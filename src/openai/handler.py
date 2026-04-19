@@ -30,9 +30,10 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import Response
 
-from .. import auth, config, errors, failover, log_db, notifier, scheduler
+from .. import auth, config, errors, failover, fingerprint, log_db, notifier, scheduler
 from ..channel import registry
 from .transform.guard import GuardError, guard_chat_ingress, guard_responses_ingress
+from .transform.responses_to_chat import resolve_current_input_items
 
 
 # ─── 辅助 ─────────────────────────────────────────────────────────
@@ -146,18 +147,28 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     # 下划线前缀 + 不在 CHAT/RESPONSES_REQ_ALLOWED 白名单里 → filter_*_passthrough 不会转发给上游。
     body["_api_key_name"] = key_name or ""
 
-    # 5. pending 日志（fingerprint 暂留空，MS-7 接入）
+    # 5. fingerprint_query（会话亲和；MS-7 接入）
+    if ingress_protocol == "chat":
+        fp_query = fingerprint.fingerprint_query_chat(
+            key_name or "", client_ip, body.get("messages") or []
+        )
+    else:
+        fp_query = fingerprint.fingerprint_query_responses(
+            key_name or "", client_ip, resolve_current_input_items(body)
+        )
+
+    # 6. pending 日志
     req_headers = _sanitize_headers(dict(request.headers))
     await asyncio.to_thread(
         log_db.insert_pending,
         request_id, client_ip, key_name, model, is_stream, msg_count, tool_count,
-        req_headers, body, fingerprint=None,
+        req_headers, body, fingerprint=fp_query,
     )
 
-    # 6. 调度（ingress_protocol 决定家族过滤）
+    # 7. 调度（ingress_protocol 决定家族过滤；fp_query 决定亲和命中）
     result = scheduler.schedule(
         body, api_key_name=key_name or "", client_ip=client_ip,
-        ingress_protocol=ingress_protocol,
+        ingress_protocol=ingress_protocol, fp_query=fp_query,
     )
     if result.affinity_hit:
         await asyncio.to_thread(log_db.update_pending, request_id, affinity_hit=1)

@@ -88,6 +88,49 @@ _ERR_TYPE_ANTHROPIC_TO_OPENAI = {
 }
 
 
+def _write_affinity_non_stream(
+    ingress_protocol: str,
+    api_key_name: Optional[str],
+    client_ip: str,
+    messages: list,
+    assistant_msg_anthropic: dict,
+    body: Optional[dict],
+    out_obj: dict,
+    channel_key: str,
+    resolved_model: str,
+) -> None:
+    """成功完成非流式请求后按 ingress 走对应家族的 fingerprint_write。"""
+    fp_write: Optional[str] = None
+    if ingress_protocol == "anthropic":
+        fp_write = fingerprint.fingerprint_write(
+            api_key_name or "", client_ip or "", messages, assistant_msg_anthropic,
+        )
+    elif ingress_protocol == "chat":
+        ds_choice = (out_obj.get("choices") or [{}])[0] if isinstance(out_obj, dict) else {}
+        ds_msg = (ds_choice or {}).get("message") or {}
+        fp_write = fingerprint.fingerprint_write_chat(
+            api_key_name or "", client_ip or "",
+            (body or {}).get("messages") or [], ds_msg,
+        )
+    elif ingress_protocol == "responses":
+        ds_output = out_obj.get("output") or [] if isinstance(out_obj, dict) else []
+        cur_input = _responses_current_input_items(body or {})
+        fp_write = fingerprint.fingerprint_write_responses(
+            api_key_name or "", client_ip or "", cur_input, ds_output,
+        )
+    if fp_write:
+        affinity.upsert(fp_write, channel_key, resolved_model)
+
+
+def _responses_current_input_items(body: dict) -> list:
+    """延迟 import 的 responses_to_chat.resolve_current_input_items 代理，避免模块顶层循环。"""
+    try:
+        from .openai.transform.responses_to_chat import resolve_current_input_items
+        return resolve_current_input_items(body)
+    except Exception:
+        return []
+
+
 def _make_stream_translator(translator_ctx: Optional[dict]):
     """根据 translator_ctx 实例化跨变体流翻译器；非跨变体返回 None。
 
@@ -519,6 +562,7 @@ async def _try_channel(
                 fp_query, retry_count_so_far, affinity_hit,
                 ingress_protocol=ingress_protocol,
                 translator_ctx=upstream_req.translator_ctx,
+                body=body,
             )
 
         # 4. 流式分支
@@ -530,6 +574,7 @@ async def _try_channel(
             fp_query, retry_count_so_far, affinity_hit,
             ingress_protocol=ingress_protocol,
             translator_ctx=upstream_req.translator_ctx,
+            body=body,
         )
     except Exception as exc:
         traceback.print_exc()
@@ -560,6 +605,7 @@ async def _consume_non_stream(
     fp_query: Optional[str], retry_count_so_far: int, affinity_hit: int,
     *, ingress_protocol: str = "anthropic",
     translator_ctx: Optional[dict] = None,
+    body: Optional[dict] = None,
 ) -> AttemptResult:
     # 读 body：用剩余总时间作为硬超时（httpx 的 read timeout 只保证单次 chunk 间隔）
     cfg = config.get()
@@ -641,14 +687,6 @@ async def _consume_non_stream(
     )
     cooldown.clear(ch.key, resolved_model)
 
-    # 亲和写入（仅 anthropic 入口；openai 亲和在 MS-7 实现）
-    if ingress_protocol == "anthropic":
-        fp_write = fingerprint.fingerprint_write(
-            api_key_name or "", client_ip or "", messages, assistant_msg,
-        )
-        if fp_write:
-            affinity.upsert(fp_write, ch.key, resolved_model)
-
     # 落库（用**上游原始响应体**，方便排错；翻译后的下游响应体由 JSONResponse 现场构造）
     await asyncio.to_thread(
         log_db.finish_success, request_id, ch.key, ch.type, resolved_model,
@@ -662,6 +700,11 @@ async def _consume_non_stream(
 
     # 跨变体：把上游 JSON 反向成 ingress 期望的格式；同协议 translator_ctx=None 即原样
     out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
+
+    # 亲和写入（按 ingress 选 fingerprint_write 的参数空间与函数）
+    _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
+                                messages, assistant_msg, body, out_obj,
+                                ch.key, resolved_model)
 
     response = JSONResponse(
         content=out_obj,
@@ -687,6 +730,7 @@ async def _consume_stream(
     fp_query: Optional[str], retry_count_so_far: int, affinity_hit: int,
     *, ingress_protocol: str = "anthropic",
     translator_ctx: Optional[dict] = None,
+    body: Optional[dict] = None,
 ) -> AttemptResult:
     aiter = upstream_resp.aiter_bytes()
 
@@ -784,15 +828,42 @@ async def _consume_stream(
         )
         cooldown.clear(ch.key, resolved_model)
 
-        # 亲和写入：当前仅 anthropic 入口生效；openai 家族的 fingerprint_write
-        # 在 MS-7 接入，MS-2 暂跳过以免误写入 hash 不兼容的记录。
+        # 亲和写入：按 ingress 走对应家族的 fingerprint_write。
+        # 跨变体 chat→openai-responses（stream_r2c）当前没有累积下游 chat
+        # assistant 文本的 accessor，MS-7 跳过；其它 3 组合（anthropic / 同协议
+        # chat-chat / 同协议 resp-resp / 跨变体 resp→chat）正常写入。
+        ch_proto = getattr(ch, "protocol", "anthropic")
+        fp_write: Optional[str] = None
         if ingress_protocol == "anthropic":
             assistant_msg = builder.get_assistant()
             fp_write = fingerprint.fingerprint_write(
                 api_key_name or "", client_ip or "", messages, assistant_msg,
             )
-            if fp_write:
-                affinity.upsert(fp_write, ch.key, resolved_model)
+        elif ingress_protocol == "chat" and ch_proto == "openai-chat":
+            assistant_msg = builder.get_assistant()
+            fp_write = fingerprint.fingerprint_write_chat(
+                api_key_name or "", client_ip or "",
+                (body or {}).get("messages") or [], assistant_msg,
+            )
+        elif ingress_protocol == "responses" and ch_proto == "openai-responses":
+            # builder 是 ResponsesSSEAssistantBuilder
+            output_items = builder.get_output_items() if hasattr(builder, "get_output_items") else []
+            cur_input = _responses_current_input_items(body or {})
+            fp_write = fingerprint.fingerprint_write_responses(
+                api_key_name or "", client_ip or "", cur_input, output_items,
+            )
+        elif ingress_protocol == "responses" and ch_proto == "openai-chat":
+            # stream_c2r translator._collect_output_items() 给出翻译后的下游 output items
+            try:
+                output_items = stream_translator._collect_output_items() if stream_translator else []
+            except Exception:
+                output_items = []
+            cur_input = _responses_current_input_items(body or {})
+            fp_write = fingerprint.fingerprint_write_responses(
+                api_key_name or "", client_ip or "", cur_input, output_items,
+            )
+        if fp_write:
+            affinity.upsert(fp_write, ch.key, resolved_model)
 
         await asyncio.to_thread(
             log_db.finish_success,
