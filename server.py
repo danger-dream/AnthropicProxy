@@ -120,6 +120,10 @@ async def lifespan(app: FastAPI):
     from src.openai.channel.registration import register_factories as _openai_register_factories
     _openai_register_factories()
 
+    # OpenAI previous_response_id Store（挂在同一张 state.db，独立表）
+    from src.openai import store as openai_store
+    openai_store.init()
+
     # 渠道注册表 + 热加载钩子
     registry.rebuild_from_config()
     registry.install_config_reload_hook()
@@ -156,6 +160,7 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
     _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
     _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
+    _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
 
     try:
         yield

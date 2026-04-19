@@ -185,11 +185,10 @@ def guard_responses_to_chat(body: dict,
                       "input item_reference is not supported (requires server-side store)",
                       param="input")
 
-    # previous_response_id：MS-3 一律拒绝；MS-5 起按 Store 开关
-    if body.get("previous_response_id"):
+    # previous_response_id：MS-5 起由 Store 支持；Store 关闭时仍拒绝
+    if body.get("previous_response_id") and not store_enabled:
         _fail(400, "invalid_request_error",
-              "previous_response_id is not yet supported when routing to chat upstream "
-              "(will be enabled in MS-5 once openai.store is wired through)",
+              "previous_response_id requires openai.store.enabled=true",
               param="previous_response_id")
 
     # conversation：显式再查一次，避免依赖调用顺序

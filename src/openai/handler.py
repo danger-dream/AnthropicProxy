@@ -142,6 +142,10 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     is_stream = bool(body.get("stream", False))
     msg_count, tool_count = _count_msg_tool(body, ingress_protocol)
 
+    # 传递 api_key_name 给 OpenAIApiChannel.build_upstream_request（通过 body 内嵌字段）。
+    # 下划线前缀 + 不在 CHAT/RESPONSES_REQ_ALLOWED 白名单里 → filter_*_passthrough 不会转发给上游。
+    body["_api_key_name"] = key_name or ""
+
     # 5. pending 日志（fingerprint 暂留空，MS-7 接入）
     req_headers = _sanitize_headers(dict(request.headers))
     await asyncio.to_thread(

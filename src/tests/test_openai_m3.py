@@ -585,7 +585,8 @@ async def test_guard_r2c_builtin_tool(m):
     print("  [PASS] r2c guard: built-in tool web_search_preview → 400")
 
 
-async def test_guard_r2c_previous_response_id(m):
+async def test_guard_r2c_previous_response_id_not_found(m):
+    """MS-5 起 Store 默认开启；未知的 previous_response_id → 404（NotFound 映射）。"""
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()
@@ -595,12 +596,12 @@ async def test_guard_r2c_previous_response_id(m):
 
     body = {"model": "gpt-5", "input": "continue", "previous_response_id": "resp_abc"}
     resp, mc = await _call_openai_handler(m, router, "responses", body)
-    assert resp.status_code == 400
+    assert resp.status_code == 404
     out = json.loads(resp.body)
     assert "previous_response_id" in out["error"]["message"]
     assert router.last_request is None
     await mc.aclose()
-    print("  [PASS] r2c guard: previous_response_id without Store → 400")
+    print("  [PASS] r2c guard: unknown previous_response_id → 404 NotFound")
 
 
 async def test_guard_r2c_builtin_call_in_input(m):
@@ -651,7 +652,7 @@ def main() -> int:
         _async(test_responses_to_chat_text),
         _async(test_responses_to_chat_function_call_roundtrip),
         _async(test_guard_r2c_builtin_tool),
-        _async(test_guard_r2c_previous_response_id),
+        _async(test_guard_r2c_previous_response_id_not_found),
         _async(test_guard_r2c_builtin_call_in_input),
     ]
     passed = 0

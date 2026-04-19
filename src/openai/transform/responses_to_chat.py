@@ -29,12 +29,15 @@ def _gen_id(prefix: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 
-def translate_request(body: dict) -> dict:
+def translate_request(body: dict, *, api_key_name: str = "") -> dict:
     """Responses 请求翻译为 Chat 请求。
 
     前置：guard.guard_responses_to_chat 已做跨变体死角检查。
+    若 body 含 `previous_response_id`，会向 openai.store 展开历史。
+    Store 查询异常（NotFound/Expired/Forbidden）通过 GuardError 抛出，由
+    failover / handler 映射成 4xx。
     """
-    input_items = _resolve_input(body)
+    input_items = _resolve_input(body, api_key_name=api_key_name)
     messages = _input_items_to_messages(input_items)
 
     # instructions → 首条 system（在任何历史之前）
@@ -77,8 +80,62 @@ def translate_request(body: dict) -> dict:
 # ─── 辅助 ────────────────────────────────────────────────────────
 
 
-def _resolve_input(body: dict) -> list:
-    """把 body.input 统一为 list[item]。MS-3 不处理 previous_response_id（guard 已拒）。"""
+def _resolve_input(body: dict, *, api_key_name: str = "") -> list:
+    """把 body.input 统一为 list[item]；若带 previous_response_id 则先展开历史。
+
+    Store 查询异常映射为 GuardError，由调用方转成 4xx 短路。
+    """
+    prev_id = body.get("previous_response_id")
+    history: list = []
+    if prev_id:
+        from . import guard as _guard
+        from .. import store as _store
+        if not _store.is_enabled():
+            raise _guard.GuardError(
+                400, "invalid_request_error",
+                "previous_response_id requires openai.store.enabled=true",
+                param="previous_response_id",
+            )
+        try:
+            history = _store.expand_history(str(prev_id), api_key_name=api_key_name)
+        except _store.ResponseNotFound:
+            raise _guard.GuardError(
+                404, "not_found_error",
+                f"previous_response_id '{prev_id}' not found (or already expired)",
+                param="previous_response_id",
+            )
+        except _store.ResponseExpired:
+            raise _guard.GuardError(
+                410, "not_found_error",
+                f"previous_response_id '{prev_id}' has expired",
+                param="previous_response_id",
+            )
+        except _store.ResponseForbidden:
+            raise _guard.GuardError(
+                403, "permission_error",
+                f"previous_response_id '{prev_id}' does not belong to this API key",
+                param="previous_response_id",
+            )
+
+    cur = body.get("input")
+    if isinstance(cur, str):
+        cur_items: list = [{"type": "message", "role": "user",
+                             "content": [{"type": "input_text", "text": cur}]}]
+    elif isinstance(cur, list):
+        cur_items = list(cur)
+    else:
+        cur_items = []
+
+    return list(history) + cur_items
+
+
+def resolve_current_input_items(body: dict) -> list:
+    """仅返回"本次请求"的 input items（不包含 previous_response_id 展开的历史）。
+
+    用于 Store 写入：`input_items` 字段存的是当前请求的输入，`output_items`
+    存本次响应。下次请求带 previous_response_id 时，expand_history 会沿
+    parent_id 链递归拼出完整历史。
+    """
     cur = body.get("input")
     if isinstance(cur, str):
         return [{"type": "message", "role": "user",
@@ -211,10 +268,14 @@ def _translate_tool_choice_r2c(tc):
 
 
 def translate_response(chat: dict, *, model: str,
-                       previous_response_id: Optional[str] = None) -> dict:
+                       previous_response_id: Optional[str] = None,
+                       api_key_name: Optional[str] = None,
+                       channel_key: Optional[str] = None,
+                       current_input_items: Optional[list] = None) -> dict:
     """Chat 非流式 JSON → Responses 非流式 JSON。
 
-    MS-3 不写 Store；previous_response_id 只透传显示，不展开链。
+    当 `current_input_items` 非 None 且 `api_key_name` 非空时，把本次响应
+    存入 openai.store（供下次 previous_response_id 续接使用）。
     """
     choices = chat.get("choices") or [{}]
     choice0 = choices[0] if choices else {}
@@ -275,8 +336,9 @@ def translate_response(chat: dict, *, model: str,
         for c in (it.get("content") or []) if c.get("type") == "output_text"
     )
 
+    resp_id = _gen_id("resp_")
     resp: dict = {
-        "id": _gen_id("resp_"),
+        "id": resp_id,
         "object": "response",
         "created_at": int(chat.get("created") or time.time()),
         "status": status,
@@ -288,6 +350,25 @@ def translate_response(chat: dict, *, model: str,
         "output_text": output_text,
         "usage": _usage_chat_to_resps(chat.get("usage") or {}),
     }
+
+    # 写 Store：只在 responses 入口 + chat 上游 + 有 api_key_name 时触发。
+    # 为了避免沉默吞错，Store 失败打 warning 但不影响主响应返回。
+    if current_input_items is not None and api_key_name:
+        try:
+            from .. import store as _store
+            if _store.is_enabled():
+                _store.save(
+                    response_id=resp_id,
+                    parent_id=previous_response_id,
+                    api_key_name=api_key_name,
+                    model=model,
+                    channel_key=channel_key,
+                    input_items=list(current_input_items),
+                    output_items=output_items,
+                )
+        except Exception as exc:
+            print(f"[openai_store] save failed (resp_id={resp_id}): {exc}")
+
     return resp
 
 

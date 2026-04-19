@@ -95,7 +95,8 @@ def _make_stream_translator(translator_ctx: Optional[dict]):
     - response_translator=="chat_to_responses"：下游期待 chat，上游发 responses
       → 用 stream_r2c（responses SSE → chat SSE）
     - response_translator=="responses_to_chat"：下游期待 responses，上游发 chat
-      → 用 stream_c2r（chat SSE → responses SSE）
+      → 用 stream_c2r（chat SSE → responses SSE）；translator 在 close() 时
+      把翻译后的 response 写入 openai.store（Store 开启 + api_key_name 非空时）
     """
     if not isinstance(translator_ctx, dict):
         return None
@@ -107,8 +108,13 @@ def _make_stream_translator(translator_ctx: Optional[dict]):
                     include_usage=bool(translator_ctx.get("include_usage", False)))
     if name == "responses_to_chat":
         from .openai.transform.stream_c2r import StreamTranslator as _C2R
-        return _C2R(model=model,
-                    previous_response_id=translator_ctx.get("previous_response_id"))
+        return _C2R(
+            model=model,
+            previous_response_id=translator_ctx.get("previous_response_id"),
+            api_key_name=translator_ctx.get("api_key_name"),
+            channel_key=translator_ctx.get("channel_key"),
+            current_input_items=translator_ctx.get("current_input_items"),
+        )
     return None
 
 
@@ -130,8 +136,13 @@ def _apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> di
         return _t(obj, model=model)
     if name == "responses_to_chat":
         from .openai.transform.responses_to_chat import translate_response as _t2
-        return _t2(obj, model=model,
-                   previous_response_id=translator_ctx.get("previous_response_id"))
+        return _t2(
+            obj, model=model,
+            previous_response_id=translator_ctx.get("previous_response_id"),
+            api_key_name=translator_ctx.get("api_key_name"),
+            channel_key=translator_ctx.get("channel_key"),
+            current_input_items=translator_ctx.get("current_input_items"),
+        )
     return obj
 
 
@@ -287,6 +298,8 @@ async def run_failover(
         if result.outcome == "guard_error":
             status = int(result.http_status or 400)
             msg = result.error_detail or "request rejected by guard"
+            # err_type 直接从 status 反推（保持与 classify_http_status 一致）
+            anth_err_type = errors.classify_http_status(status)
             total_ms = int((time.time() - start_time) * 1000)
             await asyncio.to_thread(
                 log_db.finish_error, request_id, msg[:4000], retry_count,
@@ -294,8 +307,7 @@ async def run_failover(
                 connect_ms=None, first_token_ms=None, total_ms=total_ms,
                 http_status=status, affinity_hit=affinity_hit,
             )
-            return _json_error_for_ingress(ingress_protocol, status,
-                                           errors.ErrType.INVALID_REQUEST, msg)
+            return _json_error_for_ingress(ingress_protocol, status, anth_err_type, msg)
 
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
         if (

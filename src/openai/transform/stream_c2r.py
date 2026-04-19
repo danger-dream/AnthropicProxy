@@ -111,7 +111,10 @@ class StreamTranslator:
     """Chat SSE → Responses SSE 翻译器。"""
 
     def __init__(self, *, model: str, previous_response_id: Optional[str] = None,
-                 created_ts: Optional[int] = None):
+                 created_ts: Optional[int] = None,
+                 api_key_name: Optional[str] = None,
+                 channel_key: Optional[str] = None,
+                 current_input_items: Optional[list] = None):
         self.state = C2RState(
             resp_id=_gen_id("resp_"),
             model=model,
@@ -119,6 +122,11 @@ class StreamTranslator:
             previous_response_id=previous_response_id,
         )
         self._buf = b""
+        # Store 写入上下文：当三者齐全（+ store enabled）时，close() 把本次响应
+        # 存入 openai.store 以支持下次 previous_response_id 续接
+        self._store_api_key_name = api_key_name or None
+        self._store_channel_key = channel_key or None
+        self._store_current_input = list(current_input_items) if current_input_items else None
 
     # --- 公开接口 ---
 
@@ -140,6 +148,7 @@ class StreamTranslator:
 
         if self.state.terminal_error is not None:
             yield from self._emit_failed(self.state.terminal_error)
+            # 失败态不写 Store（不想污染后续 prev_id 链）
             return
 
         # 关闭所有打开的 item
@@ -147,6 +156,9 @@ class StreamTranslator:
         yield from self._close_all_function_calls()
 
         yield from self._emit_terminal()
+
+        # 正常结束 → 写 Store（若配齐了上下文且 Store 开启）
+        self._save_to_store_if_configured()
 
     # --- 解析 ---
 
@@ -616,6 +628,26 @@ class StreamTranslator:
             }))
         items.sort(key=lambda x: x[0])
         return [it for _, it in items]
+
+    def _save_to_store_if_configured(self) -> None:
+        """流式 responses 响应收尾时写入 openai.store（若上下文齐全）。"""
+        if not self._store_api_key_name or self._store_current_input is None:
+            return
+        try:
+            from .. import store as _store
+            if not _store.is_enabled():
+                return
+            _store.save(
+                response_id=self.state.resp_id,
+                parent_id=self.state.previous_response_id,
+                api_key_name=self._store_api_key_name,
+                model=self.state.model,
+                channel_key=self._store_channel_key,
+                input_items=self._store_current_input,
+                output_items=self._collect_output_items(),
+            )
+        except Exception as exc:
+            print(f"[openai_store] stream save failed (resp_id={self.state.resp_id}): {exc}")
 
     def _response_skeleton(self, *, status: str) -> dict:
         return {

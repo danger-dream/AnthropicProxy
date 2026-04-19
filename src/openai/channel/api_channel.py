@@ -136,8 +136,16 @@ class OpenAIApiChannel(Channel):
 
     def _build_responses_to_chat(self, body: dict, resolved_model: str) -> UpstreamRequest:
         """responses ingress → openai-chat 上游。"""
-        guard.guard_responses_to_chat(body, store_enabled=False)
-        payload = responses_to_chat.translate_request(body)
+        # Store 开关决定是否允许 previous_response_id
+        from .. import store as _store
+        store_enabled = _store.is_enabled()
+        guard.guard_responses_to_chat(body, store_enabled=store_enabled)
+
+        api_key_name = str(body.get("_api_key_name") or "")
+        # 记录"本次请求的"input items（不含 previous_response_id 展开的历史），
+        # 作为 Store.save 的 input_items 字段
+        current_input_items = responses_to_chat.resolve_current_input_items(body)
+        payload = responses_to_chat.translate_request(body, api_key_name=api_key_name)
         payload["model"] = resolved_model
         return UpstreamRequest(
             url=f"{self.base_url}/v1/chat/completions",
@@ -150,6 +158,9 @@ class OpenAIApiChannel(Channel):
                 "response_translator": "responses_to_chat",
                 "model_for_response": resolved_model,
                 "previous_response_id": body.get("previous_response_id"),
+                "api_key_name": api_key_name,
+                "channel_key": self.key,
+                "current_input_items": current_input_items,
             },
         )
 
