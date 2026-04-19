@@ -88,6 +88,30 @@ _ERR_TYPE_ANTHROPIC_TO_OPENAI = {
 }
 
 
+def _make_stream_translator(translator_ctx: Optional[dict]):
+    """根据 translator_ctx 实例化跨变体流翻译器；非跨变体返回 None。
+
+    translator_ctx 由 OpenAIApiChannel.build_upstream_request 填入。
+    - response_translator=="chat_to_responses"：下游期待 chat，上游发 responses
+      → 用 stream_r2c（responses SSE → chat SSE）
+    - response_translator=="responses_to_chat"：下游期待 responses，上游发 chat
+      → 用 stream_c2r（chat SSE → responses SSE）
+    """
+    if not isinstance(translator_ctx, dict):
+        return None
+    name = translator_ctx.get("response_translator")
+    model = translator_ctx.get("model_for_response") or ""
+    if name == "chat_to_responses":
+        from .openai.transform.stream_r2c import StreamTranslator as _R2C
+        return _R2C(model=model,
+                    include_usage=bool(translator_ctx.get("include_usage", False)))
+    if name == "responses_to_chat":
+        from .openai.transform.stream_c2r import StreamTranslator as _C2R
+        return _C2R(model=model,
+                    previous_response_id=translator_ctx.get("previous_response_id"))
+    return None
+
+
 def _apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dict:
     """跨变体非流式响应反向：对下游 JSON 做格式转换。
 
@@ -730,6 +754,8 @@ async def _consume_stream(
     builder = toolkit["stream_builder"]()
     tracker.feed(first_chunk_restored)
     builder.feed(first_chunk_restored)
+    # 跨变体：上游字节 → translator.feed → 下游字节；同协议 translator=None 原样 yield
+    stream_translator = _make_stream_translator(translator_ctx)
     upstream_status = upstream_resp.status_code
 
     state: dict = {"total_ms": None, "finalized": False}
@@ -810,7 +836,11 @@ async def _consume_stream(
             return
         try:
             # 首包
-            yield first_chunk_restored
+            if stream_translator is not None:
+                for out in stream_translator.feed(first_chunk_restored):
+                    yield out
+            else:
+                yield first_chunk_restored
 
             # 后续 chunk，带 idle / total 超时
             while True:
@@ -856,9 +886,16 @@ async def _consume_stream(
                 restored = await ch.restore_response(chunk, dynamic_map=dynamic_map)
                 tracker.feed(restored)
                 builder.feed(restored)
-                yield restored
+                if stream_translator is not None:
+                    for out in stream_translator.feed(restored):
+                        yield out
+                else:
+                    yield restored
 
-            # 正常完成
+            # 正常完成：若有翻译器，先 emit 收尾帧（response.completed / [DONE] 等）
+            if stream_translator is not None:
+                for out in stream_translator.close():
+                    yield out
             await _finalize_success()
         except asyncio.CancelledError:
             # 客户端断开（或上层取消）：不归咎上游，不记 cooldown/scorer

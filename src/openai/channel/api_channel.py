@@ -116,6 +116,9 @@ class OpenAIApiChannel(Channel):
         guard.guard_chat_to_responses(body)
         payload = chat_to_responses.translate_request(body)
         payload["model"] = resolved_model
+        # 下游 chat 是否显式要求末帧 usage（stream_options.include_usage）
+        stream_opts = body.get("stream_options") or {}
+        include_usage = bool(stream_opts.get("include_usage")) if isinstance(stream_opts, dict) else False
         return UpstreamRequest(
             url=f"{self.base_url}/v1/responses",
             headers=self._headers(),
@@ -124,9 +127,10 @@ class OpenAIApiChannel(Channel):
             translator_ctx={
                 "ingress": "chat",
                 "upstream_protocol": "openai-responses",
-                # failover._consume_non_stream 按此字段选 translate_response
+                # failover 按此字段选非流式响应反向函数 + 流式 translator
                 "response_translator": "chat_to_responses",
                 "model_for_response": resolved_model,
+                "include_usage": include_usage,
             },
         )
 
