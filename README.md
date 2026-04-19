@@ -1,14 +1,23 @@
 # Anthropic Proxy
 
-**多渠道、智能调度、故障转移的 Anthropic 协议代理**
+**多渠道、智能调度、故障转移的 Anthropic + OpenAI 协议代理**
 
-一个兼容 Anthropic `/v1/messages` 协议的反向代理工具，支持把下游客户端（Claude Code CLI、openclaw、任何 Anthropic SDK 应用）的请求透明地路由到多个上游（官方 OAuth 账户 + 第三方 Anthropic 兼容云服务），具备：
+一个多协议反向代理工具，同时兼容 Anthropic `/v1/messages` 与 OpenAI
+`/v1/chat/completions`、`/v1/responses` 三条入口，支持把下游客户端的请求
+透明地路由到多种上游（Anthropic OAuth 账户 / 第三方 Anthropic 兼容云 /
+OpenAI 官方或中转），具备：
 
-- **多渠道聚合**：Claude Code OAuth 账户 + 第三方 Coding Plan（智谱 / 天翼云 / 京东云 / 讯飞星辰 等）
+- **三条下游入口共用一个代理**：`/v1/messages`（anthropic）、
+  `/v1/chat/completions`（openai-chat）、`/v1/responses`（openai-responses）
+- **OpenAI 家族内跨变体翻译**：chat 入口可打到 responses 上游，反之亦然；
+  流式 + 非流式双向打通，`previous_response_id` 由本地 Store 支持
+- **多渠道聚合**：Claude Code OAuth 账户 + 第三方 Coding Plan（智谱 / 天翼云
+  / 京东云 / 讯飞星辰 等）+ OpenAI 家族中转（支持 chat / responses 两套协议）
 - **智能调度**：基于滑动窗口评分（延迟 + 失败惩罚）+ 会话亲和绑定 + 20% 探索率
 - **故障转移**：未发首包 → 自动切下一候选；已发首包 → 流内 SSE error 收尾
 - **完整 CC 伪装**：与 cc-proxy 同源的请求签名逻辑（指纹 / CCH / 工具名混淆 / cache 断点）
-- **Telegram Bot 管理面板**：渠道管理 / OAuth 账户 / API Key / 统计 / 日志 / 系统设置 全图形化
+- **Telegram Bot 管理面板**：渠道管理 / OAuth 账户 / API Key（含协议过滤）/
+  统计 / 日志 / 系统设置 全图形化
 - **运行时保护**：四段超时独立 + 错误阶梯冷却 + 首包文本黑名单 + OAuth 配额自动禁用/恢复
 
 ---
@@ -157,8 +166,32 @@ curl http://<server>:22122/v1/messages \
 - 非流式：JSON 响应
 - 错误：标准 Anthropic 错误格式 `{"type": "error", "error": {"type": "...", "message": "..."}}`
 
+### `POST /v1/chat/completions` ✨ OpenAI 家族
+**完整兼容 OpenAI Chat Completions API**。鉴权用 `Authorization: Bearer <key>`。
+
+- 流式（`stream: true`）/ 非流式（默认）
+- 错误：OpenAI 格式 `{"error": {"message":..., "type":..., "code":..., "param":...}}`
+- 跨变体：若 API Key 命中的是 `protocol=openai-responses` 渠道，代理会在内部把
+  请求翻译为 Responses，响应再反向翻译回 `chat.completion` 形态
+
+### `POST /v1/responses` ✨ OpenAI 家族
+**完整兼容 OpenAI Responses API**（含 `previous_response_id` 多轮续接）。
+
+- 流式 / 非流式
+- `previous_response_id` 由本地 Store 支持（`openai.store.enabled=true` 默认开）：
+  即使上游是无状态的 `openai-chat`，也能由代理展开历史 items 续接对话
+- 拒绝字段：`conversation` / `background:true` / `include: ["reasoning.encrypted_content"]`
+  （当上游为 chat 时）— 跨变体死角由 guard 统一拦成 400
+
+OpenAI 支持的详细设计、字段映射、死角清单见 [`docs/openai/`](docs/openai/)。
+
 ### `GET /v1/models`
-**Anthropic 标准模型列表**。返回当前所有启用渠道聚合的可用模型（按 API Key 白名单过滤）：
+**Anthropic 标准模型列表**。返回当前所有启用渠道聚合的可用模型：
+
+- 按 API Key 的 `allowedModels` 白名单过滤
+- 按 API Key 的 `allowedProtocols` 家族过滤（解决两家族同名模型冲突，例：
+  `claude-3.5` 同时出现在 anthropic 与 openai 中转上）
+- TG Bot「🔑 管理 API Key」→「🔌 编辑允许协议」可勾选 anthropic / chat / responses 任意组合
 
 ```bash
 curl http://<server>:22122/v1/models -H "x-api-key: ccp-xxx"
@@ -213,10 +246,11 @@ curl http://<server>:22122/v1/models -H "x-api-key: ccp-xxx"
 15 条最新请求，每条一个 `📄 #N 详情` 按钮点进详情页（完整重试链 + 请求/响应 body）。
 
 ### 🔀 渠道管理
-- 添加向导（4 步 + 测试面板）：名称 → URL → API Key → 模型列表 → 测试
-- 渠道详情：模型状态、健康图标（🟢🟡🟠🔴）、统计、冷却、亲和数
-- 编辑：名称 / URL / Key / 模型 / CC 伪装切换
-- 测试模型：单/全部；成功 8s / 失败 30s 自动删除进度消息
+- 添加向导（5 步 + 测试面板）：名称 → URL → **协议** → API Key → 模型列表 → 测试
+- 协议 3 选 1：Anthropic / OpenAI Chat / OpenAI Responses（openai-* 自动关闭 CC 伪装）
+- 渠道详情：模型状态、健康图标（🟢🟡🟠🔴）、统计、冷却、亲和数；openai-* 渠道显示协议行
+- 编辑：名称 / URL / Key / 模型 / 🔌 切换协议 / 🎭 CC 伪装切换（仅 anthropic）
+- 测试模型：单/全部；成功 8s / 失败 30s 自动删除进度消息（openai-* 按对应 API 构造探测 payload）
 
 ### 🔐 管理 OAuth
 - PKCE 登录（浏览器授权 + 粘贴 code）
@@ -227,6 +261,7 @@ curl http://<server>:22122/v1/models -H "x-api-key: ccp-xxx"
 ### 🔑 管理 API Key
 - 列表直接显示完整 Key（单击即复制）
 - **每个 Key 可设模型白名单**（多选勾选界面；空 = 无限制）
+- **每个 Key 可设允许协议**（🔌 多选 anthropic / chat / responses；空 = 三个入口全放行）
 - 删除二次确认（含 Key 末 8 字符防误删）
 
 ### ⚙ 系统设置
