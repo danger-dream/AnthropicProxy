@@ -378,6 +378,84 @@ def test_cancelled_status_maps_to_stop(m):
     print("  [PASS] c2r: cancelled/queued/in_progress status → finish_reason=stop")
 
 
+def test_guard_chat_to_responses_rejects_input_audio(m):
+    """chat messages 带 input_audio content part，跨变体路由到 responses 上游时 → 400。
+
+    Responses API 的 ResponseInputContent 只接受 text/image/file；若静默透传
+    会被上游拒绝为 400，不如自己显式拦截让错误信息更明确。
+    """
+    g = m["guard"]
+    body = {
+        "model": "gpt-5",
+        "messages": [
+            {"role": "user",
+             "content": [
+                 {"type": "text", "text": "听这段"},
+                 {"type": "input_audio",
+                  "input_audio": {"data": "BASE64...", "format": "wav"}},
+             ]},
+        ],
+    }
+    try:
+        g.guard_chat_to_responses(body)
+        assert False, "应该抛 GuardError"
+    except g.GuardError as e:
+        assert e.status == 400
+        assert e.err_type == "invalid_request_error"
+        assert "input_audio" in e.message
+    # 同协议 chat→chat 不走这个 guard；上面 body 直接 filter_chat_passthrough OK（不拦）
+    print("  [PASS] guard: chat→responses 跨变体拒绝 input_audio")
+
+
+def test_r2c_assistant_refusal_preserved(m):
+    """responses 历史里 assistant 带 refusal part → chat message.refusal 字段保留。"""
+    r2c = m["responses_to_chat"]
+    body = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "不能说的话"}]},
+            {"type": "message", "role": "assistant",
+             "content": [
+                 {"type": "refusal", "refusal": "I cannot assist with that."},
+             ]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "那换个话题"}]},
+        ],
+    }
+    out = r2c.translate_request(body)
+    msgs = out["messages"]
+    # assistant message 应带 refusal 字段，content 为空列表 / 字符串
+    assistant = [m for m in msgs if m["role"] == "assistant"][0]
+    assert assistant.get("refusal") == "I cannot assist with that.", assistant
+    # 验证后续 user 消息正常
+    assert msgs[-1] == {"role": "user", "content": "那换个话题"}
+    print("  [PASS] r2c: assistant refusal part 正确映射到 chat message.refusal")
+
+
+def test_r2c_assistant_mixed_text_and_refusal(m):
+    """特例：assistant content 同时含 output_text 和 refusal parts。"""
+    r2c = m["responses_to_chat"]
+    body = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "message", "role": "assistant",
+             "content": [
+                 {"type": "output_text", "text": "部分答复"},
+                 {"type": "refusal", "refusal": "但这部分我不能说"},
+             ]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "q"}]},
+        ],
+    }
+    out = r2c.translate_request(body)
+    assistant = [m for m in out["messages"] if m["role"] == "assistant"][0]
+    assert assistant.get("refusal") == "但这部分我不能说"
+    # content 保留 output_text 部分
+    assert assistant["content"] == "部分答复", f"content 应保留非 refusal 部分：{assistant}"
+    print("  [PASS] r2c: assistant 同时 text+refusal，两者正确分发")
+
+
 def test_guard_conversation_null_allowed(m):
     """conversation=null / 空 dict：不应触发 guard 拒绝；只有非空 conv id 才拒。"""
     g = m["guard"]
@@ -430,6 +508,9 @@ def main() -> int:
         test_reasoning_content_read_from_reasoning_text,
         test_legacy_function_call_passthrough,
         test_cancelled_status_maps_to_stop,
+        test_guard_chat_to_responses_rejects_input_audio,
+        test_r2c_assistant_refusal_preserved,
+        test_r2c_assistant_mixed_text_and_refusal,
         _async(test_handler_sanitizes_internal_body_fields),
         test_guard_conversation_null_allowed,
     ]

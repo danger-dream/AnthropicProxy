@@ -125,9 +125,8 @@ def _zero() -> dict:
 
 def reasoning_bridge_mode() -> str:
     """返回当前 reasoning 桥接模式。未设/非法值均回落 'passthrough'。"""
-    from .. import __name__ as _pkg  # noqa: F401 —— 确保 package 可用
     try:
-        # 延迟 import 避免 common.py 变成 config 依赖图的叶节点时循环
+        # 延迟 import 避免 common.py 成为 config 依赖图的叶节点时循环
         from ... import config as _config
         raw = ((_config.get().get("openai") or {}).get("reasoningBridge") or "passthrough")
     except Exception:

@@ -166,10 +166,32 @@ def _input_items_to_messages(items: list) -> list:
             role = item.get("role") or "user"
             if role == "developer":
                 role = "system"   # chat 只认 system/user/assistant/tool
-            messages.append({
-                "role": role,
-                "content": _content_responses_to_chat(item.get("content") or []),
-            })
+            content_parts = item.get("content") or []
+            if role == "assistant":
+                # Responses 的 assistant message 的 content 只可能是 output_text / refusal；
+                # 回喂 chat 上游时要把 refusal parts 单独提取到 message.refusal 字段，
+                # 避免信息被折叠成空 text 丢失
+                refusal_texts: list[str] = []
+                non_refusal_parts: list = []
+                for p in content_parts:
+                    if isinstance(p, dict) and p.get("type") == "refusal":
+                        r = p.get("refusal")
+                        if isinstance(r, str) and r:
+                            refusal_texts.append(r)
+                    else:
+                        non_refusal_parts.append(p)
+                msg_out: dict = {
+                    "role": role,
+                    "content": _content_responses_to_chat(non_refusal_parts),
+                }
+                if refusal_texts:
+                    msg_out["refusal"] = "\n".join(refusal_texts)
+                messages.append(msg_out)
+            else:
+                messages.append({
+                    "role": role,
+                    "content": _content_responses_to_chat(content_parts),
+                })
 
         elif t == "function_call":
             if pending_assistant is None:

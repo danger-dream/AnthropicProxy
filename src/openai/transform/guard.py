@@ -102,9 +102,12 @@ def guard_chat_to_responses(body: dict,
 
     绝大部分丢失字段（stop / seed / logprobs / prediction / logit_bias 等）
     在翻译时静默丢弃——上游客户端也不指望 proxy 保留这些（它们本来就上不了
-    responses API）。只拦住"拒绝更安全"的两类：
+    responses API）。只拦住"拒绝更安全"的几类：
       - `n>1`（多候选）：responses 不原生支持（ingress guard 已拦，保留防御）
       - `logprobs/top_logprobs`：下游客户端可能强依赖，默认拒绝以免沉默性能降级
+      - 用户 message 的 content 里含 `input_audio` part：Responses API 的
+        ResponseInputContent 只支持 text/image/file，发过去会被上游 400 拒绝；
+        提前拦截让错误信号更清晰（同协议 chat→chat 不受影响）
     """
     if not isinstance(body, dict):
         _fail(400, "invalid_request_error", "request body must be a JSON object")
@@ -120,6 +123,18 @@ def guard_chat_to_responses(body: dict,
         _fail(400, "invalid_request_error",
               "logprobs/top_logprobs are not supported when routing to responses upstream",
               param="logprobs")
+
+    for msg in body.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "input_audio":
+                _fail(400, "invalid_request_error",
+                      "input_audio content parts are not supported when routing to responses upstream",
+                      param="messages")
 
 
 # Responses 的 tools 中非 function 类型枚举（官方 built-in）。
