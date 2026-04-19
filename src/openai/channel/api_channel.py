@@ -3,15 +3,23 @@
 由 `src/channel/registry.py` 的 factory 分派触发：config 中 protocol 为
 `openai-chat` 或 `openai-responses` 的 channel entry 会实例化本类。
 
-MS-1 只提供骨架：能被实例化、能加入 registry、能参与 `/v1/models` 列表。
-真正的 `build_upstream_request` / `restore_response` 在 MS-2 起逐步补齐。
+MS-2：实现同协议透传（chat→chat / responses→responses）。跨变体请求
+（chat ingress 打到 responses 上游、或反之）暂时抛 NotImplementedError，
+由 MS-3 起的 transform/stream_*.py 接入翻译器。
 """
 
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 from ...channel.base import Channel, ChannelDisplay, UpstreamRequest
+from ..transform import common
+
+
+# User-Agent 故意不伪装成官方 SDK：上游看到 proxy 身份便于排错，也避免与
+# anthropic 家族的 CC 伪装语义混淆。
+_UA = "anthropic-proxy/openai-adapter"
 
 
 class OpenAIApiChannel(Channel):
@@ -48,11 +56,58 @@ class OpenAIApiChannel(Channel):
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "chat",
     ) -> UpstreamRequest:
-        # MS-2 起实现：按 (ingress_protocol, self.protocol) 选择透传或跨变体翻译。
+        """按 (ingress_protocol, self.protocol) 分派。
+
+        - `(chat, openai-chat)` / `(responses, openai-responses)` → 同协议透传
+        - `(chat, openai-responses)` / `(responses, openai-chat)` → 跨变体（MS-3）
+        - 其他组合：scheduler family 过滤应已拦住；这里做防御性 400
+        """
+        if ingress_protocol not in ("chat", "responses"):
+            raise ValueError(
+                f"OpenAIApiChannel got non-openai ingress_protocol={ingress_protocol!r}; "
+                "scheduler should have filtered this at family level."
+            )
+
+        if ingress_protocol == "chat" and self.protocol == "openai-chat":
+            return self._build_chat_passthrough(requested_body, resolved_model)
+        if ingress_protocol == "responses" and self.protocol == "openai-responses":
+            return self._build_responses_passthrough(requested_body, resolved_model)
+
+        # 跨变体：暂不支持
         raise NotImplementedError(
-            "OpenAIApiChannel.build_upstream_request is not yet implemented "
-            "(scheduled for MS-2 in docs/openai/09-milestones.md)"
+            f"cross-variant translation ingress={ingress_protocol!r} → "
+            f"upstream={self.protocol!r} is scheduled for MS-3 "
+            "(see docs/openai/09-milestones.md)"
         )
+
+    # ─── 同协议透传 ────────────────────────────────────────────
+
+    def _build_chat_passthrough(self, body: dict, resolved_model: str) -> UpstreamRequest:
+        payload = common.filter_chat_passthrough(body)
+        payload["model"] = resolved_model
+        return UpstreamRequest(
+            url=f"{self.base_url}/v1/chat/completions",
+            headers=self._headers(),
+            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            dynamic_tool_map=None,
+        )
+
+    def _build_responses_passthrough(self, body: dict, resolved_model: str) -> UpstreamRequest:
+        payload = common.filter_responses_passthrough(body)
+        payload["model"] = resolved_model
+        return UpstreamRequest(
+            url=f"{self.base_url}/v1/responses",
+            headers=self._headers(),
+            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            dynamic_tool_map=None,
+        )
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": _UA,
+        }
 
     async def restore_response(self, chunk: bytes,
                                dynamic_map: Optional[dict] = None) -> bytes:

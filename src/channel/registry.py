@@ -108,12 +108,26 @@ def available_models() -> list[str]:
 
     用于 `/v1/models` 列表。OAuth 渠道返回真实模型名，API 渠道返回 alias。
     """
+    return available_models_for_families(None)
+
+
+def available_models_for_families(families: Optional[set[str]]) -> list[str]:
+    """按家族集合过滤后的可见模型列表。
+
+    `families=None` 或空集 → 不过滤，返回所有（等价于 available_models()）。
+    家族名从 Channel.protocol 推导：`anthropic` → "anthropic"，其他 → "openai"。
+    """
     models: set[str] = set()
     with _lock:
         channels = list(_channels.values())
     for ch in channels:
         if not ch.enabled or ch.disabled_reason:
             continue
+        if families:
+            proto = getattr(ch, "protocol", "anthropic")
+            fam = "anthropic" if proto == "anthropic" else "openai"
+            if fam not in families:
+                continue
         for m in ch.list_client_models():
             if m:
                 models.add(m)

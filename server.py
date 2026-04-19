@@ -250,14 +250,22 @@ async def list_models(request: Request):
     """Anthropic 标准 /v1/models：返回当前代理可见的模型清单。
 
     - 需要 API Key 验证（和 /v1/messages 一致）
-    - 若 Key 有 allowedModels 白名单，仅返回该集合与全渠道可用模型的交集
+    - 若 Key 有 allowedProtocols，按家族过滤（解决两家族同名模型冲突，例：
+      openai 与 anthropic 都叫 claude-3.5）
+    - 若 Key 有 allowedModels 白名单，再和家族结果取交集
     - 否则返回所有启用渠道聚合的去重模型列表
     """
     key_name, allowed_models, err = auth.validate(request.headers)
     if err:
         return errors.json_error_response(401, errors.ErrType.AUTH, err)
 
-    all_models = registry.available_models()
+    # 按 Key 的 allowedProtocols 推断家族。空/未设 = 全部家族。
+    allowed_protos = auth.get_allowed_protocols(key_name)
+    if allowed_protos:
+        families = {"anthropic" if p == "anthropic" else "openai" for p in allowed_protos}
+        all_models = registry.available_models_for_families(families)
+    else:
+        all_models = registry.available_models()
     if allowed_models:
         allowed_set = set(allowed_models)
         visible = [m for m in all_models if m in allowed_set]
@@ -279,6 +287,20 @@ async def list_models(request: Request):
         "last_id": data[-1]["id"] if data else None,
         "has_more": False,
     }
+
+
+@app.post("/v1/chat/completions")
+async def proxy_chat_completions(request: Request):
+    """OpenAI Chat Completions 入口。详细流程在 src/openai/handler.py。"""
+    from src.openai.handler import handle
+    return await handle(request, ingress_protocol="chat")
+
+
+@app.post("/v1/responses")
+async def proxy_responses(request: Request):
+    """OpenAI Responses 入口。详细流程在 src/openai/handler.py。"""
+    from src.openai.handler import handle
+    return await handle(request, ingress_protocol="responses")
 
 
 @app.post("/v1/messages")
