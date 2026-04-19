@@ -332,9 +332,12 @@ def _gather_refusal(output: list) -> Optional[str]:
 def _gather_reasoning_summary(output: list) -> Optional[str]:
     """从 reasoning items 的 summary_text 聚合文本。
 
-    MS-3 最小版本：只读 summary[].summary_text.text；encrypted_content 不处理。
-    完整桥接（配置开关 / reasoning_text 等）在 MS-6。
+    当 `openai.reasoningBridge == "drop"` 时直接返回 None（usage.reasoning_tokens
+    不受影响，仍由 _usage_resps_to_chat 透传）。encrypted_content 不处理。
     """
+    from .common import reasoning_passthrough_enabled
+    if not reasoning_passthrough_enabled():
+        return None
     parts: list[str] = []
     for item in output:
         if not isinstance(item, dict) or item.get("type") != "reasoning":

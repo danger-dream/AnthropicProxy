@@ -284,14 +284,17 @@ def translate_response(chat: dict, *, model: str,
 
     output_items: list[dict] = []
 
-    # reasoning_content（非官方字段）→ reasoning item（MS-3 最小化；MS-6 完整桥接）
+    # reasoning_content（非官方字段）→ reasoning item；
+    # drop 模式丢弃文本（usage.reasoning_tokens 仍透传）
     reasoning_text = msg.get("reasoning_content")
     if isinstance(reasoning_text, str) and reasoning_text:
-        output_items.append({
-            "type": "reasoning",
-            "id": _gen_id("rs_"),
-            "summary": [{"type": "summary_text", "text": reasoning_text}],
-        })
+        from .common import reasoning_passthrough_enabled
+        if reasoning_passthrough_enabled():
+            output_items.append({
+                "type": "reasoning",
+                "id": _gen_id("rs_"),
+                "summary": [{"type": "summary_text", "text": reasoning_text}],
+            })
 
     # content text → message item
     content = msg.get("content")

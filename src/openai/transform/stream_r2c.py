@@ -243,6 +243,10 @@ class StreamTranslator:
         yield _mk_chunk(self.state, delta={"refusal": text})
 
     def _on_reasoning_delta(self, data: dict) -> Iterator[bytes]:
+        # drop 模式：丢弃 reasoning 文本（usage.reasoning_tokens 不受影响）
+        from .common import reasoning_passthrough_enabled
+        if not reasoning_passthrough_enabled():
+            return
         text = data.get("delta")
         if not isinstance(text, str) or not text:
             return

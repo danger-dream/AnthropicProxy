@@ -197,11 +197,14 @@ class StreamTranslator:
         delta = choice.get("delta") or {}
         fr = choice.get("finish_reason")
 
-        # reasoning_content 优先处理（顺序上通常 reasoning 在 message 之前）
+        # reasoning_content 优先处理（顺序上通常 reasoning 在 message 之前）。
+        # drop 模式：丢弃 reasoning 文本；不开 reasoning item（避免产生空 item）。
         rc = delta.get("reasoning_content")
         if isinstance(rc, str) and rc:
-            yield from self._switch_text_kind("reasoning")
-            yield from self._emit_reasoning_text_delta(rc)
+            from .common import reasoning_passthrough_enabled
+            if reasoning_passthrough_enabled():
+                yield from self._switch_text_kind("reasoning")
+                yield from self._emit_reasoning_text_delta(rc)
 
         content = delta.get("content")
         if isinstance(content, str) and content:

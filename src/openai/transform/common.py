@@ -106,3 +106,34 @@ def extract_usage_responses(obj: Any) -> dict:
 
 def _zero() -> dict:
     return {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0}
+
+
+# ─── reasoning bridge 配置 ───────────────────────────────────────
+#
+# 两种模式：
+#   - "passthrough"（默认）：在 chat ↔ responses 之间双向映射 reasoning 文本
+#     - chat 侧通过非官方字段 `message.reasoning_content`（DeepSeek 等生态）
+#     - responses 侧通过 reasoning item 的 summary_text
+#   - "drop"：丢弃 reasoning 文本（usage.reasoning_tokens 不受影响，仍透传）
+#
+# encrypted_content：本 proxy 不处理加密推理（chat 无对应字段）；同协议
+# passthrough 路径会原样转发，跨变体路径由 guard 在 include 里拦截。
+
+
+def reasoning_bridge_mode() -> str:
+    """返回当前 reasoning 桥接模式。未设/非法值均回落 'passthrough'。"""
+    from .. import __name__ as _pkg  # noqa: F401 —— 确保 package 可用
+    try:
+        # 延迟 import 避免 common.py 变成 config 依赖图的叶节点时循环
+        from ... import config as _config
+        raw = ((_config.get().get("openai") or {}).get("reasoningBridge") or "passthrough")
+    except Exception:
+        raw = "passthrough"
+    mode = str(raw).lower().strip()
+    if mode not in ("passthrough", "drop"):
+        return "passthrough"
+    return mode
+
+
+def reasoning_passthrough_enabled() -> bool:
+    return reasoning_bridge_mode() == "passthrough"
