@@ -88,6 +88,29 @@ _ERR_TYPE_ANTHROPIC_TO_OPENAI = {
 }
 
 
+def _apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dict:
+    """跨变体非流式响应反向：对下游 JSON 做格式转换。
+
+    `translator_ctx` 由 OpenAIApiChannel.build_upstream_request 填入；
+    目前两个合法值：
+      - "chat_to_responses"：上游 responses JSON → 下游 chat.completion JSON
+      - "responses_to_chat"：上游 chat.completion JSON → 下游 responses JSON
+    其他值原样返回。
+    """
+    if not isinstance(translator_ctx, dict):
+        return obj
+    name = translator_ctx.get("response_translator")
+    model = translator_ctx.get("model_for_response") or ""
+    if name == "chat_to_responses":
+        from .openai.transform.chat_to_responses import translate_response as _t
+        return _t(obj, model=model)
+    if name == "responses_to_chat":
+        from .openai.transform.responses_to_chat import translate_response as _t2
+        return _t2(obj, model=model,
+                   previous_response_id=translator_ctx.get("previous_response_id"))
+    return obj
+
+
 def _translate_err_type(anth_type: str, ingress: str) -> str:
     if ingress == "anthropic":
         return anth_type
@@ -132,6 +155,7 @@ _OUTCOMES_NO_COOLDOWN = {
     "success",
     "http_auth_error",   # 先刷 token 再判
     "transform_error",   # 代理自己 bug，和上游无关
+    "guard_error",       # 请求级 4xx：跨变体 guard 拒绝，与 ch 无关
 }
 
 
@@ -235,6 +259,20 @@ async def run_failover(
             # 注意：scorer / cooldown / affinity / log_db 在 _try_channel 内完成
             return result.response
 
+        # 请求级 guard 错误：所有 openai 候选语义一致，切也无用，直接短路 4xx
+        if result.outcome == "guard_error":
+            status = int(result.http_status or 400)
+            msg = result.error_detail or "request rejected by guard"
+            total_ms = int((time.time() - start_time) * 1000)
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, msg[:4000], retry_count,
+                final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
+                connect_ms=None, first_token_ms=None, total_ms=total_ms,
+                http_status=status, affinity_hit=affinity_hit,
+            )
+            return _json_error_for_ingress(ingress_protocol, status,
+                                           errors.ErrType.INVALID_REQUEST, msg)
+
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
         if (
             ch.type == "oauth"
@@ -327,6 +365,15 @@ async def _try_channel(
             body, resolved_model, ingress_protocol=ingress_protocol,
         )
     except Exception as exc:
+        # GuardError（OpenAI 跨变体死角）带 .status / .err_type / .message 属性；
+        # 视为"请求在当前 ch 不可服务"，短路到客户端的 4xx，不再切下一候选
+        # （所有 openai 候选的 guard 语义一致；切了也同样失败）。
+        if hasattr(exc, "status") and hasattr(exc, "err_type") and hasattr(exc, "message"):
+            return AttemptResult(
+                outcome="guard_error",
+                error_detail=str(getattr(exc, "message", exc))[:2000],
+                http_status=int(getattr(exc, "status", 400)),
+            )
         traceback.print_exc()
         return AttemptResult(
             outcome="transform_error",
@@ -435,6 +482,7 @@ async def _try_channel(
                 messages, api_key_name, client_ip,
                 fp_query, retry_count_so_far, affinity_hit,
                 ingress_protocol=ingress_protocol,
+                translator_ctx=upstream_req.translator_ctx,
             )
 
         # 4. 流式分支
@@ -445,6 +493,7 @@ async def _try_channel(
             request_id, messages, api_key_name, client_ip,
             fp_query, retry_count_so_far, affinity_hit,
             ingress_protocol=ingress_protocol,
+            translator_ctx=upstream_req.translator_ctx,
         )
     except Exception as exc:
         traceback.print_exc()
@@ -474,6 +523,7 @@ async def _consume_non_stream(
     messages: list, api_key_name: Optional[str], client_ip: str,
     fp_query: Optional[str], retry_count_so_far: int, affinity_hit: int,
     *, ingress_protocol: str = "anthropic",
+    translator_ctx: Optional[dict] = None,
 ) -> AttemptResult:
     # 读 body：用剩余总时间作为硬超时（httpx 的 read timeout 只保证单次 chunk 间隔）
     cfg = config.get()
@@ -563,7 +613,7 @@ async def _consume_non_stream(
         if fp_write:
             affinity.upsert(fp_write, ch.key, resolved_model)
 
-    # 落库
+    # 落库（用**上游原始响应体**，方便排错；翻译后的下游响应体由 JSONResponse 现场构造）
     await asyncio.to_thread(
         log_db.finish_success, request_id, ch.key, ch.type, resolved_model,
         input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"],
@@ -574,8 +624,11 @@ async def _consume_non_stream(
         http_status=upstream_resp.status_code,
     )
 
+    # 跨变体：把上游 JSON 反向成 ingress 期望的格式；同协议 translator_ctx=None 即原样
+    out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
+
     response = JSONResponse(
-        content=obj,
+        content=out_obj,
         status_code=upstream_resp.status_code,
         headers=resp_headers,
     )
@@ -597,6 +650,7 @@ async def _consume_stream(
     request_id: str, messages: list, api_key_name: Optional[str], client_ip: str,
     fp_query: Optional[str], retry_count_so_far: int, affinity_hit: int,
     *, ingress_protocol: str = "anthropic",
+    translator_ctx: Optional[dict] = None,
 ) -> AttemptResult:
     aiter = upstream_resp.aiter_bytes()
 

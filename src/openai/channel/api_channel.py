@@ -3,9 +3,10 @@
 由 `src/channel/registry.py` 的 factory 分派触发：config 中 protocol 为
 `openai-chat` 或 `openai-responses` 的 channel entry 会实例化本类。
 
-MS-2：实现同协议透传（chat→chat / responses→responses）。跨变体请求
-（chat ingress 打到 responses 上游、或反之）暂时抛 NotImplementedError，
-由 MS-3 起的 transform/stream_*.py 接入翻译器。
+MS-3 起：跨变体请求（chat→openai-responses / responses→openai-chat）会
+先过 transform.guard 的跨变体 guard，再调用对应 translate_request；同时在
+UpstreamRequest.translator_ctx 里带上"响应反向所用的 translate_response"
+函数名，failover 的非流式路径据此做反向。SSE 流式翻译在 MS-4 接入。
 """
 
 from __future__ import annotations
@@ -14,7 +15,9 @@ import json
 from typing import Optional
 
 from ...channel.base import Channel, ChannelDisplay, UpstreamRequest
-from ..transform import common
+from ..transform import (
+    chat_to_responses, common, guard, responses_to_chat,
+)
 
 
 # User-Agent 故意不伪装成官方 SDK：上游看到 proxy 身份便于排错，也避免与
@@ -59,8 +62,9 @@ class OpenAIApiChannel(Channel):
         """按 (ingress_protocol, self.protocol) 分派。
 
         - `(chat, openai-chat)` / `(responses, openai-responses)` → 同协议透传
-        - `(chat, openai-responses)` / `(responses, openai-chat)` → 跨变体（MS-3）
-        - 其他组合：scheduler family 过滤应已拦住；这里做防御性 400
+        - `(chat, openai-responses)` → chat→responses 翻译
+        - `(responses, openai-chat)` → responses→chat 翻译
+        - 其他组合：scheduler family 过滤应已拦住；这里做防御性报错
         """
         if ingress_protocol not in ("chat", "responses"):
             raise ValueError(
@@ -72,12 +76,13 @@ class OpenAIApiChannel(Channel):
             return self._build_chat_passthrough(requested_body, resolved_model)
         if ingress_protocol == "responses" and self.protocol == "openai-responses":
             return self._build_responses_passthrough(requested_body, resolved_model)
+        if ingress_protocol == "chat" and self.protocol == "openai-responses":
+            return self._build_chat_to_responses(requested_body, resolved_model)
+        if ingress_protocol == "responses" and self.protocol == "openai-chat":
+            return self._build_responses_to_chat(requested_body, resolved_model)
 
-        # 跨变体：暂不支持
-        raise NotImplementedError(
-            f"cross-variant translation ingress={ingress_protocol!r} → "
-            f"upstream={self.protocol!r} is scheduled for MS-3 "
-            "(see docs/openai/09-milestones.md)"
+        raise RuntimeError(
+            f"unreachable: ingress={ingress_protocol!r} protocol={self.protocol!r}"
         )
 
     # ─── 同协议透传 ────────────────────────────────────────────
@@ -90,6 +95,7 @@ class OpenAIApiChannel(Channel):
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
+            translator_ctx=None,
         )
 
     def _build_responses_passthrough(self, body: dict, resolved_model: str) -> UpstreamRequest:
@@ -100,6 +106,47 @@ class OpenAIApiChannel(Channel):
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
+            translator_ctx=None,
+        )
+
+    # ─── 跨变体翻译 ────────────────────────────────────────────
+
+    def _build_chat_to_responses(self, body: dict, resolved_model: str) -> UpstreamRequest:
+        """chat ingress → openai-responses 上游。"""
+        guard.guard_chat_to_responses(body)
+        payload = chat_to_responses.translate_request(body)
+        payload["model"] = resolved_model
+        return UpstreamRequest(
+            url=f"{self.base_url}/v1/responses",
+            headers=self._headers(),
+            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            dynamic_tool_map=None,
+            translator_ctx={
+                "ingress": "chat",
+                "upstream_protocol": "openai-responses",
+                # failover._consume_non_stream 按此字段选 translate_response
+                "response_translator": "chat_to_responses",
+                "model_for_response": resolved_model,
+            },
+        )
+
+    def _build_responses_to_chat(self, body: dict, resolved_model: str) -> UpstreamRequest:
+        """responses ingress → openai-chat 上游。"""
+        guard.guard_responses_to_chat(body, store_enabled=False)
+        payload = responses_to_chat.translate_request(body)
+        payload["model"] = resolved_model
+        return UpstreamRequest(
+            url=f"{self.base_url}/v1/chat/completions",
+            headers=self._headers(),
+            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            dynamic_tool_map=None,
+            translator_ctx={
+                "ingress": "responses",
+                "upstream_protocol": "openai-chat",
+                "response_translator": "responses_to_chat",
+                "model_for_response": resolved_model,
+                "previous_response_id": body.get("previous_response_id"),
+            },
         )
 
     def _headers(self) -> dict[str, str]:

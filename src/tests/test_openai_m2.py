@@ -419,26 +419,9 @@ async def test_allowed_protocols_mismatch_403(m):
     print("  [PASS] allowedProtocols=anthropic blocks chat ingress → 403")
 
 
-async def test_cross_variant_not_implemented_yet(m):
-    """chat ingress 打到 openai-responses 上游：MS-3 才实现翻译；MS-2 期望 503。"""
-    _setup(m)
-    _install_keys(m, _default_key())
-    router = MockRouter()
-    chR = _make_openai_channel(m, "oaiR", "https://r.example",
-                               protocol="openai-responses", real="gpt-5", alias="gpt-5")
-    _install_channels(m, [chR])
-
-    body = {"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}], "stream": False}
-    resp, mc = await _call_openai_handler(m, router, "chat", body)
-    # build_upstream_request 抛 NotImplementedError → transform_error outcome
-    # → 无 cooldown、候选耗尽 → 503，error type 翻译成 invalid_request_error
-    # （_err_type_from_outcome("transform_error", None) 返回 ErrType.INVALID_REQUEST）
-    assert resp.status_code == 503
-    out = json.loads(resp.body)
-    assert out["error"]["type"] in ("invalid_request_error", "server_error")
-    assert "All upstream channels failed" in out["error"]["message"]
-    await mc.aclose()
-    print("  [PASS] cross-variant (chat → openai-responses) → 503 (MS-3 will implement)")
+# 注：MS-2 时这里曾有 test_cross_variant_not_implemented_yet，验证 MS-2 阶段
+# 跨变体请求会 503。MS-3 已实现跨变体翻译，这个用例移到 test_openai_m3.py 里
+# 以真实上游 mock 验证端到端行为。
 
 
 async def test_no_candidates_family_filtered(m):
@@ -507,7 +490,6 @@ def main() -> int:
         _async(test_chat_500_switches_next),
         _async(test_guard_chat_n_gt_1),
         _async(test_allowed_protocols_mismatch_403),
-        _async(test_cross_variant_not_implemented_yet),
         _async(test_no_candidates_family_filtered),
         test_list_models_family_filter,
     ]
