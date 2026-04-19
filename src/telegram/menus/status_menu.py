@@ -171,7 +171,8 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
         hot = [(k, v) for k, v in utils.items() if v is not None and v >= threshold_pct]
         if hot:
             parts = " | ".join(f"{k} {v:.0f}%" for k, v in hot)
-            out.append(f"⚠ <code>{ui.escape_html(email)}</code> — {parts}")
+            prov_tag = " 🅾" if oauth_manager.provider_of(acc) == "openai" else ""
+            out.append(f"⚠ <code>{ui.escape_html(email)}</code>{prov_tag} — {parts}")
     return out
 
 

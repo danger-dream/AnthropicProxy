@@ -19,12 +19,47 @@ from typing import Optional
 import httpx
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+import threading
+
 from . import (
     affinity, blacklist, config, cooldown, errors, fingerprint, log_db,
-    notifier, oauth_manager, scorer, upstream,
+    notifier, oauth_manager, scorer, state_db, upstream,
 )
 from .channel.base import Channel
+from .channel.openai_oauth_channel import OpenAIOAuthChannel
+from .oauth import openai as openai_provider
 from .scheduler import ScheduleResult
+
+
+# ─── OpenAI Codex 响应头 snapshot 节流 ───────────────────────────
+#
+# ChatGPT internal API 把 rate-limit 放在每次请求的 response header 里，没有
+# 独立 usage 端点。为避免每次请求都写一次 state_db，按 email 30s 节流（与
+# sub2api openAICodexSnapshotPersistMinInterval 对齐）。吞掉所有异常，不影响主链路。
+
+_CODEX_SNAPSHOT_WRITE_INTERVAL_S = 30.0
+_codex_snapshot_last: dict[str, float] = {}
+_codex_snapshot_lock = threading.Lock()
+
+
+def _maybe_record_codex_snapshot(ch: Channel, resp: httpx.Response) -> None:
+    if not isinstance(ch, OpenAIOAuthChannel):
+        return
+    try:
+        snap = openai_provider.parse_rate_limit_headers(dict(resp.headers))
+        if not snap:
+            return
+        email = ch.email
+        now = time.time()
+        with _codex_snapshot_lock:
+            last = _codex_snapshot_last.get(email, 0.0)
+            if now - last < _CODEX_SNAPSHOT_WRITE_INTERVAL_S:
+                return
+            _codex_snapshot_last[email] = now
+        normalized = openai_provider.normalize_codex_snapshot(snap)
+        state_db.quota_save_openai_snapshot(email, snap, normalized)
+    except Exception as exc:
+        print(f"[failover] codex snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
 
 
 # ─── 协议相关工具集分派 ──────────────────────────────────────────
@@ -529,6 +564,9 @@ async def _try_channel(
                                  error_detail=f"transport: {exc}")
 
         connect_ms = int((time.time() - t_send) * 1000)
+
+        # 1.5 OpenAI Codex 响应头 snapshot：成功/失败分支前都先记一次
+        _maybe_record_codex_snapshot(ch, upstream_resp)
 
         # 2. HTTP 状态码检查
         if upstream_resp.status_code >= 400:

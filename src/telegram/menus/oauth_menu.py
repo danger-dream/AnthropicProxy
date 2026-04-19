@@ -117,7 +117,14 @@ def _format_account_block(acc: dict) -> str:
     elif reason == "auth_error":
         tag = " [认证失败]"
 
-    lines = [f"{icon} <code>{ui.escape_html(email)}</code>{tag}"]
+    # provider 图标：claude 不显示（默认），openai 加 🅾 + plan
+    prov = oauth_manager.provider_of(acc)
+    provider_tag = ""
+    if prov == "openai":
+        plan = acc.get("plan_type") or ""
+        provider_tag = f" 🅾 OpenAI{' · ' + ui.escape_html(plan) if plan else ''}"
+
+    lines = [f"{icon} <code>{ui.escape_html(email)}</code>{provider_tag}{tag}"]
 
     # Token 过期时间（绝对 + 倒计时）
     expired = acc.get("expired")
@@ -195,6 +202,20 @@ def _format_usage_block(email: str) -> str:
         line = _line(label, row.get(util_k), row.get(reset_k))
         if line:
             out.append(line)
+
+    # OpenAI Codex 原始 primary/secondary 窗口（用于排查，按需显示）
+    codex_primary_pct = row.get("codex_primary_used_pct")
+    codex_primary_win = row.get("codex_primary_window_min")
+    codex_secondary_pct = row.get("codex_secondary_used_pct")
+    codex_secondary_win = row.get("codex_secondary_window_min")
+    if codex_primary_pct is not None or codex_secondary_pct is not None:
+        out.append("<i>── Codex 原始窗口 ──</i>")
+        if codex_primary_pct is not None:
+            win = f"{codex_primary_win}min" if codex_primary_win else "?"
+            out.append(f"primary ({win}): {codex_primary_pct:.0f}%")
+        if codex_secondary_pct is not None:
+            win = f"{codex_secondary_win}min" if codex_secondary_win else "?"
+            out.append(f"secondary ({win}): {codex_secondary_pct:.0f}%")
 
     ex_used = row.get("extra_used")
     ex_limit = row.get("extra_limit")
@@ -337,9 +358,19 @@ def _detail_text_and_kb(email: str) -> tuple[Optional[str], Optional[dict]]:
 
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason") or "—"
+    prov = oauth_manager.provider_of(acc)
+    provider_line = ""
+    if prov == "openai":
+        plan = acc.get("plan_type") or "?"
+        acct_id = acc.get("chatgpt_account_id") or "?"
+        provider_line = (
+            f"Provider: <code>🅾 OpenAI (Codex)</code> · plan: <code>{ui.escape_html(plan)}</code>\n"
+            f"Account ID: <code>{ui.escape_html(acct_id)}</code>\n"
+        )
     text = (
         f"{icon} <b>{ui.escape_html(email)}</b>\n\n"
         f"状态: <code>{ui.escape_html('enabled' if acc.get('enabled', True) and not acc.get('disabled_reason') else reason)}</code>\n"
+        f"{provider_line}"
         f"过期: <code>{_format_bjt(acc.get('expired'))}</code> ({_format_remaining(acc.get('expired'))})\n"
         f"上次刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
         f"<b>📊 使用量</b>\n{_format_usage_block(email)}"
@@ -429,6 +460,11 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str) -> N
     email = ui.resolve_code(short)
     if email is None:
         ui.answer_cb(cb_id, "短码已失效")
+        return
+    # OpenAI 没有独立 usage 端点，用量由响应头在每次请求时更新。
+    # 点"刷新用量"没啥意义，直接给友好提示。
+    if oauth_manager.provider_of(email) == "openai":
+        ui.answer_cb(cb_id, "OpenAI 用量由响应头更新，无独立端点", show_alert=True)
         return
     ui.answer_cb(cb_id, "拉取中...")
 
@@ -538,9 +574,14 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
     accounts = oauth_manager.list_accounts()
     ok = 0
     fail = 0
+    skipped_openai = 0
     for acc in accounts:
         email = acc.get("email")
         if not email:
+            continue
+        # OpenAI 账户没有独立 usage 端点，跳过
+        if oauth_manager.provider_of(acc) == "openai":
+            skipped_openai += 1
             continue
         result = _run_sync(oauth_manager.fetch_usage(email))
         if isinstance(result, Exception):
@@ -549,7 +590,10 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
         state_db.quota_save(email, oauth_manager.flatten_usage(result))
         ok += 1
     show(chat_id, message_id)
-    ui.send(chat_id, f"✅ 刷新完成：成功 {ok}，失败 {fail}")
+    parts = [f"✅ 刷新完成：成功 {ok}", f"失败 {fail}"]
+    if skipped_openai:
+        parts.append(f"跳过 OpenAI {skipped_openai}（用量由响应头更新）")
+    ui.send(chat_id, "，".join(parts))
 
 
 # ─── 新增账户：入口 ──────────────────────────────────────────────
