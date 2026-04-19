@@ -110,6 +110,14 @@ async def lifespan(app: FastAPI):
     log_db.init()
     await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
 
+    # 老数据 provider 字段回填（无 provider 字段的账户默认 claude；幂等）
+    try:
+        migrated = oauth_manager.migrate_provider_field()
+        if migrated:
+            print(f"[oauth] migrated provider='claude' for {migrated} legacy account(s)")
+    except Exception as exc:
+        print(f"[oauth] provider field migration failed: {exc}")
+
     # 内存表从 state.db 恢复
     affinity.init()
     cooldown.init()

@@ -101,9 +101,38 @@ def init() -> None:
     conn = _get_conn()
     with _write_lock:
         conn.executescript(_schema_sql())
+        _migrate_oauth_quota_cache_openai_cols(conn)
         conn.commit()
     _initialized = True
     print(f"[state_db] Using {_db_path}")
+
+
+# 自 MS-OpenAI OAuth 接入起，oauth_quota_cache 新增了 Codex 原始/归一化用量字段。
+# 老库没有这些列 → 此函数在 init() 时幂等补齐。SQLite `ADD COLUMN` 不支持
+# IF NOT EXISTS，改用 PRAGMA table_info 比对再决定是否加，重复启动无副作用。
+_OPENAI_EXTRA_COLUMNS: list[tuple[str, str]] = [
+    # 原始 primary/secondary（便于排查问题）
+    ("codex_primary_used_pct",          "REAL"),
+    ("codex_primary_reset_sec",         "INTEGER"),
+    ("codex_primary_window_min",        "INTEGER"),
+    ("codex_secondary_used_pct",        "REAL"),
+    ("codex_secondary_reset_sec",       "INTEGER"),
+    ("codex_secondary_window_min",      "INTEGER"),
+    ("codex_primary_over_secondary_pct", "REAL"),
+]
+
+
+def _migrate_oauth_quota_cache_openai_cols(conn: sqlite3.Connection) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")}
+    for col, col_type in _OPENAI_EXTRA_COLUMNS:
+        if col in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE oauth_quota_cache ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError as exc:
+            # 并发启动下可能被另一进程抢跑；忽略 "duplicate column name"
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def _get_conn() -> sqlite3.Connection:
