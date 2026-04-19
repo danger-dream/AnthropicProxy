@@ -79,15 +79,19 @@ class OpenAIOAuthChannel(Channel):
         self.chatgpt_account_id = str(account.get("chatgpt_account_id") or "")
         self.plan_type = str(account.get("plan_type") or "")
 
-        # 账户配置优先；缺省退到 codex 家族"所有已知别名"（70+ 条，涵盖
-        # gpt-5 / gpt-5-codex / gpt-5.3-xhigh 等下游可能直接发的历史名字）。
-        # 真正规范化到 gpt-5.1 / gpt-5.1-codex 这 ~12 个上游认识的 canonical
-        # 名，由 codex_oauth_transform.apply_codex_oauth_transform 完成。
+        # 账户 models 优先级：
+        #   1) 账户 entry 自带 models（TG 面板里手动填的）
+        #   2) 构造参数 default_models（registry 注入，向后兼容；当前为 None）
+        #   3) config.oauth.providers.openai.defaultModels（默认 4 个常用 codex 模型）
+        # 上游 codex endpoint 只认规范名，transform 把别名映射过去；所以这里
+        # 只要列出对外暴露的名字即可。
         models = account.get("models") or []
-        self.models: list[str] = (
-            list(models) if models
-            else list(default_models or codex_oauth_transform.codex_known_aliases())
-        )
+        if models:
+            self.models = list(models)
+        elif default_models:
+            self.models = list(default_models)
+        else:
+            self.models = list(_provider_cfg().get("defaultModels") or [])
 
     # ─── 模型查询 ─────────────────────────────────────────────
 

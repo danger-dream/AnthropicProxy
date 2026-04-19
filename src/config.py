@@ -109,7 +109,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "oauth": {
         "mockMode": False,
-        # provider 专属设置（claude 无配置项；openai 在此登记）
+        # provider 专属设置（claude 无配置项;openai 在此登记）
         "providers": {
             "openai": {
                 # 是否强制把上游请求的 User-Agent 伪装成 Codex CLI
@@ -124,6 +124,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # 出的 session 标识，防止不同 API Key 之间会话粘性交叉污染。
                 # 默认 True，基于 prompt_cache_key 派生。
                 "isolateSessionId": True,
+                # 账户未手填 models 时的默认模型列表。下游客户端发其中任何一个
+                # 都能命中调度；发列表外的 codex 家族别名会被 scheduler 跳过
+                # （需要账户手动补入 models）。transform 会把别名规范化到
+                # gpt-5.1 / gpt-5.1-codex 等上游 canonical 名再发出。
+                "defaultModels": [
+                    "gpt-5.2",
+                    "gpt-5.2-codex",
+                    "gpt-5.3-codex",
+                    "gpt-5.4",
+                ],
             },
         },
     },

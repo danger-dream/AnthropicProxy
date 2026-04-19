@@ -230,23 +230,33 @@ def test_transform_normalizes_chat_style_tools(m):
     print("  [PASS] transform: chat-style tools flattened; invalid dropped; non-function preserved")
 
 
-def test_channel_supports_known_aliases(m):
-    """Commit 5 ②: 默认 models 列表应包含所有已知别名（gpt-5 / gpt-5-codex 等）。"""
+def test_channel_accepts_any_alias_when_account_models_set(m):
+    """账户手动填的 models 列表可包含任意 codex 家族别名；transform 层规范化上游"""
     _setup(m)
-    # 故意不设 models，让 Channel 回落到默认别名集
     m["oauth_manager"].add_account({
         "email": "alias@openai.test", "provider": "openai",
         "access_token": "x", "refresh_token": "r",
         "chatgpt_account_id": "acct-alias",
+        # 用户手填了老别名 + 变体后缀
+        "models": ["gpt-5", "gpt-5-codex", "gpt-5.1-codex-max-xhigh",
+                   "codex-mini-latest"],
     })
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("alias@openai.test"))
-    # 客户端发老别名应命中
-    for alias in ("gpt-5", "gpt-5-codex", "gpt-5.3-xhigh",
-                  "gpt-5.1-codex-max-xhigh", "codex-mini-latest"):
+    for alias in ("gpt-5", "gpt-5-codex", "gpt-5.1-codex-max-xhigh",
+                  "codex-mini-latest"):
         assert ch.supports_model(alias) == alias, f"{alias} should be supported"
-    # 未知名字仍然拒绝
+    # 不在账户列表里的仍然拒绝
+    assert ch.supports_model("gpt-5.2") is None
     assert ch.supports_model("gpt-4o") is None
-    print("  [PASS] channel: default models accept all known codex aliases (70+)")
+    # 通过 build_upstream_request 验证发给上游时会规范化
+    import asyncio, json
+    req = asyncio.run(ch.build_upstream_request(
+        {"model": "gpt-5-codex", "input": "hi"}, "gpt-5-codex",
+        ingress_protocol="responses",
+    ))
+    payload = json.loads(req.body)
+    assert payload["model"] == "gpt-5.1-codex"   # 规范化到上游认的 canonical
+    print("  [PASS] channel: account.models can carry aliases; transform normalizes upstream")
 
 
 def test_transform_model_map(m):
@@ -289,13 +299,27 @@ def test_channel_basic(m):
 
 
 def test_channel_default_models_fallback(m):
+    """账户不设 models → Channel 回落到 config.oauth.providers.openai.defaultModels"""
     _setup(m)
-    # 账户不设 models → Channel 回落到 codex_model_ids
-    _add_openai_acc(m, email="no-models@x", models=[])
+    # 直接调 add_account（不走 _add_openai_acc helper，后者会塞硬编码的 models）
+    m["oauth_manager"].add_account({
+        "email": "no-models@x",
+        "provider": "openai",
+        "access_token": "x", "refresh_token": "r",
+        "chatgpt_account_id": "acct",
+        # 故意不给 models
+    })
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("no-models@x"))
     models = ch.list_client_models()
-    assert "gpt-5.1" in models and "gpt-5.1-codex" in models
-    print("  [PASS] channel: default models fallback when account.models=[]")
+    # 默认 4 个：gpt-5.2 / gpt-5.2-codex / gpt-5.3-codex / gpt-5.4
+    assert set(models) == {"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4"}, models
+    # supports_model 命中
+    for m_id in ["gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4"]:
+        assert ch.supports_model(m_id) == m_id
+    # 不在默认列表的别名不会命中（需用户手动补 models）
+    assert ch.supports_model("gpt-5") is None
+    assert ch.supports_model("gpt-5.1") is None
+    print("  [PASS] channel: default 4 models from config.providers.openai.defaultModels")
 
 
 def test_channel_responses_ingress(m):
@@ -519,7 +543,7 @@ def main():
         test_transform_system_appended_to_existing_instructions,
         test_transform_legacy_functions,
         test_transform_normalizes_chat_style_tools,
-        test_channel_supports_known_aliases,
+        test_channel_accepts_any_alias_when_account_models_set,
         test_transform_model_map,
         test_channel_basic,
         test_channel_default_models_fallback,
