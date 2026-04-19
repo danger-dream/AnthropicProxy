@@ -302,6 +302,35 @@ def test_refresh_notice_openai_wording(m):
     print("  [PASS] _build_refresh_notice: openai gets header-path wording")
 
 
+def test_openai_refresh_updates_id_token_metadata(m):
+    """force_refresh 成功后应从新 id_token 解出 chatgpt_account_id / plan_type /
+    organization_id 写回 config，便于 plan 升级/换组织后的 UI 立即反映。"""
+    _setup(m)
+    om = m["oauth_manager"]
+    # 预置一个旧 metadata 的账户
+    om.add_account({
+        "email": "meta@openai.test",
+        "provider": "openai",
+        "access_token": "old-at", "refresh_token": "rt-meta",
+        "id_token": "old.token.sig",
+        "chatgpt_account_id": "old-acct",
+        "plan_type": "free",
+        "organization_id": "old-org",
+    })
+
+    import asyncio
+    asyncio.run(om.force_refresh("meta@openai.test"))
+
+    acc = om.get_account("meta@openai.test")
+    # mockMode 的 _mock_token_response 返回新 id_token，里面 plan=plus、
+    # chatgpt_account_id=mock-acct-<hex>、organizations 含 org-mock
+    assert acc["plan_type"] == "plus", acc.get("plan_type")
+    assert acc["chatgpt_account_id"].startswith("mock-acct-"), acc.get("chatgpt_account_id")
+    assert acc["organization_id"] == "org-mock", acc.get("organization_id")
+    assert acc["id_token"] != "old.token.sig"
+    print("  [PASS] force_refresh: openai decodes new id_token → updates plan/account_id/org")
+
+
 def test_fetch_usage_openai_raises_not_supported(m):
     _setup(m)
     om = m["oauth_manager"]
@@ -438,6 +467,7 @@ def main():
         test_migrate_provider_field_idempotent,
         test_migrate_provider_field_skip_write_when_nothing_to_do,
         test_refresh_notice_openai_wording,
+        test_openai_refresh_updates_id_token_metadata,
         test_fetch_usage_openai_raises_not_supported,
         test_tg_openai_add_via_pkce,
         test_tg_openai_add_state_mismatch,

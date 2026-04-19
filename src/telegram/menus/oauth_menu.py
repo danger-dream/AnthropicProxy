@@ -154,7 +154,13 @@ def _format_account_block(acc: dict) -> str:
         if fh_util is None and sd_util is None:
             lines.append("  📊 用量: <i>尚未获取</i>")
     else:
-        lines.append("  📊 用量: <i>尚未获取</i>（请点账户详情手动刷新一次）")
+        # OpenAI 账户没有独立 usage 端点；只有实际 codex 请求经过才会写响应头
+        # snapshot 到 quota_cache。这里区别提示，避免误导用户"手动刷新"按钮能拉
+        # 回用量（它不能，只能刷 Token）。
+        if oauth_manager.provider_of(acc) == "openai":
+            lines.append("  📊 用量: <i>由响应头更新（需发一次 codex 请求）</i>")
+        else:
+            lines.append("  📊 用量: <i>尚未获取</i>（请点账户详情手动刷新一次）")
 
     # 月度统计（本月 log_db 聚合）
     try:
@@ -462,10 +468,25 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str) -> N
     if email is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    # OpenAI 没有独立 usage 端点，用量由响应头在每次请求时更新。
-    # 点"刷新用量"没啥意义，直接给友好提示。
+    # OpenAI 没有独立 usage 端点。把按钮退化为 force_refresh：
+    # 刷一次 token 顺带更新 last_refresh / expired，并解新 id_token 里
+    # 可能轮换的 plan_type / chatgpt_account_id / organization_id。实际的
+    # 使用量 (5h / 7d) 仍然只能在真实 codex 请求经过时由响应头写入。
     if oauth_manager.provider_of(email) == "openai":
-        ui.answer_cb(cb_id, "OpenAI 用量由响应头更新，无独立端点", show_alert=True)
+        ui.answer_cb(cb_id, "刷新 Token 中...")
+        result = _run_sync(oauth_manager.force_refresh(email))
+        if isinstance(result, Exception):
+            ui.send(chat_id,
+                    f"❌ 刷新失败: <code>{ui.escape_html(str(result))}</code>")
+            return
+        text, kb = _detail_text_and_kb(email)
+        if text:
+            ui.edit(
+                chat_id, message_id,
+                "✅ <i>OpenAI 无独立 usage 端点；已刷新 Token 与账户元信息。"
+                "真实用量由后续 codex 请求的响应头更新。</i>\n\n" + text,
+                reply_markup=kb,
+            )
         return
     ui.answer_cb(cb_id, "拉取中...")
 
@@ -575,14 +596,21 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
     accounts = oauth_manager.list_accounts()
     ok = 0
     fail = 0
-    skipped_openai = 0
+    openai_ok = 0       # OpenAI 账户：没有独立 usage，退化为 force_refresh token
+    openai_fail = 0
     for acc in accounts:
         email = acc.get("email")
         if not email:
             continue
-        # OpenAI 账户没有独立 usage 端点，跳过
         if oauth_manager.provider_of(acc) == "openai":
-            skipped_openai += 1
+            # 没有独立 usage 端点，点"刷新全部"对 openai 意为"批量刷新 Token"
+            # （顺带更新 expired / last_refresh / id_token metadata）。真实用量
+            # 由后续 codex 请求响应头更新，这里不动 quota_cache。
+            res = _run_sync(oauth_manager.force_refresh(email))
+            if isinstance(res, Exception):
+                openai_fail += 1
+            else:
+                openai_ok += 1
             continue
         result = _run_sync(oauth_manager.fetch_usage(email))
         if isinstance(result, Exception):
@@ -591,10 +619,14 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
         state_db.quota_save(email, oauth_manager.flatten_usage(result))
         ok += 1
     show(chat_id, message_id)
-    parts = [f"✅ 刷新完成：成功 {ok}", f"失败 {fail}"]
-    if skipped_openai:
-        parts.append(f"跳过 OpenAI {skipped_openai}（用量由响应头更新）")
-    ui.send(chat_id, "，".join(parts))
+    parts = []
+    if ok or fail:
+        parts.append(f"Claude 用量: 成功 {ok} / 失败 {fail}")
+    if openai_ok or openai_fail:
+        parts.append(f"OpenAI Token 刷新: 成功 {openai_ok} / 失败 {openai_fail}")
+    if not parts:
+        parts.append("无可刷新账户")
+    ui.send(chat_id, "✅ " + "；".join(parts))
 
 
 # ─── 新增账户：入口 ──────────────────────────────────────────────

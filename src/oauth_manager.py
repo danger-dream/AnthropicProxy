@@ -229,9 +229,20 @@ def _refresh_sync_locked(email: str, force: bool) -> str:
         }
         if "refresh_token" in data and data["refresh_token"]:
             new_fields["refresh_token"] = data["refresh_token"]
-        # OpenAI: 刷新响应若带 id_token 同步更新（email/org_id/plan 可能轮换）
+        # OpenAI: 刷新响应若带 id_token 同步更新；解码拿出最新 metadata
+        # （plan_type / chatgpt_account_id / organization_id 都可能随账户升级
+        # 或换组织而变）。email 理论上不变，不覆盖以免生成孤儿 entry。
         if provider == "openai" and data.get("id_token"):
             new_fields["id_token"] = data["id_token"]
+            try:
+                claims = openai_provider.decode_id_token(data["id_token"])
+                info = openai_provider.extract_user_info(claims)
+                for k in ("chatgpt_account_id", "organization_id", "plan_type"):
+                    v = info.get(k)
+                    if v:   # 空值不覆盖已有字段
+                        new_fields[k] = v
+            except Exception as exc:
+                print(f"[oauth] openai refresh: id_token decode failed for {email}: {exc}")
 
         _save_token_fields(email, new_fields)
         return new_fields["access_token"]

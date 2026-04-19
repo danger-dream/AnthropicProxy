@@ -261,37 +261,63 @@ def test_oauth_menu_detail_openai_shows_provider_and_codex_usage(m):
     print("  [PASS] oauth_menu detail: provider tag + plan + codex usage")
 
 
-def test_oauth_menu_refresh_usage_openai_friendly_alert(m):
+def test_oauth_menu_refresh_usage_openai_force_refreshes_token(m):
+    """OpenAI 账户点'刷新用量'退化为 force_refresh：更新 last_refresh/expired/id_token"""
     _setup(m)
     _add_openai(m, "ru@openai.test")
+
+    # 写一个旧的 access_token / expired 便于观察更新
+    def _stamp(c):
+        for a in c["oauthAccounts"]:
+            if a["email"] == "ru@openai.test":
+                a["access_token"] = "OLD-AT"
+                a["expired"] = "2026-01-01T00:00:00Z"
+                a["last_refresh"] = "2026-01-01T00:00:00Z"
+    m["config"].update(_stamp)
+
     rec = _UiRecorder()
     m["ui"].api = rec
     short = m["ui"].register_code("ru@openai.test")
     m["oauth_menu"].on_refresh_usage(42, 100, "cb", short)
-    ans = rec.last("answerCallbackQuery")
-    assert ans and "响应头" in ans["text"], ans
-    # 确认没有 fetch_usage 真实调用（mockMode 兜底，但这里要的是"根本没尝试"）
-    # 我们通过 "没有报错消息" 间接验证
-    send = rec.last("sendMessage")
-    assert send is None
-    print("  [PASS] oauth_menu refresh_usage: openai returns friendly alert, no fetch attempt")
+
+    # access_token / expired / last_refresh 都应已更新
+    acc = m["oauth_manager"].get_account("ru@openai.test")
+    assert acc["access_token"] != "OLD-AT"
+    assert acc["expired"] != "2026-01-01T00:00:00Z"
+    assert acc["last_refresh"] != "2026-01-01T00:00:00Z"
+    # 详情已重渲染（edit 带提示文字）
+    last = rec.last("editMessageText")
+    assert last and ("已刷新 Token" in last["text"] or "OpenAI" in last["text"])
+    print("  [PASS] oauth_menu refresh_usage: openai → force_refresh + re-render")
 
 
-def test_oauth_menu_refresh_all_skips_openai(m):
+def test_oauth_menu_refresh_all_refreshes_openai_tokens(m):
+    """OpenAI 账户参与 refresh_all，调 force_refresh 更新 Token 字段"""
     _setup(m)
     m["oauth_manager"].add_account({
         "email": "c@claude.test", "provider": "claude",
         "access_token": "x", "refresh_token": "x",
     })
     _add_openai(m, "o@openai.test")
+    # 记旧 token 以便对比
+    def _stamp(c):
+        for a in c["oauthAccounts"]:
+            if a["email"] == "o@openai.test":
+                a["access_token"] = "OLD-OPENAI-AT"
+    m["config"].update(_stamp)
+
     rec = _UiRecorder()
     m["ui"].api = rec
     m["oauth_menu"].on_refresh_all(42, 100, "cb")
     send = rec.last("sendMessage")
     assert send, "expected send summary"
-    # 总结行含 "跳过 OpenAI"
-    assert "跳过 OpenAI" in send["text"]
-    print("  [PASS] oauth_menu refresh_all: openai counted as skipped")
+    # 新摘要语义："OpenAI Token 刷新: 成功 1 / 失败 0"
+    assert "OpenAI Token 刷新" in send["text"], send["text"]
+    assert "成功 1" in send["text"]
+    # openai 账户 access_token 确实被换了
+    acc = m["oauth_manager"].get_account("o@openai.test")
+    assert acc["access_token"] != "OLD-OPENAI-AT"
+    print("  [PASS] oauth_menu refresh_all: openai accounts get token refreshed")
 
 
 def test_delete_account_clears_codex_snapshot_throttle(m):
@@ -376,8 +402,8 @@ def main():
         test_record_skip_non_openai_channel,
         test_record_skip_no_codex_headers,
         test_oauth_menu_detail_openai_shows_provider_and_codex_usage,
-        test_oauth_menu_refresh_usage_openai_friendly_alert,
-        test_oauth_menu_refresh_all_skips_openai,
+        test_oauth_menu_refresh_usage_openai_force_refreshes_token,
+        test_oauth_menu_refresh_all_refreshes_openai_tokens,
         test_delete_account_clears_codex_snapshot_throttle,
         test_on_refresh_token_openai_skips_fetch_usage,
         test_status_menu_quota_warnings_tags_openai,

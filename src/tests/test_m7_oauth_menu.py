@@ -252,9 +252,9 @@ def test_refresh_all_usage(m):
     # 两个都应有缓存
     assert m["state_db"].quota_load("u1@x.com") is not None
     assert m["state_db"].quota_load("u2@x.com") is not None
-    # UI 反馈含"刷新完成"
+    # UI 反馈摘要：新版按 provider 拆成两段；纯 claude 账户只会出 "Claude 用量: 成功 X / 失败 Y"
     sent = [d["text"] for _, d in rec.calls if "text" in d]
-    assert any("刷新完成" in t for t in sent)
+    assert any("Claude 用量: 成功 2" in t for t in sent), sent
     print("  [PASS] refresh_all 两个账户都写入了 quota 缓存")
 
 
