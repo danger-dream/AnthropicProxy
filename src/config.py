@@ -11,9 +11,14 @@ import threading
 from typing import Any
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# 路径可通过环境变量覆盖（测试场景用；生产不设就用默认位置）。
-# 这样能彻底防止测试污染生产 config.json。
-CONFIG_PATH = os.environ.get("ANTHROPIC_PROXY_CONFIG") or os.path.join(BASE_DIR, "config.json")
+# DATA_DIR 是所有运行时持久化文件的根目录（config.json / state.db / logs/ / .anthropic_proxy_ids.json）。
+# 优先使用环境变量 ANTHROPIC_PROXY_DATA_DIR（容器内通常是 /app/data），不设则回退到 BASE_DIR，
+# 保持现有源码安装方式（systemd 直跑）行为完全不变。
+DATA_DIR = os.environ.get("ANTHROPIC_PROXY_DATA_DIR") or BASE_DIR
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# CONFIG_PATH 仍单独支持 ANTHROPIC_PROXY_CONFIG（测试场景用），否则走 DATA_DIR/config.json。
+CONFIG_PATH = os.environ.get("ANTHROPIC_PROXY_CONFIG") or os.path.join(DATA_DIR, "config.json")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "listen": {"host": "0.0.0.0", "port": 18082},
@@ -23,10 +28,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "timeouts": {
         "connect": 10,
         "firstByte": 30,
-        "idle": 30,
+        "idle": 120,    # chunk 之间最长空闲；上游推理慢需要更宽松
         "total": 600,
     },
     "errorWindows": [1, 3, 5, 10, 15, 0],
+    # OAuth 渠道宽容次数：前 N 次失败只累计计数不进入冷却（成功一次清零）。
+    # 第 N+1 次失败开始按 errorWindows 阶梯。设计目的：避免单 OAuth 账号
+    # 因偶发 timeout 立即冷却导致所有 Claude 模型不可用。
+    "oauthGraceCount": 3,
     "affinity": {
         "ttlMinutes": 30,
         "threshold": 3.0,

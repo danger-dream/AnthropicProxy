@@ -140,6 +140,7 @@ curl http://<server>:22122/v1/messages \
 | **四段超时** | `connect` / `firstByte` / `idle`（chunk 间）/ `total`（硬上限） |
 | **会话亲和** | 指纹 = `hash(key \| ip \| 倒数两条消息 canonical JSON)`，30min TTL |
 | **错误冷却** | 阶梯 `[1, 3, 5, 10, 15, 0]` 分钟，`0` = 永久；成功一次清零 |
+| **OAuth 宽容次数** | 默认 3 —— OAuth 渠道前 3 次失败仅累计计数不冷却（避免单账号偶发故障导致全部 Claude 模型不可用），第 4 次起按上述阶梯 |
 | **CC 伪装** | 完整移植 Claude Code，OAuth 渠道强制启用；API 渠道可选 |
 | **OAuth 配额监控** | 每 60s 拉 usage，≥95% 自动禁用，resets_at 过后自动恢复 |
 
@@ -279,8 +280,9 @@ curl http://<server>:22122/v1/models -H "x-api-key: ccp-xxx"
   "apiKeys":  { "default": { "key": "ccp-xxx", "allowedModels": [] } },
   "oauthAccounts": [ { "email": "...", "access_token": "...", "refresh_token": "...", "expired": "...", "enabled": true, "disabled_reason": null, "models": [] } ],
   "channels": [ { "name": "智谱", "type": "api", "baseUrl": "https://...", "apiKey": "...", "models": [{"real": "GLM-5", "alias": "glm-5"}], "cc_mimicry": true, "enabled": true } ],
-  "timeouts": { "connect": 10, "firstByte": 30, "idle": 30, "total": 600 },
+  "timeouts": { "connect": 10, "firstByte": 30, "idle": 120, "total": 600 },
   "errorWindows": [1, 3, 5, 10, 15, 0],
+  "oauthGraceCount": 3,    // OAuth 前 N 次失败不冷却；只对 oauth: 前缀的渠道生效
   "affinity":  { "ttlMinutes": 30, "threshold": 3.0, "cleanupIntervalSeconds": 300 },
   "scoring":   { "emaAlpha": 0.25, "recentWindow": 50, "defaultScore": 3000, "errorPenaltyFactor": 8, "staleMinutes": 15, "staleFullDecayMinutes": 30, "explorationRate": 0.2 },
   "quotaMonitor":  { "enabled": false, "intervalSeconds": 60, "disableThresholdPercent": 95, "resumeThresholdPercent": 95 },
@@ -432,6 +434,15 @@ anthropic-proxy/
 - 如看到 `Conflict: terminated by other getUpdates request` → 有多个实例在拉同一 bot，杀掉多余的
 - 如看到 `Invalid bot token` → 检查 `config.json` 的 `telegram.botToken`
 - 其它错误按 traceback 定位
+
+### OAuth 单账号偶发失败导致全部 Claude 模型不可用？
+默认 `oauthGraceCount = 3`，OAuth 渠道前 3 次连续失败仅累计计数不进冷却，第 4 次起才按 `errorWindows` 阶梯。任意一次成功立即清零。
+
+- 仍想更宽容：「⚙ 系统设置」→「⛔ 错误阶梯」→「✏ OAuth 宽容次数」改更大值（如 5）
+- 已经被冷却的 OAuth 渠道：「🔐 管理 OAuth」→ 选账号 →「🧹 清模型错误」一键清
+
+### 上游推理慢被 `idle timeout` 误杀？
+默认 `idle = 120s`（chunk 之间最长空闲）。Claude 长 thinking / GLM 大模型可能 chunk 间隔很长。可在「⚙ 系统设置」→「⏱ 超时设置」继续放宽。
 
 ### OAuth 账户被标 `auth_error`
 refresh_token 已失效。在 TG bot「🔐 管理 OAuth」→ 点该账户 →「🔄 刷新 Token」；若还是失败则删除后用「➕ 新增账户」→「🌐 登录获取 Token」走 PKCE 重新登录。

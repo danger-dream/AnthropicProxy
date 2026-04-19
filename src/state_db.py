@@ -30,8 +30,8 @@ def _resolve_db_path() -> str:
     rel = cfg.get("stateDbPath", "state.db")
     if os.path.isabs(rel):
         return rel
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, rel)
+    # Relative paths anchor to DATA_DIR (container: /app/data; source install: BASE_DIR).
+    return os.path.join(config.DATA_DIR, rel)
 
 
 def _schema_sql() -> str:

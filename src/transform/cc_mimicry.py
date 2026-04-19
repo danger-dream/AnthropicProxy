@@ -68,7 +68,7 @@ def _normalize_cch_value(value):
 # ─── 持久 device_id ───
 
 def _load_or_create_device_id():
-    ids_file = os.path.join(BASE_DIR, ".anthropic_proxy_ids.json")
+    ids_file = os.path.join(_ap_config.DATA_DIR, ".anthropic_proxy_ids.json")
     if os.path.exists(ids_file):
         with open(ids_file) as f:
             return json.load(f).get("device_id", os.urandom(32).hex())

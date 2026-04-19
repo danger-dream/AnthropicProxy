@@ -108,6 +108,86 @@ def test_fingerprint_symmetry(m):
     print("  [PASS] fingerprint symmetry + isolation")
 
 
+def test_fingerprint_normalization(m):
+    """归一化：write 侧的 assistant（SSE 还原）带上游/模型元数据，
+    query 侧历史里的 assistant（客户端回发）精简了这些字段——两者
+    fingerprint 必须相等。这是 2026-04 真实生产数据里亲和命中率为 0 的
+    直接场景（tool_use.caller + thinking block）。
+    """
+    fp = m["fingerprint"]
+    api_key, ip = "kk", "1.2.3.4"
+
+    u1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+    # write 侧（SSE 还原）：assistant 同时带 thinking 块 + tool_use.caller
+    a1_write = {
+        "role": "assistant",
+        "content": [
+            {"type": "thinking",
+             "thinking": "let me think about it...",
+             "signature": "abc"},
+            {"type": "tool_use",
+             "id": "toolu_001", "name": "read",
+             "input": {"path": "/tmp/x"},
+             "caller": {"type": "direct"}},   # ← 上游非标字段
+        ],
+    }
+    # query 侧（客户端回发历史）：thinking 被 Claude Code 丢弃，tool_use 只保留标准字段
+    a1_echoed = {
+        "role": "assistant",
+        "content": [
+            {"type": "tool_use",
+             "id": "toolu_001", "name": "read",
+             "input": {"path": "/tmp/x"}},
+        ],
+    }
+    u2 = {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_001", "content": "ok"},
+    ]}
+
+    fp_w = fp.fingerprint_write(api_key, ip, [u1], a1_write)
+    fp_q = fp.fingerprint_query(api_key, ip, [u1, a1_echoed, u2])
+    assert fp_w is not None
+    assert fp_q is not None
+    assert fp_w == fp_q, (
+        "write(SSE) 和 query(客户端回发) 必须归一化到同一 hash；"
+        f"got fp_w={fp_w} fp_q={fp_q}"
+    )
+
+    # 再加三个反向对照：只要业务逻辑字段 (name/id/input/text) 不同，hash 必须不同
+    a1_diff_name = {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_001", "name": "write", "input": {"path": "/tmp/x"}},
+    ]}
+    a1_diff_id = {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_002", "name": "read", "input": {"path": "/tmp/x"}},
+    ]}
+    a1_diff_input = {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_001", "name": "read", "input": {"path": "/tmp/y"}},
+    ]}
+    assert fp.fingerprint_query(api_key, ip, [u1, a1_diff_name, u2]) != fp_q
+    assert fp.fingerprint_query(api_key, ip, [u1, a1_diff_id,   u2]) != fp_q
+    assert fp.fingerprint_query(api_key, ip, [u1, a1_diff_input,u2]) != fp_q
+
+    # cache_control 浮动不应改变 hash（原有行为回归保护）
+    u2_with_cc = {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_001", "content": "ok",
+         "cache_control": {"type": "ephemeral"}},
+    ]}
+    assert fp.fingerprint_query(api_key, ip, [u1, a1_echoed, u2_with_cc]) == fp_q
+
+    # message 顶层也可能被塞元数据（上游完整响应里有 id/model/stop_reason 等）
+    a1_fat = {
+        "role": "assistant",
+        "id": "msg_xxx",
+        "model": "claude-opus-4",
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+        "content": a1_echoed["content"],
+    }
+    assert fp.fingerprint_query(api_key, ip, [u1, a1_fat, u2]) == fp_q
+
+    print("  [PASS] fingerprint normalization (thinking/caller/cache_control/msg-meta)")
+
+
 def test_scorer_sliding_window(m):
     """滑动窗口：窗口未满时累加；满后每次新事件等效"滑出一次"再"滑入一次"。"""
     _reset_all_state(m)
@@ -410,6 +490,7 @@ def main():
     try:
         print("── M3 Tests ─────────────────────────────")
         test_fingerprint_symmetry(m)
+        test_fingerprint_normalization(m)
         test_scorer_sliding_window(m)
         test_scorer_stale_decay(m)
         test_cooldown_ladder(m)

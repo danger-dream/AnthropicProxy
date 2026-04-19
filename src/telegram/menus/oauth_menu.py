@@ -18,7 +18,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from ... import config, log_db, oauth_manager, state_db
+from ... import affinity, config, cooldown, log_db, oauth_manager, state_db
 from .. import states, ui
 from . import main as main_menu
 
@@ -156,6 +156,12 @@ def _format_account_block(acc: dict) -> str:
             f"  💎 月度统计: ↑ {ui.fmt_tokens(prompt)} ↓ {ui.fmt_tokens(ts['output'])}"
             f" · 缓存率 {cache_rate:.2f}%"
         )
+        if ts.get("avg_tps") is not None:
+            lines.append(
+                f"  ⚡ 本月 TPS: 平均 {ui.fmt_tps(ts.get('avg_tps'))} · "
+                f"峰值 {ui.fmt_tps(ts.get('max_tps'))} · "
+                f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
+            )
 
     return "\n".join(lines)
 
@@ -256,6 +262,57 @@ def send_new(chat_id: int) -> None:
 
 # ─── 账户详情 ─────────────────────────────────────────────────────
 
+def _format_month_stats_block(email: str) -> str:
+    """本月使用统计：总体 + 按模型展开。无数据时返回空字符串。"""
+    ck = f"oauth:{email}"
+    since_ts = _this_month_start_ts()
+    try:
+        overall = log_db.tokens_for_channel(ck, since_ts=since_ts)
+    except Exception:
+        return ""
+    if not overall or overall.get("total", 0) <= 0:
+        return ""
+    try:
+        by_model = log_db.channel_model_stats(ck, since_ts=since_ts)
+    except Exception:
+        by_model = []
+
+    total = overall["total"]
+    succ = overall["success_count"]
+    err = overall["error_count"]
+    inp_prompt = overall["input"] + overall["cache_creation"] + overall["cache_read"]
+    out_tok = overall["output"]
+    cache_rate = (overall["cache_read"] / inp_prompt * 100) if inp_prompt > 0 else 0
+
+    lines = [
+        "",
+        "<b>⚡ 本月使用统计</b>",
+        f"总体: {total} 次 · ✅ {succ} · ❌ {err}",
+        f"↑ {ui.fmt_tokens(inp_prompt)} · ↓ {ui.fmt_tokens(out_tok)} · 缓存率 {cache_rate:.2f}%",
+        f"平均 {ui.fmt_tps(overall.get('avg_tps'))} · "
+        f"峰值 {ui.fmt_tps(overall.get('max_tps'))} · "
+        f"最低 {ui.fmt_tps(overall.get('min_tps'))}",
+    ]
+    if by_model:
+        lines.append("")
+        lines.append("按模型:")
+        for ms in by_model:
+            model = ui.escape_html(ms.get("final_model") or "?")
+            m_prompt = ms["input"] + ms["cache_creation"] + ms["cache_read"]
+            lines.append(f"  • <code>{model}</code>")
+            lines.append(
+                f"    {ms['total']} 次 · ✅ {ms['success_count']} · ❌ {ms['error_count']}"
+                f" · ↑ {ui.fmt_tokens(m_prompt)} ↓ {ui.fmt_tokens(ms['output'])}"
+            )
+            if ms.get("avg_tps") is not None:
+                lines.append(
+                    f"    ⚡ 平均 {ui.fmt_tps(ms.get('avg_tps'))} · "
+                    f"峰值 {ui.fmt_tps(ms.get('max_tps'))} · "
+                    f"最低 {ui.fmt_tps(ms.get('min_tps'))}"
+                )
+    return "\n".join(lines)
+
+
 def _detail_text_and_kb(email: str) -> tuple[Optional[str], Optional[dict]]:
     acc = oauth_manager.get_account(email)
     if acc is None:
@@ -270,14 +327,35 @@ def _detail_text_and_kb(email: str) -> tuple[Optional[str], Optional[dict]]:
         f"上次刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
         f"<b>📊 使用量</b>\n{_format_usage_block(email)}"
     )
+    month_block = _format_month_stats_block(email)
+    if month_block:
+        text += "\n" + month_block
 
     short = ui.register_code(email)
     enabled = acc.get("enabled", True) and not acc.get("disabled_reason")
     toggle_label = "🚫 禁用" if enabled else "✅ 启用"
 
+    # 显示当前模型的冷却状态（让 admin 直观判断需不需要清错误）
+    ck = f"oauth:{email}"
+    cd_models = [e for e in cooldown.active_entries() if e["channel_key"] == ck]
+    if cd_models:
+        text += "\n\n<b>⚠ 冷却中的模型：</b>\n"
+        now_ms = int(__import__('time').time() * 1000)
+        for e in cd_models:
+            mdl = ui.escape_html(e["model"])
+            cu = e.get("cooldown_until")
+            if cu == -1:
+                text += f"  🔴 <code>{mdl}</code> — 永久冻结"
+            else:
+                rem = max(0, (cu - now_ms) // 1000)
+                text += f"  🟠 <code>{mdl}</code> — 剩 {rem}s"
+            text += f" (累计失败 {e['error_count']} 次)\n"
+
     rows = [
         [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{short}"),
          ui.btn("📊 刷新用量",   f"oa:refresh_usage:{short}")],
+        [ui.btn("🧹 清模型错误", f"oa:clear_errors:{short}"),
+         ui.btn("🔗 清亲和绑定", f"oa:clear_affinity:{short}")],
         [ui.btn(toggle_label,     f"oa:toggle:{short}"),
          ui.btn("🗑 删除",         f"oa:delete_ask:{short}")],
         [ui.btn("◀ 返回 OAuth 列表", "menu:oauth")],
@@ -343,6 +421,32 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str) -> N
         return
     state_db.quota_save(email, oauth_manager.flatten_usage(usage_result))
 
+    text, kb = _detail_text_and_kb(email)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+# ─── 清错误 / 清亲和 ─────────────────────────────────────────────
+
+def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    email = ui.resolve_code(short)
+    if email is None:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    cooldown.clear(f"oauth:{email}", model=None)
+    ui.answer_cb(cb_id, "已清除该账号的所有模型冷却")
+    text, kb = _detail_text_and_kb(email)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    email = ui.resolve_code(short)
+    if email is None:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    affinity.delete_by_channel(f"oauth:{email}")
+    ui.answer_cb(cb_id, "已清亲和")
     text, kb = _detail_text_and_kb(email)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -626,6 +730,12 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data.startswith("oa:refresh_usage:"):
         on_refresh_usage(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("oa:clear_errors:"):
+        on_clear_errors(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("oa:clear_affinity:"):
+        on_clear_affinity(chat_id, message_id, cb_id, data.split(":", 2)[2])
         return True
     if data.startswith("oa:toggle:"):
         on_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2])

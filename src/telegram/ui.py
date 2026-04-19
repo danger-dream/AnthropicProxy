@@ -385,6 +385,38 @@ def fmt_ms(ms) -> str:
     return f"{ms / 1000:.1f}s"
 
 
+def fmt_tps(v) -> str:
+    """生成速度格式化：42.3 → '42.3 t/s'；None → '—'。"""
+    if v is None:
+        return "—"
+    try:
+        v = float(v)
+    except Exception:
+        return "—"
+    if v >= 1000:
+        return f"{v / 1000:.1f}K t/s"
+    if v >= 100:
+        return f"{v:.0f} t/s"
+    return f"{v:.1f} t/s"
+
+
+def calc_row_tps(row: dict) -> Optional[float]:
+    """单条日志的生成速度（t/s）。口径与 log_db._TPS_* 一致：
+    stream 有首字 → (total-first) 作分母；非 stream → total。成功才算。"""
+    if not row or row.get("status") != "success":
+        return None
+    out = row.get("output_tokens") or 0
+    total = row.get("total_time_ms")
+    first = row.get("first_token_time_ms")
+    if out <= 0 or total is None or total <= 0:
+        return None
+    if row.get("is_stream") and first is not None and total > first:
+        return out * 1000.0 / (total - first)
+    if not row.get("is_stream"):
+        return out * 1000.0 / total
+    return None
+
+
 def fmt_bjt_ts(ts: float, pattern: str = "%m-%d %H:%M:%S") -> str:
     """Unix 秒级时间戳 → 北京时间字符串。"""
     from datetime import datetime, timedelta, timezone

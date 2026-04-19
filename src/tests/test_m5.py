@@ -181,6 +181,10 @@ async def test_recovery_run_once(m):
     )
     _install_channels(m, [chA, chO])
 
+    # 测试本身验证 probe.recovery 的"清冷却"行为；为简化，关掉 OAuth 宽容次数
+    # 让单次 record_error 即进入冷却（生产默认 3，本测试场景不验证 grace）。
+    cfg.update(lambda c: c.__setitem__("oauthGraceCount", 0))
+
     # 注入 cooldown
     cd.record_error("api:chA", "glm-5", "initial failure")
     cd.record_error("oauth:o@test.com", "claude-opus-4-7", "fake oauth cooldown")

@@ -170,14 +170,15 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
 
 
 def _today_snapshot() -> dict:
-    """今日请求总数、成功率、平均响应。"""
+    """今日请求总数、成功率、平均响应、TPS。"""
     from datetime import datetime, timedelta, timezone
     bjt = timezone(timedelta(hours=8))
     today = datetime.now(bjt).replace(hour=0, minute=0, second=0, microsecond=0)
     try:
         result = log_db.stats_summary(since_ts=today.timestamp(), summary_top_limit=0)
     except Exception:
-        return {"total": 0, "succ": 0, "avg_total": None}
+        return {"total": 0, "succ": 0, "avg_total": None,
+                "avg_tps": None, "max_tps": None, "min_tps": None}
     o = result.get("overall") or {}
     return {
         "total": int(o.get("total") or 0),
@@ -185,7 +186,21 @@ def _today_snapshot() -> dict:
         "err": int(o.get("error_count") or 0),
         "avg_total": o.get("avg_total_ms"),
         "avg_first": o.get("avg_first_token_ms"),
+        "avg_tps": o.get("avg_tps"),
+        "max_tps": o.get("max_tps"),
+        "min_tps": o.get("min_tps"),
     }
+
+
+def _month_tps_by_channel_model() -> dict:
+    """本月按 (channel_key, model) 的平均 TPS lookup；供"最快渠道"补充展示。"""
+    from datetime import datetime, timedelta, timezone
+    bjt = timezone(timedelta(hours=8))
+    month_start = datetime.now(bjt).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    try:
+        return log_db.tps_by_channel_model(since_ts=month_start.timestamp())
+    except Exception:
+        return {}
 
 
 # ─── 渲染 ─────────────────────────────────────────────────────────
@@ -200,6 +215,7 @@ def _compose() -> tuple[str, dict]:
     fastest = _fastest_channels()
     problems = _problem_channels()
     quota_warn = _quota_warnings(80.0)
+    tps_map = _month_tps_by_channel_model() if fastest else {}
 
     sep = "─" * 18
     lines = [
@@ -225,6 +241,12 @@ def _compose() -> tuple[str, dict]:
     ]
     if today["avg_total"] or today["avg_first"]:
         lines.append(f"首字 {ui.fmt_ms(today['avg_first'])} · 总 {ui.fmt_ms(today['avg_total'])}")
+    if today.get("avg_tps") is not None or today.get("max_tps") is not None:
+        lines.append(
+            f"⚡ 生成速度: 平均 {ui.fmt_tps(today.get('avg_tps'))} · "
+            f"峰值 {ui.fmt_tps(today.get('max_tps'))} · "
+            f"最低 {ui.fmt_tps(today.get('min_tps'))}"
+        )
 
     # 最快渠道
     if fastest:
@@ -239,9 +261,12 @@ def _compose() -> tuple[str, dict]:
                 f"{medal} {ico} <code>{ui.escape_html(short)}</code> "
                 f"({ui.escape_html(m)})"
             )
+            tps = tps_map.get((ck, m))
+            tps_part = f" · ⚡ {ui.fmt_tps(tps)}" if tps is not None else ""
             lines.append(
                 f"   首字 {ui.fmt_ms(info['avg_first_byte_ms'])} · "
                 f"成功率 {info['rate']:.0f}% · {info['recent_requests']} 次"
+                f"{tps_part}"
             )
 
     # 配额预警

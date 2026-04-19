@@ -33,8 +33,8 @@ def _resolve_log_dir() -> str:
     rel = cfg.get("logDir", "logs")
     if os.path.isabs(rel):
         return rel
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, rel)
+    # Relative paths anchor to DATA_DIR (container: /app/data; source install: BASE_DIR).
+    return os.path.join(config.DATA_DIR, rel)
 
 
 def _schema_sql() -> str:
@@ -431,15 +431,197 @@ def stats_lifetime() -> dict:
 
 
 def tokens_for_channel(channel_key: str, since_ts: float) -> dict:
-    """跨月聚合某 channel_key 在 since_ts 之后的 token 统计。
+    """跨月聚合某 channel_key 在 since_ts 之后的统计（含 TPS）。
 
-    用于 OAuth 列表里按账号显示"月度统计"等场景。
-    返回 {total, input, output, cache_creation, cache_read}（int）。
+    返回字段：
+      - total / success_count / error_count          次数
+      - input / output / cache_creation / cache_read tokens
+      - avg_tps / max_tps / min_tps                  生成速度（可能为 None）
     """
-    out = {"total": 0, "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
-    if _log_dir is None or not os.path.isdir(_log_dir):
-        return out
+    return _aggregate_by_filter(
+        "final_channel_key=?", (channel_key,), since_ts,
+    )
 
+
+def tokens_for_apikey(api_key_name: str, since_ts: float) -> dict:
+    """跨月聚合某 API Key 在 since_ts 之后的统计（字段同 tokens_for_channel）。"""
+    return _aggregate_by_filter(
+        "api_key_name=?", (api_key_name,), since_ts,
+    )
+
+
+def _aggregate_by_filter(where: str, where_args: tuple, since_ts: float) -> dict:
+    """按给定 WHERE 条件跨月聚合；where 不含 created_at 过滤。"""
+    out: dict[str, Any] = {
+        "total": 0, "success_count": 0, "error_count": 0,
+        "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0,
+        "tps_num_tokens": 0, "tps_denom_ms": 0,
+        "max_tps": None, "min_tps": None,
+    }
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        return _pack_stats(out)
+
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            row = conn.execute(
+                f"""SELECT
+                     COUNT(*) AS total,
+                     SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
+                     SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
+                     SUM(input_tokens) AS inp,
+                     SUM(output_tokens) AS outp,
+                     SUM(cache_creation_tokens) AS cc,
+                     SUM(cache_read_tokens) AS cr,
+                     {_tps_agg_sql()}
+                   FROM request_log
+                   WHERE {where} AND created_at >= ?""",
+                where_args + (since_ts,),
+            ).fetchone()
+            if row:
+                out["total"] += int(row["total"] or 0)
+                out["success_count"] += int(row["success_count"] or 0)
+                out["error_count"] += int(row["error_count"] or 0)
+                out["input"] += int(row["inp"] or 0)
+                out["output"] += int(row["outp"] or 0)
+                out["cache_creation"] += int(row["cc"] or 0)
+                out["cache_read"] += int(row["cr"] or 0)
+                _merge_tps(out, row)
+        except Exception as exc:
+            print(f"[log_db] _aggregate_by_filter: skip: {exc}")
+        finally:
+            try:
+                close_fn()
+            except Exception:
+                pass
+    return _pack_stats(out)
+
+
+def _pack_stats(raw: dict) -> dict:
+    """把 _aggregate_by_filter 的内部累加结构 finalize 为对外格式。"""
+    tps = _finalize_tps(raw)
+    return {
+        "total": raw["total"],
+        "success_count": raw["success_count"],
+        "error_count": raw["error_count"],
+        "input": raw["input"],
+        "output": raw["output"],
+        "cache_creation": raw["cache_creation"],
+        "cache_read": raw["cache_read"],
+        "avg_tps": tps["avg_tps"],
+        "max_tps": tps["max_tps"],
+        "min_tps": tps["min_tps"],
+    }
+
+
+def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
+    """跨月按 final_model 分组聚合某渠道下每个模型的统计（含 TPS）。
+
+    用于渠道详情/ OAuth 账户详情的"按模型展开"视图。
+    每条 dict 含 final_model + tokens_for_channel 的所有字段。
+    """
+    by_model: dict[str, dict] = {}
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        return []
+
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            rows = conn.execute(
+                f"""SELECT
+                     COALESCE(final_model, '?') AS model,
+                     COUNT(*) AS total,
+                     SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
+                     SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
+                     SUM(input_tokens) AS inp,
+                     SUM(output_tokens) AS outp,
+                     SUM(cache_creation_tokens) AS cc,
+                     SUM(cache_read_tokens) AS cr,
+                     {_tps_agg_sql()}
+                   FROM request_log
+                   WHERE final_channel_key=? AND created_at >= ?
+                   GROUP BY COALESCE(final_model, '?')""",
+                (channel_key, since_ts),
+            ).fetchall()
+            for r in rows:
+                key = r["model"] or "?"
+                bucket = by_model.setdefault(key, {
+                    "total": 0, "success_count": 0, "error_count": 0,
+                    "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0,
+                    "tps_num_tokens": 0, "tps_denom_ms": 0,
+                    "max_tps": None, "min_tps": None,
+                })
+                bucket["total"] += int(r["total"] or 0)
+                bucket["success_count"] += int(r["success_count"] or 0)
+                bucket["error_count"] += int(r["error_count"] or 0)
+                bucket["input"] += int(r["inp"] or 0)
+                bucket["output"] += int(r["outp"] or 0)
+                bucket["cache_creation"] += int(r["cc"] or 0)
+                bucket["cache_read"] += int(r["cr"] or 0)
+                _merge_tps(bucket, r)
+        except Exception as exc:
+            print(f"[log_db] channel_model_stats: skip: {exc}")
+        finally:
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+    out = []
+    for model, raw in by_model.items():
+        d = _pack_stats(raw)
+        d["final_model"] = model
+        out.append(d)
+    # 按请求量降序；方便 UI 直接渲染
+    out.sort(key=lambda x: x["total"], reverse=True)
+    return out
+
+
+def tps_by_channel_model(since_ts: float) -> dict[tuple[str, str], float]:
+    """跨月聚合 {(channel_key, model): avg_tps}，用于"最快渠道"区 lookup。"""
+    acc: dict[tuple[str, str], dict] = {}
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        return {}
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            rows = conn.execute(
+                f"""SELECT final_channel_key AS ck, final_model AS m,
+                     {_tps_agg_sql()}
+                   FROM request_log
+                   WHERE final_channel_key IS NOT NULL AND final_model IS NOT NULL
+                     AND created_at >= ?
+                   GROUP BY final_channel_key, final_model""",
+                (since_ts,),
+            ).fetchall()
+            for r in rows:
+                key = (r["ck"], r["m"])
+                bucket = acc.setdefault(key, {
+                    "tps_num_tokens": 0, "tps_denom_ms": 0,
+                    "max_tps": None, "min_tps": None,
+                })
+                _merge_tps(bucket, r)
+        except Exception as exc:
+            print(f"[log_db] tps_by_channel_model: skip: {exc}")
+        finally:
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+    return {
+        k: _finalize_tps(v)["avg_tps"]
+        for k, v in acc.items()
+        if _finalize_tps(v)["avg_tps"] is not None
+    }
+
+
+def _iter_month_conns_all(since_ts: float):
+    """从 since_ts 所在月起到当月止，产出 (conn, close_fn) 序列。
+
+    与 _iter_month_conns 不同的是：后者假设每个 conn 只会在同一轮被用；
+    这里每个 conn 可能跨多个查询（channel_model_stats 等），所以统一 close。
+    当月连接用 thread-local 共享连接，close_fn=noop。
+    """
+    if _log_dir is None:
+        return
     current_path, _ = _current_db_path()
     start_dt = datetime.fromtimestamp(since_ts, tz=_BJT)
     now_dt = datetime.now(_BJT)
@@ -449,56 +631,19 @@ def tokens_for_channel(channel_key: str, since_ts: float) -> dict:
     while cursor <= end:
         y, m = cursor
         path = os.path.join(_log_dir, f"{y:04d}-{m:02d}.db")
-        if cursor == (now_dt.year, now_dt.month) and path == current_path:
-            conn = _get_conn()
-            close_fn = None
+        if cursor == end and path == current_path:
+            yield _get_conn(), lambda: None
         elif os.path.exists(path):
             try:
-                conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
-                conn.row_factory = sqlite3.Row
+                c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+                c.row_factory = sqlite3.Row
+                yield c, c.close
             except Exception:
-                conn = None
-                close_fn = None
-            else:
-                close_fn = conn.close
-        else:
-            conn = None
-            close_fn = None
-
-        if conn is not None:
-            try:
-                row = conn.execute(
-                    """SELECT
-                         COUNT(*) AS total,
-                         SUM(input_tokens) AS inp,
-                         SUM(output_tokens) AS outp,
-                         SUM(cache_creation_tokens) AS cc,
-                         SUM(cache_read_tokens) AS cr
-                       FROM request_log
-                       WHERE final_channel_key=? AND created_at >= ?""",
-                    (channel_key, since_ts),
-                ).fetchone()
-                if row:
-                    out["total"] += int(row["total"] or 0)
-                    out["input"] += int(row["inp"] or 0)
-                    out["output"] += int(row["outp"] or 0)
-                    out["cache_creation"] += int(row["cc"] or 0)
-                    out["cache_read"] += int(row["cr"] or 0)
-            except Exception as exc:
-                print(f"[log_db] tokens_for_channel: skip {path}: {exc}")
-            finally:
-                if close_fn is not None:
-                    try:
-                        close_fn()
-                    except Exception:
-                        pass
-
-        # 下一月
+                pass
         if m == 12:
             cursor = (y + 1, 1)
         else:
             cursor = (y, m + 1)
-    return out
 
 
 def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
@@ -526,6 +671,62 @@ _RECENT_COLS = (
     "connect_time_ms, first_token_time_ms, total_time_ms, "
     "retry_count, affinity_hit"
 )
+
+
+# ─── 每秒生成 tokens (TPS) 的 SQL 片段 ─────────────────────────────
+# 口径：成功请求；stream 有 first_token_time_ms 时取生成阶段（total-first）；
+#      非 stream 回退整体耗时。聚合用"加权平均"= Σtokens / Σdenom_ms × 1000。
+_TPS_COND = (
+    "status='success' AND output_tokens > 0 AND ("
+    "(is_stream=1 AND first_token_time_ms IS NOT NULL "
+    "AND total_time_ms > first_token_time_ms) "
+    "OR (is_stream=0 AND total_time_ms > 0))"
+)
+_TPS_DENOM_MS_EXPR = (
+    "CASE WHEN is_stream=1 AND first_token_time_ms IS NOT NULL "
+    "AND total_time_ms > first_token_time_ms "
+    "THEN (total_time_ms - first_token_time_ms) "
+    "ELSE total_time_ms END"
+)
+_TPS_VALUE_EXPR = f"(output_tokens*1000.0 / {_TPS_DENOM_MS_EXPR})"
+
+
+def _tps_agg_sql() -> str:
+    """返回 4 列聚合 SQL：tps_num_tokens / tps_denom_ms / max_tps / min_tps。
+    调用方把它塞进 SELECT 列表里。"""
+    return (
+        f"SUM(CASE WHEN {_TPS_COND} THEN output_tokens ELSE 0 END) AS tps_num_tokens,\n"
+        f"SUM(CASE WHEN {_TPS_COND} THEN {_TPS_DENOM_MS_EXPR} ELSE 0 END) AS tps_denom_ms,\n"
+        f"MAX(CASE WHEN {_TPS_COND} THEN {_TPS_VALUE_EXPR} ELSE NULL END) AS max_tps,\n"
+        f"MIN(CASE WHEN {_TPS_COND} THEN {_TPS_VALUE_EXPR} ELSE NULL END) AS min_tps"
+    )
+
+
+def _merge_tps(agg: dict, row) -> None:
+    """把单条 SQL row 的 tps 聚合合并到 agg（跨月累加）。
+    agg 维持 num_tokens / denom_ms / max_tps / min_tps 四个键。"""
+    agg["tps_num_tokens"] = (agg.get("tps_num_tokens") or 0) + int(row["tps_num_tokens"] or 0)
+    agg["tps_denom_ms"] = (agg.get("tps_denom_ms") or 0) + int(row["tps_denom_ms"] or 0)
+    mt = row["max_tps"]
+    if mt is not None:
+        cur = agg.get("max_tps")
+        agg["max_tps"] = float(mt) if cur is None else max(float(cur), float(mt))
+    mn = row["min_tps"]
+    if mn is not None:
+        cur = agg.get("min_tps")
+        agg["min_tps"] = float(mn) if cur is None else min(float(cur), float(mn))
+
+
+def _finalize_tps(agg: dict) -> dict:
+    """把 tps 聚合结构 finalize 为 {avg_tps, max_tps, min_tps}。"""
+    denom = int(agg.get("tps_denom_ms") or 0)
+    num = int(agg.get("tps_num_tokens") or 0)
+    avg = (num * 1000.0 / denom) if denom > 0 else None
+    return {
+        "avg_tps": avg,
+        "max_tps": agg.get("max_tps"),
+        "min_tps": agg.get("min_tps"),
+    }
 
 
 def recent_logs(
@@ -645,7 +846,8 @@ def stats_summary(
                  SUM(CASE WHEN status='success' AND connect_time_ms IS NOT NULL THEN connect_time_ms ELSE 0 END) AS sum_connect_ms,
                  SUM(CASE WHEN status='success' AND connect_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
                  SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
-                 SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token
+                 SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
+                 {_tps_agg_sql()}
                FROM request_log WHERE created_at >= ?
                GROUP BY grp_key""",
             (since_ts,),
@@ -654,11 +856,12 @@ def stats_summary(
             k = r["grp_key"] or "?"
             bucket = target.setdefault(k, _new_group_agg())
             _accumulate_group(bucket, r)
+            _merge_tps(bucket, r)
 
     try:
         for conn, _ in conns:
             row = conn.execute(
-                """SELECT
+                f"""SELECT
                      COUNT(*) AS total,
                      SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
                      SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
@@ -677,11 +880,13 @@ def stats_summary(
                      SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
                      SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
                      SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN total_time_ms ELSE 0 END) AS sum_total_ms,
-                     SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_total
+                     SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_total,
+                     {_tps_agg_sql()}
                    FROM request_log WHERE created_at >= ?""",
                 (since_ts,),
             ).fetchone()
             _accumulate(overall_agg, row)
+            _merge_tps(overall_agg, row)
 
             # 永远聚合三个维度（cc-proxy 风格：汇总视图也展示三方 Top）
             _agg_group(by_channel, conn, _GROUP_BY_COLS["channel"])
@@ -780,7 +985,7 @@ def _accumulate(agg: dict, row) -> None:
 def _finalize_overall(agg: dict) -> dict:
     def _avg(s, c):
         return (s / c) if c > 0 else None
-    return {
+    out = {
         "total": agg["total"],
         "success_count": agg["success_count"],
         "error_count": agg["error_count"],
@@ -798,6 +1003,8 @@ def _finalize_overall(agg: dict) -> dict:
         "avg_first_token_ms": _avg(agg["sum_first_token_ms"], agg["cnt_first_token"]),
         "avg_total_ms": _avg(agg["sum_total_ms"], agg["cnt_total"]),
     }
+    out.update(_finalize_tps(agg))
+    return out
 
 
 _GROUP_FIELDS = [
@@ -827,4 +1034,5 @@ def _finalize_group(agg: dict) -> dict:
     out["avg_first_token_ms"] = (
         out["sum_first_token_ms"] / out["cnt_first_token"] if out["cnt_first_token"] > 0 else None
     )
+    out.update(_finalize_tps(agg))
     return out
