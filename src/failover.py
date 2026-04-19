@@ -62,6 +62,17 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: httpx.Response) -> None:
         print(f"[failover] codex snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
 
 
+def forget_codex_snapshot(email: str) -> None:
+    """账户删除时清本地节流桶，避免内存无限累积。
+
+    对外公开；调用方：oauth_manager.delete_account。
+    """
+    if not email:
+        return
+    with _codex_snapshot_lock:
+        _codex_snapshot_last.pop(email, None)
+
+
 # ─── 协议相关工具集分派 ──────────────────────────────────────────
 #
 # 每个上游协议对应一组 (stream tracker 类, stream builder 类, first-event 解析器,

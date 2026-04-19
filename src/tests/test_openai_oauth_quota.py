@@ -294,6 +294,51 @@ def test_oauth_menu_refresh_all_skips_openai(m):
     print("  [PASS] oauth_menu refresh_all: openai counted as skipped")
 
 
+def test_delete_account_clears_codex_snapshot_throttle(m):
+    """Commit 5 ⑥：account 删除时同步清 failover._codex_snapshot_last。"""
+    _setup(m)
+    _add_openai(m, "del@openai.test")
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("del@openai.test"))
+    resp = _MockResp({
+        "x-codex-primary-used-percent": "5",
+        "x-codex-primary-window-minutes": "10080",
+    })
+    m["failover"]._maybe_record_codex_snapshot(ch, resp)
+    assert "del@openai.test" in m["failover"]._codex_snapshot_last
+    m["oauth_manager"].delete_account("del@openai.test")
+    assert "del@openai.test" not in m["failover"]._codex_snapshot_last
+    print("  [PASS] delete_account: forget_codex_snapshot clears throttle bucket")
+
+
+def test_on_refresh_token_openai_skips_fetch_usage(m):
+    """Commit 5 ⑤：TG 详情页'刷新 Token'按钮对 openai 不调 fetch_usage（它会抛
+    QuotaNotSupported）。用计数 stub 验证没被调。"""
+    _setup(m)
+    _add_openai(m, "rt@openai.test")
+
+    rec = _UiRecorder()
+    m["ui"].api = rec
+
+    called = {"fetch_usage": 0}
+    orig_fetch = m["oauth_manager"].fetch_usage
+    async def _counting_fetch(email):
+        called["fetch_usage"] += 1
+        return await orig_fetch(email)
+
+    try:
+        m["oauth_manager"].fetch_usage = _counting_fetch
+        short = m["ui"].register_code("rt@openai.test")
+        m["oauth_menu"].on_refresh_token(42, 100, "cb", short)
+    finally:
+        m["oauth_manager"].fetch_usage = orig_fetch
+
+    assert called["fetch_usage"] == 0, "fetch_usage should be skipped for openai"
+    # 重渲染详情页应成功
+    last = rec.last("editMessageText")
+    assert last and ("已刷新" in last["text"] or "Token" in last["text"])
+    print("  [PASS] on_refresh_token: openai provider skips fetch_usage call")
+
+
 def test_status_menu_quota_warnings_tags_openai(m):
     _setup(m)
     _add_openai(m, "warn@openai.test")
@@ -333,6 +378,8 @@ def main():
         test_oauth_menu_detail_openai_shows_provider_and_codex_usage,
         test_oauth_menu_refresh_usage_openai_friendly_alert,
         test_oauth_menu_refresh_all_skips_openai,
+        test_delete_account_clears_codex_snapshot_throttle,
+        test_on_refresh_token_openai_skips_fetch_usage,
         test_status_menu_quota_warnings_tags_openai,
     ]
 

@@ -250,6 +250,58 @@ def test_migrate_provider_field_idempotent(m):
     print("  [PASS] migrate_provider_field idempotent: 1 then 0")
 
 
+def test_migrate_provider_field_skip_write_when_nothing_to_do(m):
+    """Commit 5 ⑦：无变更时不应触发 config.update（避免无意义 write）。"""
+    _setup(m)
+    om = m["oauth_manager"]
+    # 安装 config.update 计数桩
+    real_update = m["config"].update
+    call_count = {"n": 0}
+    def counting_update(mutator):
+        call_count["n"] += 1
+        return real_update(mutator)
+    try:
+        m["config"].update = counting_update
+        # 无账户
+        n0 = om.migrate_provider_field()
+        assert n0 == 0
+        assert call_count["n"] == 0, "no-op should not call config.update"
+        # 加一个已有 provider 的账户
+        real_update(lambda c: c.setdefault("oauthAccounts", []).append({
+            "email": "new@x", "provider": "claude",
+            "access_token": "x", "refresh_token": "x",
+        }))
+        call_count["n"] = 0
+        n1 = om.migrate_provider_field()
+        assert n1 == 0
+        assert call_count["n"] == 0, "all-provider-present should not call update"
+    finally:
+        m["config"].update = real_update
+    print("  [PASS] migrate_provider_field skips config.update when no-op")
+
+
+def test_refresh_notice_openai_wording(m):
+    """Commit 5 ④：OpenAI 账户 refresh 通知显示'响应头路径'而非'获取失败'。"""
+    _setup(m)
+    om = m["oauth_manager"]
+    om.add_account({
+        "email": "nr@openai.test", "provider": "openai",
+        "access_token": "x", "refresh_token": "x",
+        "chatgpt_account_id": "acct-1",
+    })
+    txt = om._build_refresh_notice("nr@openai.test", usage_flat=None)
+    assert "响应头" in txt, txt
+    assert "获取失败" not in txt
+    # Claude 账户仍走老文案
+    om.add_account({
+        "email": "nr2@claude.test", "provider": "claude",
+        "access_token": "x", "refresh_token": "x",
+    })
+    txt2 = om._build_refresh_notice("nr2@claude.test", usage_flat=None)
+    assert "获取失败" in txt2
+    print("  [PASS] _build_refresh_notice: openai gets header-path wording")
+
+
 def test_fetch_usage_openai_raises_not_supported(m):
     _setup(m)
     om = m["oauth_manager"]
@@ -384,6 +436,8 @@ def main():
         test_add_account_openai_provider,
         test_add_account_claude_default_provider,
         test_migrate_provider_field_idempotent,
+        test_migrate_provider_field_skip_write_when_nothing_to_do,
+        test_refresh_notice_openai_wording,
         test_fetch_usage_openai_raises_not_supported,
         test_tg_openai_add_via_pkce,
         test_tg_openai_add_state_mismatch,

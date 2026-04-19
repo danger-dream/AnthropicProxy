@@ -79,10 +79,14 @@ class OpenAIOAuthChannel(Channel):
         self.chatgpt_account_id = str(account.get("chatgpt_account_id") or "")
         self.plan_type = str(account.get("plan_type") or "")
 
-        # 账户配置优先；缺省退到 codex 家族完整模型表
+        # 账户配置优先；缺省退到 codex 家族"所有已知别名"（70+ 条，涵盖
+        # gpt-5 / gpt-5-codex / gpt-5.3-xhigh 等下游可能直接发的历史名字）。
+        # 真正规范化到 gpt-5.1 / gpt-5.1-codex 这 ~12 个上游认识的 canonical
+        # 名，由 codex_oauth_transform.apply_codex_oauth_transform 完成。
         models = account.get("models") or []
         self.models: list[str] = (
-            list(models) if models else list(default_models or codex_oauth_transform.codex_model_ids())
+            list(models) if models
+            else list(default_models or codex_oauth_transform.codex_known_aliases())
         )
 
     # ─── 模型查询 ─────────────────────────────────────────────

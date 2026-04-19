@@ -153,11 +153,23 @@ def normalize_codex_model(model: str) -> str:
 
 
 def codex_model_ids() -> list[str]:
-    """导出所有 codex 家族已知模型名，供 Channel.list_client_models 用。
+    """导出所有 codex 家族**规范**模型名（_CODEX_MODEL_MAP 的 value 集合）。
 
-    返回 map 的 key 集合（排序后），涵盖 sub2api DefaultModels 列的所有真实 ID。
+    只有 ~12 条：gpt-5.1 / gpt-5.1-codex / gpt-5.1-codex-max / ...。
+    上游 codex endpoint 最终只认这些规范名，transform 会把别名 normalize 过去。
     """
     return sorted({v for v in _CODEX_MODEL_MAP.values()})
+
+
+def codex_known_aliases() -> list[str]:
+    """导出所有已登记的 codex 模型别名集合（_CODEX_MODEL_MAP 的 key 集合）。
+
+    70+ 条：gpt-5 / gpt-5-codex / gpt-5-codex-mini / gpt-5.3-xhigh / ...。
+    给 Channel.list_client_models / supports_model 用，让客户端用任何已知别名
+    请求都能命中；真正发给上游时由 transform 的 normalize_codex_model 映射
+    到规范名。
+    """
+    return sorted(_CODEX_MODEL_MAP.keys())
 
 
 # ─── 默认 instructions（仅一行，与 sub2api applyInstructions 对齐）──
@@ -283,6 +295,58 @@ def _coerce_input_to_list(body: dict) -> bool:
     return False
 
 
+def _normalize_codex_tools(body: dict) -> bool:
+    """把 chat-style `{type:"function", function:{name,...}}` 拍平为 Responses-style
+    `{type:"function", name, parameters, ...}`（顶层字段）。
+
+    移植自 sub2api openai_codex_transform.go:normalizeCodexTools。原因：codex
+    endpoint 走 Responses API 协议，工具定义必须是顶层 name/parameters；若收到
+    ChatCompletions 历史格式会 400。本函数在 transform 末尾统一做一次，不管
+    下游走哪条 ingress 都兜底。
+
+    返回是否动过 body。副作用：丢弃无效的 function tool（hasFunction 为假且
+    顶层无 name 的条目），这与 sub2api 行为一致。
+    """
+    raw_tools = body.get("tools")
+    if not isinstance(raw_tools, list):
+        return False
+
+    modified = False
+    valid: list = []
+    for tool in raw_tools:
+        if not isinstance(tool, dict):
+            # 非 dict 的工具保留（不是我们要处理的）
+            valid.append(tool)
+            continue
+        ttype = str(tool.get("type") or "").strip()
+        if ttype != "function":
+            valid.append(tool)
+            continue
+        # 已是 Responses-style（顶层有 name）→ 原样保留
+        top_name = tool.get("name")
+        if isinstance(top_name, str) and top_name.strip():
+            valid.append(tool)
+            continue
+        # ChatCompletions-style：{type:"function", function:{name, parameters, ...}}
+        function_obj = tool.get("function")
+        if not isinstance(function_obj, dict):
+            # 既无顶层 name 又无 function 对象 → 丢弃（与 sub2api 一致）
+            modified = True
+            continue
+        # 把 function.* 拍平到顶层（不覆盖已有的顶层同名字段）
+        for key in ("name", "description", "parameters", "strict"):
+            if key in tool:
+                continue
+            if key in function_obj:
+                tool[key] = function_obj[key]
+                modified = True
+        valid.append(tool)
+
+    if modified:
+        body["tools"] = valid
+    return modified
+
+
 def apply_codex_oauth_transform(
     body: dict,
     *,
@@ -313,6 +377,12 @@ def apply_codex_oauth_transform(
 
     # 4) legacy functions / function_call → tools / tool_choice
     _convert_legacy_tools(body)
+
+    # 4.5) tools 结构规范化：chat-style {type:function, function:{name,...}}
+    #      拍平为 Responses-style {type:function, name, ...}。ingress 无论
+    #      是 chat（由 chat_to_responses 翻译后一般已扁平，但防御性再跑一遍）
+    #      还是 responses（下游可能直接用 ChatCompletions 格式）都要兜底。
+    _normalize_codex_tools(body)
 
     # 5) input 字符串 → 数组；再把 input 里的 system 消息提到 instructions
     _coerce_input_to_list(body)

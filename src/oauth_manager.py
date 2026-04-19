@@ -30,7 +30,6 @@ from . import config, notifier, state_db
 from .oauth import (
     DEFAULT_PROVIDER as _DEFAULT_PROVIDER,
     VALID_PROVIDERS as _VALID_PROVIDERS,
-    get_non_claude_module as _get_non_claude_module,
     normalize_provider as _normalize_provider,
 )
 from .oauth import openai as openai_provider
@@ -505,20 +504,26 @@ def latest_reset_iso(usage: dict) -> str | None:
 def migrate_provider_field() -> int:
     """给所有没有 provider 字段的账户回填默认值（claude）。
 
-    幂等：已填过的账户不动；无账户时直接返回 0。启动时调用一次即可。
-    返回本次回填数量。
+    幂等：已填过的账户不动；无变更时不触发 config.update（避免对磁盘做无
+    意义的 rewrite，也不会触发 registry 的 reload callback 重建 channels）。
+    启动时调用一次即可。返回本次回填数量。
     """
-    count = 0
+    cfg = config.get()
+    pending: list[int] = [
+        i for i, acc in enumerate(cfg.get("oauthAccounts", []))
+        if not acc.get("provider")
+    ]
+    if not pending:
+        return 0
 
-    def mutate(cfg):
-        nonlocal count
-        for acc in cfg.get("oauthAccounts", []):
-            if not acc.get("provider"):
-                acc["provider"] = _DEFAULT_PROVIDER
-                count += 1
+    def mutate(c):
+        accounts = c.get("oauthAccounts", [])
+        for i in pending:
+            if 0 <= i < len(accounts) and not accounts[i].get("provider"):
+                accounts[i]["provider"] = _DEFAULT_PROVIDER
 
     config.update(mutate)
-    return count
+    return len(pending)
 
 
 def add_account(entry: dict) -> None:
@@ -579,6 +584,14 @@ def delete_account(email: str) -> None:
     state_db.error_delete(key)
     state_db.affinity_delete_by_channel(key)
     state_db.quota_delete(email)
+
+    # failover 的 Codex 节流桶（仅 OpenAI 账户有记录；claude 账户无副作用）
+    try:
+        from . import failover
+        failover.forget_codex_snapshot(email)
+    except Exception:
+        # 启动早期 failover 可能尚未 import；无记录时忽略
+        pass
 
 
 def set_enabled(email: str, enabled: bool, reason: str | None = None,
@@ -674,7 +687,10 @@ def _build_refresh_notice(email: str, usage_flat: dict | None) -> str:
         f" (剩 {_remaining_str(new_exp)})",
     ]
     # 用量
-    if usage_flat:
+    if provider_of(email) == "openai":
+        # OpenAI 没有独立 usage 端点，per-request 响应头更新。这里不是"失败"。
+        parts.append("📊 用量: <i>由响应头更新（无独立端点）</i>")
+    elif usage_flat:
         fh_util = usage_flat.get("five_hour_util")
         sd_util = usage_flat.get("seven_day_util")
         if fh_util is not None:

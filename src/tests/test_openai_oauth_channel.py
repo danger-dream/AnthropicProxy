@@ -170,17 +170,83 @@ def test_transform_legacy_functions(m):
     })
     assert "functions" not in out
     assert "function_call" not in out
-    assert out["tools"] == [
-        {"type": "function", "function": {"name": "f1"}},
-        {"type": "function", "function": {"name": "f2"}},
-    ]
+    # 经过 _convert_legacy_tools + _normalize_codex_tools 两步后：
+    # tools 都是 responses-style（顶层有 name），function 子对象可能仍在（sub2api 行为）
+    assert isinstance(out["tools"], list) and len(out["tools"]) == 2
+    names = sorted(t.get("name") for t in out["tools"])
+    assert names == ["f1", "f2"], f"got top-level names: {names}"
+    assert all(t.get("type") == "function" for t in out["tools"])
     assert out["tool_choice"] == {"type": "function", "function": {"name": "f1"}}
     # string function_call (auto)
     out2 = t.apply_codex_oauth_transform({
         "model": "gpt-5.1", "input": [], "function_call": "auto",
     })
     assert out2["tool_choice"] == "auto"
-    print("  [PASS] transform: legacy functions/function_call → tools/tool_choice")
+    print("  [PASS] transform: legacy functions/function_call → tools/tool_choice (flat name)")
+
+
+def test_transform_normalizes_chat_style_tools(m):
+    """Commit 5 ①: responses ingress 收到 chat-style tools 时必须拍平成
+    Responses-style（顶层 name/parameters）。否则 codex endpoint 会 400。"""
+    t = m["transform"]
+    out = t.apply_codex_oauth_transform({
+        "model": "gpt-5.1", "input": "hi",
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "get weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                    "strict": True,
+                },
+            },
+            {   # 已是 responses-style 的不动
+                "type": "function", "name": "existing",
+                "parameters": {"type": "object"},
+            },
+        ],
+    })
+    tools = out["tools"]
+    # 第一个：顶层必须有 name / description / parameters / strict
+    assert tools[0]["name"] == "get_weather"
+    assert tools[0]["description"] == "get weather"
+    assert tools[0]["parameters"]["type"] == "object"
+    assert tools[0]["strict"] is True
+    # 第二个：原样保留
+    assert tools[1]["name"] == "existing"
+    # invalid 工具会被丢弃
+    out2 = t.apply_codex_oauth_transform({
+        "model": "gpt-5.1", "input": "hi",
+        "tools": [{"type": "function"}],   # 无 name 也无 function 对象
+    })
+    assert out2["tools"] == []
+    # 非 function 类型的工具原样保留
+    out3 = t.apply_codex_oauth_transform({
+        "model": "gpt-5.1", "input": "hi",
+        "tools": [{"type": "web_search"}],
+    })
+    assert out3["tools"] == [{"type": "web_search"}]
+    print("  [PASS] transform: chat-style tools flattened; invalid dropped; non-function preserved")
+
+
+def test_channel_supports_known_aliases(m):
+    """Commit 5 ②: 默认 models 列表应包含所有已知别名（gpt-5 / gpt-5-codex 等）。"""
+    _setup(m)
+    # 故意不设 models，让 Channel 回落到默认别名集
+    m["oauth_manager"].add_account({
+        "email": "alias@openai.test", "provider": "openai",
+        "access_token": "x", "refresh_token": "r",
+        "chatgpt_account_id": "acct-alias",
+    })
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("alias@openai.test"))
+    # 客户端发老别名应命中
+    for alias in ("gpt-5", "gpt-5-codex", "gpt-5.3-xhigh",
+                  "gpt-5.1-codex-max-xhigh", "codex-mini-latest"):
+        assert ch.supports_model(alias) == alias, f"{alias} should be supported"
+    # 未知名字仍然拒绝
+    assert ch.supports_model("gpt-4o") is None
+    print("  [PASS] channel: default models accept all known codex aliases (70+)")
 
 
 def test_transform_model_map(m):
@@ -452,6 +518,8 @@ def main():
         test_transform_extracts_system,
         test_transform_system_appended_to_existing_instructions,
         test_transform_legacy_functions,
+        test_transform_normalizes_chat_style_tools,
+        test_channel_supports_known_aliases,
         test_transform_model_map,
         test_channel_basic,
         test_channel_default_models_fallback,

@@ -441,10 +441,11 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str) -> N
         ui.send(chat_id, f"❌ 刷新失败: <code>{ui.escape_html(str(result))}</code>")
         return
 
-    # 顺便刷新用量写入缓存
-    usage_result = _run_sync(oauth_manager.fetch_usage(email))
-    if not isinstance(usage_result, Exception):
-        state_db.quota_save(email, oauth_manager.flatten_usage(usage_result))
+    # 顺便刷新用量写入缓存。OpenAI 没有独立 usage 端点（响应头路径），跳过。
+    if oauth_manager.provider_of(email) != "openai":
+        usage_result = _run_sync(oauth_manager.fetch_usage(email))
+        if not isinstance(usage_result, Exception):
+            state_db.quota_save(email, oauth_manager.flatten_usage(usage_result))
 
     # 重渲染详情
     text, kb = _detail_text_and_kb(email)
