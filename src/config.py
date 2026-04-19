@@ -107,6 +107,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "channelSelection": "smart",  # "smart" | "order"
     "logDir": "logs",
     "stateDbPath": "state.db",
+    # OpenAI 支持相关默认值（只在 /v1/chat/completions、/v1/responses 入口或 openai-* 渠道上生效）
+    "openai": {
+        # previous_response_id 本地 store（跨变体 chat↔responses 必需，同协议可选）
+        "store": {
+            "enabled": True,
+            "ttlMinutes": 60,
+            "cleanupIntervalSeconds": 300,
+        },
+        # reasoning 跨协议桥接："passthrough" = 通过非官方字段 reasoning_content 双向映射；"drop" = 丢弃
+        "reasoningBridge": "passthrough",
+        # 跨变体翻译能力开关
+        "translation": {
+            "enabled": True,
+            "rejectOnBuiltinTools": True,
+            "rejectOnMultiCandidate": True,
+        },
+    },
 }
 
 

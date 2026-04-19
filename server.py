@@ -115,6 +115,11 @@ async def lifespan(app: FastAPI):
     cooldown.init()
     scorer.init()
 
+    # OpenAI 家族 factory 注入（必须在 rebuild_from_config 之前，否则带 protocol=openai-*
+    # 的 channel entry 会回落到 ApiChannel 并被 assert 拒绝）
+    from src.openai.channel.registration import register_factories as _openai_register_factories
+    _openai_register_factories()
+
     # 渠道注册表 + 热加载钩子
     registry.rebuild_from_config()
     registry.install_config_reload_hook()
