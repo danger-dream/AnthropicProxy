@@ -9,9 +9,11 @@ import threading
 from typing import Optional
 
 from .. import config, state_db
+from ..oauth import normalize_provider as _normalize_provider
 from .api_channel import ApiChannel
 from .base import Channel
 from .oauth_channel import OAuthChannel
+from .openai_oauth_channel import OpenAIOAuthChannel
 
 
 _lock = threading.Lock()
@@ -37,11 +39,15 @@ def rebuild_from_config() -> None:
     new: dict[str, Channel] = {}
 
     for acc in cfg.get("oauthAccounts", []):
+        provider = _normalize_provider(acc.get("provider"))
         try:
-            ch = OAuthChannel(acc, default_models)
+            if provider == "openai":
+                ch = OpenAIOAuthChannel(acc)
+            else:
+                ch = OAuthChannel(acc, default_models)
             new[ch.key] = ch
         except Exception as exc:
-            print(f"[registry] skip invalid OAuth account: {exc}")
+            print(f"[registry] skip invalid OAuth account (provider={provider}): {exc}")
 
     for entry in cfg.get("channels", []):
         proto = entry.get("protocol", "anthropic")
