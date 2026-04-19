@@ -133,15 +133,21 @@ def _on_timeouts_input(chat_id: int, text: str) -> None:
 
 def _show_errwin(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
-    win = config.get().get("errorWindows") or []
+    cfg = config.get()
+    win = cfg.get("errorWindows") or []
+    grace = int(cfg.get("oauthGraceCount", 3))
     text = (
         "⛔ <b>错误冷却阶梯</b>\n\n"
-        f"当前: <code>{','.join(str(x) for x in win)}</code> 分钟\n\n"
-        "<i>说明：每个 (渠道, 模型) 连续失败递进到下一阶梯；末位为 0 表示永久拉黑；"
-        "成功一次立即重置计数。</i>"
+        f"阶梯（分钟）: <code>{','.join(str(x) for x in win)}</code>\n"
+        f"OAuth 宽容次数: <code>{grace}</code>\n\n"
+        "<i>说明：</i>\n"
+        "<i>• 每个 (渠道, 模型) 连续失败递进到下一阶梯；末位为 0 表示永久拉黑</i>\n"
+        "<i>• 成功一次立即重置失败计数</i>\n"
+        f"<i>• OAuth 渠道前 <b>{grace}</b> 次失败仅累计计数、不冷却（避免单账号偶发故障导致全部 Claude 模型不可用）</i>"
     )
     ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([
-        [ui.btn("✏ 修改", "sys:edit:errwin")],
+        [ui.btn("✏ 修改阶梯", "sys:edit:errwin"),
+         ui.btn("✏ OAuth 宽容次数", "sys:edit:oauth_grace")],
         [ui.btn("◀ 返回设置", "menu:settings")],
     ]))
 
@@ -154,6 +160,35 @@ def _edit_errwin(chat_id: int, message_id: int, cb_id: str) -> None:
         "请输入新的错误阶梯（非负整数，以逗号分隔；末位可用 0 表示永久）。\n\n"
         "例: <code>1,3,5,10,15,0</code>",
         reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:show:errwin")]]),
+    )
+
+
+def _edit_oauth_grace(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "sys_oauth_grace")
+    ui.edit(
+        chat_id, message_id,
+        "请输入新的 OAuth 宽容次数（非负整数）：\n\n"
+        "<i>示例：3 = 前 3 次失败仅累计不冷却，第 4 次起按错误阶梯进入冷却。</i>\n"
+        "<i>设 0 = 关闭宽容（与 API 渠道相同，第 1 次失败立即冷却）。</i>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:show:errwin")]]),
+    )
+
+
+def _on_oauth_grace_input(chat_id: int, text: str) -> None:
+    try:
+        v = int((text or "").strip())
+    except ValueError:
+        ui.send(chat_id, "❌ 非法数字，请重新输入：")
+        return
+    if v < 0 or v > 100:
+        ui.send(chat_id, "❌ 范围 0-100，请重新输入：")
+        return
+    config.update(lambda c: c.__setitem__("oauthGraceCount", v))
+    states.pop_state(chat_id)
+    ui.send_result(
+        chat_id, f"✅ OAuth 宽容次数已更新为 <code>{v}</code>",
+        back_label="◀ 返回错误阶梯", back_callback="sys:show:errwin",
     )
 
 
@@ -705,6 +740,7 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "sys:edit:timeouts":  _edit_timeouts(chat_id, message_id, cb_id); return True
     if data == "sys:show:errwin":    _show_errwin(chat_id, message_id, cb_id); return True
     if data == "sys:edit:errwin":    _edit_errwin(chat_id, message_id, cb_id); return True
+    if data == "sys:edit:oauth_grace": _edit_oauth_grace(chat_id, message_id, cb_id); return True
     if data == "sys:show:scoring":   _show_scoring(chat_id, message_id, cb_id); return True
     if data.startswith("sys:edit:scoring:"):
         _edit_scoring(chat_id, message_id, cb_id, data.split(":", 3)[3]); return True
@@ -747,6 +783,8 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         _on_timeouts_input(chat_id, text); return True
     if action == "sys_errwin":
         _on_errwin_input(chat_id, text); return True
+    if action == "sys_oauth_grace":
+        _on_oauth_grace_input(chat_id, text); return True
     if action.startswith("sys_scoring:"):
         _on_scoring_input(chat_id, action, text); return True
     if action.startswith("sys_affinity:"):

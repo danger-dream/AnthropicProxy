@@ -46,6 +46,18 @@ def _windows() -> list[int]:
     return [int(x) for x in w]
 
 
+def _grace_count(channel_key: str) -> int:
+    """OAuth 渠道的"宽容次数"：前 N 次失败不入冷却，只累计计数。
+
+    避免单 OAuth 账号因偶发 timeout 就被冷却（导致所有 Claude 模型不可用）。
+    第 N+1 次失败起按 errorWindows 阶梯。成功一次仍清零计数（沿用现有逻辑）。
+    API 渠道不启用 grace（失败第一次就进冷却）。
+    """
+    if channel_key.startswith("oauth:"):
+        return int(config.get().get("oauthGraceCount", 3))
+    return 0
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -76,6 +88,7 @@ def record_error(channel_key: str, model: str, message: str | None = None) -> di
     若本次推进让该 (channel, model) **首次进入永久冷却**，触发"channel_permanent"事件通知。
     """
     windows = _windows()
+    grace = _grace_count(channel_key)
     just_became_permanent = False
     with _lock:
         state = _entries.get((channel_key, model)) or {
@@ -85,13 +98,21 @@ def record_error(channel_key: str, model: str, message: str | None = None) -> di
         }
         prev_cd = state.get("cooldown_until")
         prev_count = int(state.get("error_count", 0))
-        idx = min(prev_count, len(windows) - 1)
-        minutes = windows[idx]
         new_count = prev_count + 1
-        if minutes == 0:
-            cooldown_until: Optional[int] = _INF
+
+        cooldown_until: Optional[int]
+        if new_count <= grace:
+            # 仍在宽容期：只累计 error_count，不进冷却（也不发通知）
+            cooldown_until = None
         else:
-            cooldown_until = _now_ms() + minutes * 60 * 1000
+            # 已超出宽容期：用扣除 grace 后的次数索引 errorWindows
+            ladder_idx = min(new_count - 1 - grace, len(windows) - 1)
+            minutes = windows[ladder_idx]
+            if minutes == 0:
+                cooldown_until = _INF
+            else:
+                cooldown_until = _now_ms() + minutes * 60 * 1000
+
         # 检测"首次进入永久"
         if cooldown_until == _INF and prev_cd != _INF:
             just_became_permanent = True

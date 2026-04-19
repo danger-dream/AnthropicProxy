@@ -28,10 +28,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "timeouts": {
         "connect": 10,
         "firstByte": 30,
-        "idle": 30,
+        "idle": 120,    # chunk 之间最长空闲；上游推理慢需要更宽松
         "total": 600,
     },
     "errorWindows": [1, 3, 5, 10, 15, 0],
+    # OAuth 渠道宽容次数：前 N 次失败只累计计数不进入冷却（成功一次清零）。
+    # 第 N+1 次失败开始按 errorWindows 阶梯。设计目的：避免单 OAuth 账号
+    # 因偶发 timeout 立即冷却导致所有 Claude 模型不可用。
+    "oauthGraceCount": 3,
     "affinity": {
         "ttlMinutes": 30,
         "threshold": 3.0,

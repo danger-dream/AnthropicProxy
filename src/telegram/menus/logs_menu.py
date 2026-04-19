@@ -15,7 +15,7 @@ from ... import log_db
 from .. import states, ui
 
 
-_LIST_LIMIT = 8
+_LIST_LIMIT = 15
 
 
 _STATUS_ICON = {"success": "✅", "error": "❌", "pending": "⏳"}
@@ -59,13 +59,17 @@ def _render_list(rows: list[dict]) -> str:
             detail_parts.append(f"首字 {ui.fmt_ms(r['first_token_time_ms'])}")
         if r.get("total_time_ms") is not None:
             detail_parts.append(f"总 {ui.fmt_ms(r['total_time_ms'])}")
+        tps_v = ui.calc_row_tps(r)
+        if tps_v is not None:
+            detail_parts.append(f"⚡ {ui.fmt_tps(tps_v)}")
         if detail_parts:
             line += "\n  " + " · ".join(detail_parts)
 
         if r.get("status") == "error" and r.get("error_message"):
             msg = r["error_message"]
             summary = _extract_error_summary(msg)[:120]
-            line += f"\n  <pre>{ui.escape_html(summary)}</pre>"
+            # 用 ⚠ + 斜体行内显示，避免 <pre> 块级元素带来的大空行
+            line += f"\n  ⚠ <i>{ui.escape_html(summary)}</i>"
 
         lines.append(line)
     return "\n".join(lines)
@@ -196,6 +200,9 @@ def _render_detail(detail: dict) -> str:
         f"首字 {ui.fmt_ms(log.get('first_token_time_ms'))} · "
         f"总 {ui.fmt_ms(log.get('total_time_ms'))}"
     )
+    tps_v = ui.calc_row_tps(log)
+    if tps_v is not None:
+        lines.append(f"⚡ 生成速度: {ui.fmt_tps(tps_v)}")
 
     # 重试链
     lines.append("")
@@ -220,13 +227,13 @@ def _render_detail(detail: dict) -> str:
         if timing:
             lines.append(f"     · {' · '.join(timing)}")
         if c.get("error_detail"):
-            lines.append(f"     ⚠ <pre>{ui.escape_html(_extract_error_summary(c['error_detail'])[:180])}</pre>")
+            lines.append(f"     ⚠ <i>{ui.escape_html(_extract_error_summary(c['error_detail'])[:180])}</i>")
 
     # 错误信息（整体）
     if status == "error" and log.get("error_message"):
         lines.append("")
         lines.append("<b>错误信息</b>")
-        lines.append(f"<pre>{ui.escape_html(_extract_error_summary(log['error_message'])[:300])}</pre>")
+        lines.append(f"<i>{ui.escape_html(_extract_error_summary(log['error_message'])[:300])}</i>")
 
     return "\n".join(lines)
 

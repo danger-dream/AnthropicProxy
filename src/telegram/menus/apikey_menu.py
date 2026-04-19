@@ -22,11 +22,30 @@ from __future__ import annotations
 
 import re
 import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from ... import config
+from ... import config, log_db
 from ...channel import registry
 from .. import states, ui
+
+
+_BJT = timezone(timedelta(hours=8))
+
+
+def _month_start_ts() -> float:
+    return datetime.now(_BJT).replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def _key_month_stats(name: str) -> Optional[dict]:
+    """本月该 API Key 的统计。无数据返回 None。"""
+    try:
+        s = log_db.tokens_for_apikey(name, since_ts=_month_start_ts())
+    except Exception:
+        return None
+    if not s or s.get("total", 0) <= 0:
+        return None
+    return s
 
 
 _KEY_PREFIX = "ccp-"
@@ -82,10 +101,23 @@ def _render_list() -> tuple[str, dict]:
             else:
                 key_str = entry.get("key", "")
                 allowed = list(entry.get("allowedModels") or [])
+            ms = _key_month_stats(name)
+            tps_line = ""
+            if ms is None:
+                tps_line = "\n  ⚡ 本月 TPS: <i>暂无数据</i>"
+            elif ms.get("avg_tps") is not None:
+                tps_line = (
+                    f"\n  ⚡ 本月 TPS: 平均 {ui.fmt_tps(ms.get('avg_tps'))} · "
+                    f"峰值 {ui.fmt_tps(ms.get('max_tps'))} · "
+                    f"最低 {ui.fmt_tps(ms.get('min_tps'))} ({ms['total']} 次)"
+                )
+            else:
+                tps_line = f"\n  ⚡ 本月调用 {ms['total']} 次（无可用 TPS 样本）"
             lines.append(
                 f"• <b>{ui.escape_html(name)}</b>\n"
                 f"  <code>{ui.escape_html(key_str)}</code>\n"
                 f"  {_fmt_allowed(allowed)}"
+                f"{tps_line}"
             )
         lines.append("\n<i>Tip: 单击 Key 即可复制。</i>")
 
@@ -137,6 +169,26 @@ def _render_detail(name: str) -> tuple[Optional[str], Optional[dict]]:
             lines.append(f"  • <code>{ui.escape_html(m)}</code>")
     else:
         lines.append("  <i>（未设白名单时，该 Key 可调用任意渠道支持的模型）</i>")
+
+    # 本月使用统计
+    ms = _key_month_stats(name)
+    if ms is not None:
+        prompt = ms["input"] + ms["cache_creation"] + ms["cache_read"]
+        cache_rate = (ms["cache_read"] / prompt * 100) if prompt > 0 else 0
+        lines += [
+            "",
+            "<b>📈 本月使用统计</b>",
+            f"  调用 {ms['total']} 次 · ✅ {ms['success_count']}"
+            f" ({ui.fmt_rate(ms['success_count'], ms['total'])}) · ❌ {ms['error_count']}",
+            f"  ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ms['output'])}"
+            f" · 缓存率 {cache_rate:.2f}%",
+        ]
+        if ms.get("avg_tps") is not None:
+            lines.append(
+                f"  ⚡ TPS: 平均 {ui.fmt_tps(ms.get('avg_tps'))} · "
+                f"峰值 {ui.fmt_tps(ms.get('max_tps'))} · "
+                f"最低 {ui.fmt_tps(ms.get('min_tps'))}"
+            )
 
     short = _short_of(name)
     rows = [

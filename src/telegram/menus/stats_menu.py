@@ -79,6 +79,9 @@ def _section_overall(overall: dict) -> str:
     avg_conn = overall.get("avg_connect_ms")
     avg_first = overall.get("avg_first_token_ms")
     avg_total = overall.get("avg_total_ms")
+    avg_tps = overall.get("avg_tps")
+    max_tps = overall.get("max_tps")
+    min_tps = overall.get("min_tps")
 
     lines = [
         "<b>Tokens:</b>",
@@ -97,17 +100,29 @@ def _section_overall(overall: dict) -> str:
         "",
         "<b>耗时（平均）:</b>",
         f"连接 {ui.fmt_ms(avg_conn)} | 首字 {ui.fmt_ms(avg_first)} | 总 {ui.fmt_ms(avg_total)}",
+        "",
+        "<b>生成速度:</b>",
+        f"平均 {ui.fmt_tps(avg_tps)} | 峰值 {ui.fmt_tps(max_tps)} | 最低 {ui.fmt_tps(min_tps)}",
     ]
     if total > 0:
+        if total_retries > 0:
+            lines += [
+                "",
+                "<b>重试:</b>",
+                f"共 {total_retries} 次 · 涉及 {retried}/{total} 个请求 ({ui.fmt_rate(retried, total)})",
+            ]
         lines += [
-            "",
-            "<b>重试:</b>",
-            f"共 {total_retries} 次 · 涉及 {retried}/{total} 个请求 ({ui.fmt_rate(retried, total)})",
             "",
             "<b>亲和:</b>",
             f"命中率 {ui.fmt_rate(affinity_hits, total)} ({affinity_hits}/{total})",
         ]
     return "\n".join(lines)
+
+
+def _strip_unknown(groups: list[dict]) -> list[dict]:
+    """过滤掉 key='?' 的维度条目——这些是 final_channel_key/requested_model
+    为 NULL 的请求（通常是调度失败 / error 中止），不应占据 Top 位置。"""
+    return [g for g in groups if (g.get("key") or "?") != "?"]
 
 
 def _summary_dim_block(title: str, groups: list[dict], render_key) -> str:
@@ -149,6 +164,9 @@ def _expanded_dim_block(title: str, groups: list[dict], render_key) -> str:
         cc = int(m.get("total_cache_creation") or 0)
         avg_conn = m.get("avg_connect_ms")
         avg_first = m.get("avg_first_token_ms")
+        avg_tps = m.get("avg_tps")
+        max_tps = m.get("max_tps")
+        min_tps = m.get("min_tps")
 
         out.append(f"\n{key}")
         out.append(f"  请求 {total} | ✅ {succ} ({ui.fmt_rate(succ, total)}) | ❌ {err}")
@@ -162,6 +180,11 @@ def _expanded_dim_block(title: str, groups: list[dict], render_key) -> str:
         )
         if avg_conn is not None or avg_first is not None:
             out.append(f"  连接 {ui.fmt_ms(avg_conn)} | 首字 {ui.fmt_ms(avg_first)}")
+        if avg_tps is not None or max_tps is not None:
+            out.append(
+                f"  ⚡ TPS: 平均 {ui.fmt_tps(avg_tps)} · "
+                f"峰值 {ui.fmt_tps(max_tps)} · 最低 {ui.fmt_tps(min_tps)}"
+            )
     return "\n".join(out)
 
 
@@ -174,7 +197,7 @@ def _section_cache_misses(misses: list[dict]) -> str:
         model = ui.escape_html((r.get("requested_model") or "?")[:36])
         key = ui.escape_html((r.get("api_key_name") or "?")[:18])
         ch = r.get("final_channel_key") or "?"
-        ch_disp = ui.escape_html(_ch_short_name(ch)[:24])
+        ch_disp = ui.escape_html(_ch_short_name(ch))
         inp = (r.get("input_tokens") or 0) + (r.get("cache_creation_tokens") or 0) + (r.get("cache_read_tokens") or 0)
         write = r.get("cache_creation_tokens") or 0
         msgs = r.get("msg_count") or 0
@@ -213,6 +236,9 @@ def _section_recent_calls(calls: list[dict]) -> str:
             timing.append(f"首字 {ui.fmt_ms(r['first_token_time_ms'])}")
         if r.get("total_time_ms") is not None:
             timing.append(f"总 {ui.fmt_ms(r['total_time_ms'])}")
+        tps_v = ui.calc_row_tps(r)
+        if tps_v is not None:
+            timing.append(f"⚡ {ui.fmt_tps(tps_v)}")
         if (r.get("retry_count") or 0) > 0:
             timing.append(f"重试 {r['retry_count']} 次")
         if timing:
@@ -234,7 +260,7 @@ def _render_overall(result: dict, period: str) -> str:
         _section_overall(result.get("overall") or {}),
     ]
 
-    by_channel = result.get("by_channel") or []
+    by_channel = _strip_unknown(result.get("by_channel") or [])
     if by_channel:
         block = _summary_dim_block(
             "按渠道 Top",
@@ -244,7 +270,7 @@ def _render_overall(result: dict, period: str) -> str:
         sections.append("")
         sections.append(block)
 
-    by_model = result.get("by_model") or []
+    by_model = _strip_unknown(result.get("by_model") or [])
     if by_model:
         block = _summary_dim_block(
             "按模型 Top", by_model,
@@ -253,7 +279,7 @@ def _render_overall(result: dict, period: str) -> str:
         sections.append("")
         sections.append(block)
 
-    by_apikey = result.get("by_apikey") or []
+    by_apikey = _strip_unknown(result.get("by_apikey") or [])
     if by_apikey:
         block = _summary_dim_block(
             "按 Key Top", by_apikey,
@@ -286,21 +312,24 @@ def _render_expanded(result: dict, period: str, dim: str) -> str:
         "",
     ]
     if dim == "channel":
+        groups = _strip_unknown(result.get("by_channel") or [])
         block = _expanded_dim_block(
-            f"按渠道（Top {len(result.get('by_channel') or [])}）",
-            result.get("by_channel") or [],
+            f"按渠道（Top {len(groups)}）",
+            groups,
             lambda k: f"{_channel_icon(k)} <code>{ui.escape_html(_ch_short_name(k))}</code>",
         )
     elif dim == "model":
+        groups = _strip_unknown(result.get("by_model") or [])
         block = _expanded_dim_block(
-            f"按模型（Top {len(result.get('by_model') or [])}）",
-            result.get("by_model") or [],
+            f"按模型（Top {len(groups)}）",
+            groups,
             lambda k: f"<code>{ui.escape_html(k)}</code>",
         )
     elif dim == "apikey":
+        groups = _strip_unknown(result.get("by_apikey") or [])
         block = _expanded_dim_block(
-            f"按 Key（Top {len(result.get('by_apikey') or [])}）",
-            result.get("by_apikey") or [],
+            f"按 Key（Top {len(groups)}）",
+            groups,
             lambda k: f"<code>{ui.escape_html(k)}</code>",
         )
     else:

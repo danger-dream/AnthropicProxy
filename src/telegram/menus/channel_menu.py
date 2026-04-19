@@ -20,12 +20,20 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from ... import affinity, config, cooldown, log_db, probe, scorer, state_db
 from ...channel import api_channel, registry
 from .. import states, ui
 from . import main as main_menu
+
+
+_BJT = timezone(timedelta(hours=8))
+
+
+def _month_start_ts() -> float:
+    return datetime.now(_BJT).replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
 # ─── 异步同步桥 ──────────────────────────────────────────────────
@@ -148,8 +156,8 @@ def _channel_health(ch) -> tuple[str, str]:
     return "🔴", f"近期 {worst:.0f}%"
 
 
-def _summary_text(ch) -> str:
-    """列表行上的简短摘要（sum_requests · avg_first_byte · success_rate）。"""
+def _summary_text(ch, tps_v: Optional[float] = None) -> str:
+    """列表行上的简短摘要（success_rate · avg_first_byte · sum_requests · 本月 TPS）。"""
     key = ch.key
     total_req = 0
     avg_fb: list[float] = []
@@ -167,7 +175,10 @@ def _summary_text(ch) -> str:
                 best = rate
                 rate_str = f"{rate:.0f}%"
     fb_str = f"{int(sum(avg_fb) / len(avg_fb))}ms" if avg_fb else "—"
-    return f"{rate_str} · {fb_str} · {total_req} 次"
+    core = f"{rate_str} · {fb_str} · {total_req} 次"
+    if tps_v is not None:
+        core += f" · ⚡ {ui.fmt_tps(tps_v)}"
+    return core
 
 
 def _mask_key(key: str) -> str:
@@ -188,11 +199,19 @@ def _list_text_and_kb() -> tuple[str, dict]:
     if total == 0:
         lines.append("\n暂无渠道，点「➕ 添加渠道」创建。")
 
+    # 本月 channel 级加权平均 TPS（按 channel 维度聚合 tokens/denom）
+    month_ts = _month_start_ts()
+
     rows: list[list[dict]] = []
     current: list[dict] = []
     for ch in chans:
         icon, status = _channel_health(ch)
-        summary = _summary_text(ch)
+        try:
+            ch_stats = log_db.tokens_for_channel(ch.key, since_ts=month_ts)
+            ch_tps = ch_stats.get("avg_tps")
+        except Exception:
+            ch_tps = None
+        summary = _summary_text(ch, tps_v=ch_tps)
         lines.append("")
         lines.append(f"{icon} <b>{ui.escape_html(ch.display_name)}</b> — {ui.escape_html(status)}")
         lines.append(f"  模型: {len(ch.models)} 个 · {ui.escape_html(summary)}")
@@ -237,6 +256,13 @@ def _channel_model_lines(ch) -> list[str]:
     perfs = {s["model"]: s for s in scorer.snapshot() if s["channel_key"] == ch.key}
     cd_map = {e["model"]: e for e in cooldown.active_entries() if e["channel_key"] == ch.key}
 
+    # 本月每个 model 的 TPS / 次数
+    try:
+        model_stats = log_db.channel_model_stats(ch.key, since_ts=_month_start_ts())
+    except Exception:
+        model_stats = []
+    stats_by_model = {s["final_model"]: s for s in model_stats}
+
     for m in ch.models:
         alias = m.get("alias")
         real = m.get("real")
@@ -269,6 +295,14 @@ def _channel_model_lines(ch) -> list[str]:
                 f"score {perf['score']}"
             )
             lines.append(stats_line)
+
+        ms = stats_by_model.get(real)
+        if ms and ms.get("avg_tps") is not None:
+            lines.append(
+                f"    ⚡ TPS: 平均 {ui.fmt_tps(ms['avg_tps'])} · "
+                f"峰值 {ui.fmt_tps(ms.get('max_tps'))} · "
+                f"最低 {ui.fmt_tps(ms.get('min_tps'))}"
+            )
     return lines
 
 
