@@ -7,6 +7,7 @@
 import copy
 import json
 import os
+import shutil
 import threading
 from typing import Any
 
@@ -233,7 +234,10 @@ _BACKUP_KEEP = 3  # 保留最近 3 份 config 备份
 
 
 def _rotate_backups() -> None:
-    """在覆盖 config.json 之前，把旧文件轮转到 .bak.1/2/3（FIFO）。"""
+    """在覆盖 config.json 前刷新备份链，但不移动当前 live config。
+
+    这样即使后续写 tmp / replace 失败，live config 仍保留在原位。
+    """
     if not os.path.exists(CONFIG_PATH):
         return
     # 从大到小移位：.bak.2 → .bak.3；.bak.1 → .bak.2
@@ -247,19 +251,26 @@ def _rotate_backups() -> None:
                 pass
     # 当前 config → .bak.1
     try:
-        os.replace(CONFIG_PATH, CONFIG_PATH + ".bak.1")
+        shutil.copy2(CONFIG_PATH, CONFIG_PATH + ".bak.1")
     except OSError:
         pass
 
 
 def _write_atomic(data: dict) -> None:
-    _rotate_backups()
     tmp = CONFIG_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, CONFIG_PATH)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        _rotate_backups()
+        os.replace(tmp, CONFIG_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _current_mtime() -> float:

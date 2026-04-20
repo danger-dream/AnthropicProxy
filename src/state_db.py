@@ -99,19 +99,27 @@ def _schema_sql() -> str:
 
 
 def init() -> None:
-    """启动时调用一次。建表 + 清理过期亲和。"""
+    """启动时调用。确保当前连接的 schema 始终升级到最新版本。"""
     global _initialized, _db_path
-    if _initialized:
-        return
-    _db_path = _resolve_db_path()
+    resolved = _resolve_db_path()
+    if _db_path != resolved:
+        old = getattr(_local, "conn", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+            _local.conn = None
+        _db_path = resolved
     os.makedirs(os.path.dirname(_db_path) or ".", exist_ok=True)
     conn = _get_conn()
     with _write_lock:
         conn.executescript(_schema_sql())
         _migrate_oauth_quota_cache_openai_cols(conn)
         conn.commit()
+    if not _initialized:
+        print(f"[state_db] Using {_db_path}")
     _initialized = True
-    print(f"[state_db] Using {_db_path}")
 
 
 # ================================================================
@@ -257,13 +265,28 @@ def run_composite_key_migration(email_to_key: dict[str, str]) -> dict:
 
 
 
-# 自 MS-OpenAI OAuth 接入起，oauth_quota_cache 新增了 Codex 原始/归一化用量字段。
-# 老库没有这些列 → 此函数在 init() 时幂等补齐。SQLite `ADD COLUMN` 不支持
-# IF NOT EXISTS，改用 PRAGMA table_info 比对再决定是否加，重复启动无副作用。
-_OPENAI_EXTRA_COLUMNS: list[tuple[str, str]] = [
-    # 2026-04-20: Anthropic 被动采样写入时间戳（ms）
+# oauth_quota_cache 在几个里程碑里逐步加过列：
+# - 统一 quota 视图：five_hour_* / seven_day_* / sonnet_* / opus_* / extra_* / raw_data
+# - 2026-04-20 被动采样：last_passive_update_at
+# - OpenAI Codex 快照：codex_primary_* / codex_secondary_* / codex_primary_over_secondary_pct
+#
+# 某些测试会手动重建老 schema（只保留 email/fetched_at 或少数字段）再继续复用同一
+# 进程里的 state_db 模块；因此 init() 必须能对"已存在但缺列"的表做幂等补齐，
+# 不能只依赖 CREATE TABLE IF NOT EXISTS。
+_OAUTH_QUOTA_CACHE_EXTRA_COLUMNS: list[tuple[str, str]] = [
+    ("five_hour_util",                   "REAL"),
+    ("five_hour_reset",                  "TEXT"),
+    ("seven_day_util",                   "REAL"),
+    ("seven_day_reset",                  "TEXT"),
+    ("sonnet_util",                      "REAL"),
+    ("sonnet_reset",                     "TEXT"),
+    ("opus_util",                        "REAL"),
+    ("opus_reset",                       "TEXT"),
+    ("extra_used",                       "REAL"),
+    ("extra_limit",                      "REAL"),
+    ("extra_util",                       "REAL"),
+    ("raw_data",                         "TEXT"),
     ("last_passive_update_at",          "INTEGER"),
-    # 原始 primary/secondary（便于排查问题）
     ("codex_primary_used_pct",          "REAL"),
     ("codex_primary_reset_sec",         "INTEGER"),
     ("codex_primary_window_min",        "INTEGER"),
@@ -276,7 +299,7 @@ _OPENAI_EXTRA_COLUMNS: list[tuple[str, str]] = [
 
 def _migrate_oauth_quota_cache_openai_cols(conn: sqlite3.Connection) -> None:
     existing = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")}
-    for col, col_type in _OPENAI_EXTRA_COLUMNS:
+    for col, col_type in _OAUTH_QUOTA_CACHE_EXTRA_COLUMNS:
         if col in existing:
             continue
         try:
@@ -558,35 +581,54 @@ def quota_save(account_key: str, data: dict[str, Any],
     if email is None:
         email = account_key.split(":", 1)[1] if ":" in account_key else account_key
     with _write_lock:
-        _get_conn().execute(
-            """INSERT OR REPLACE INTO oauth_quota_cache
-               (account_key, email, fetched_at,
-                five_hour_util, five_hour_reset,
-                seven_day_util, seven_day_reset,
-                sonnet_util, sonnet_reset,
-                opus_util, opus_reset,
-                extra_used, extra_limit, extra_util,
-                raw_data)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                account_key,
-                email,
-                int(data.get("fetched_at", now_ms())),
-                data.get("five_hour_util"),
-                data.get("five_hour_reset"),
-                data.get("seven_day_util"),
-                data.get("seven_day_reset"),
-                data.get("sonnet_util"),
-                data.get("sonnet_reset"),
-                data.get("opus_util"),
-                data.get("opus_reset"),
-                data.get("extra_used"),
-                data.get("extra_limit"),
-                data.get("extra_util"),
-                data.get("raw_data"),
-            ),
+        conn = _get_conn()
+        values = (
+            email,
+            int(data.get("fetched_at", now_ms())),
+            data.get("five_hour_util"),
+            data.get("five_hour_reset"),
+            data.get("seven_day_util"),
+            data.get("seven_day_reset"),
+            data.get("sonnet_util"),
+            data.get("sonnet_reset"),
+            data.get("opus_util"),
+            data.get("opus_reset"),
+            data.get("extra_used"),
+            data.get("extra_limit"),
+            data.get("extra_util"),
+            data.get("raw_data"),
         )
-        _get_conn().commit()
+        row = conn.execute(
+            "SELECT account_key FROM oauth_quota_cache WHERE account_key=?",
+            (account_key,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """INSERT INTO oauth_quota_cache
+                   (account_key, email, fetched_at,
+                    five_hour_util, five_hour_reset,
+                    seven_day_util, seven_day_reset,
+                    sonnet_util, sonnet_reset,
+                    opus_util, opus_reset,
+                    extra_used, extra_limit, extra_util,
+                    raw_data)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (account_key,) + values,
+            )
+        else:
+            conn.execute(
+                """UPDATE oauth_quota_cache SET
+                     email=?, fetched_at=?,
+                     five_hour_util=?, five_hour_reset=?,
+                     seven_day_util=?, seven_day_reset=?,
+                     sonnet_util=?, sonnet_reset=?,
+                     opus_util=?, opus_reset=?,
+                     extra_used=?, extra_limit=?, extra_util=?,
+                     raw_data=?
+                   WHERE account_key=?""",
+                values + (account_key,),
+            )
+        conn.commit()
 
 
 def quota_load(account_key_or_email: str) -> dict | None:
@@ -721,37 +763,61 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
 
     if email is None:
         email = account_key.split(":", 1)[1] if ":" in account_key else account_key
+    passive_ts = fetched_at
     with _write_lock:
-        _get_conn().execute(
-            """INSERT OR REPLACE INTO oauth_quota_cache
-               (account_key, email, fetched_at,
-                five_hour_util, five_hour_reset,
-                seven_day_util, seven_day_reset,
-                sonnet_util, sonnet_reset,
-                opus_util, opus_reset,
-                extra_used, extra_limit, extra_util, raw_data,
-                codex_primary_used_pct, codex_primary_reset_sec, codex_primary_window_min,
-                codex_secondary_used_pct, codex_secondary_reset_sec, codex_secondary_window_min,
-                codex_primary_over_secondary_pct)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                       ?,?,?,?,?,?,?)""",
-            (
-                account_key, email, fetched_at,
-                normalized.get("five_hour_util"),
-                _reset_iso(normalized.get("five_hour_reset_sec")),
-                normalized.get("seven_day_util"),
-                _reset_iso(normalized.get("seven_day_reset_sec")),
-                None, None,            # sonnet —— OpenAI 无此维度
-                None, None,            # opus   —— 同上
-                None, None, None,      # extra_* —— Claude 专属
-                None,                  # raw_data（响应头体积较小，不存）
-                snap.get("primary_used_pct"),
-                snap.get("primary_reset_sec"),
-                snap.get("primary_window_min"),
-                snap.get("secondary_used_pct"),
-                snap.get("secondary_reset_sec"),
-                snap.get("secondary_window_min"),
-                snap.get("primary_over_secondary_pct"),
-            ),
+        conn = _get_conn()
+        values = (
+            email,
+            fetched_at,
+            passive_ts,
+            normalized.get("five_hour_util"),
+            _reset_iso(normalized.get("five_hour_reset_sec")),
+            normalized.get("seven_day_util"),
+            _reset_iso(normalized.get("seven_day_reset_sec")),
+            snap.get("primary_used_pct"),
+            snap.get("primary_reset_sec"),
+            snap.get("primary_window_min"),
+            snap.get("secondary_used_pct"),
+            snap.get("secondary_reset_sec"),
+            snap.get("secondary_window_min"),
+            snap.get("primary_over_secondary_pct"),
         )
-        _get_conn().commit()
+        row = conn.execute(
+            "SELECT account_key FROM oauth_quota_cache WHERE account_key=?",
+            (account_key,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """INSERT INTO oauth_quota_cache
+                   (account_key, email, fetched_at, last_passive_update_at,
+                    five_hour_util, five_hour_reset,
+                    seven_day_util, seven_day_reset,
+                    sonnet_util, sonnet_reset,
+                    opus_util, opus_reset,
+                    extra_used, extra_limit, extra_util, raw_data,
+                    codex_primary_used_pct, codex_primary_reset_sec, codex_primary_window_min,
+                    codex_secondary_used_pct, codex_secondary_reset_sec, codex_secondary_window_min,
+                    codex_primary_over_secondary_pct)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    account_key,
+                ) + values[:7] + (
+                    None, None,        # sonnet —— OpenAI 无此维度
+                    None, None,        # opus   —— 同上
+                    None, None, None,  # extra_* —— Claude 专属
+                    None,              # raw_data（响应头体积较小，不存）
+                ) + values[7:],
+            )
+        else:
+            conn.execute(
+                """UPDATE oauth_quota_cache SET
+                     email=?, fetched_at=?, last_passive_update_at=?,
+                     five_hour_util=?, five_hour_reset=?,
+                     seven_day_util=?, seven_day_reset=?,
+                     codex_primary_used_pct=?, codex_primary_reset_sec=?, codex_primary_window_min=?,
+                     codex_secondary_used_pct=?, codex_secondary_reset_sec=?, codex_secondary_window_min=?,
+                     codex_primary_over_secondary_pct=?
+                   WHERE account_key=?""",
+                values + (account_key,),
+            )
+        conn.commit()

@@ -79,6 +79,7 @@ class C2RState:
     message_item: Optional[_MessageItem] = None
     reasoning_item: Optional[_ReasoningItem] = None
     fc_by_chat_index: dict[int, _FunctionCallItem] = field(default_factory=dict)
+    closed_items: list[tuple[int, dict]] = field(default_factory=list)
 
     finish_reason: Optional[str] = None          # chat 的值：stop/length/tool_calls/content_filter/function_call
     usage: Optional[dict] = None                  # chat usage（上游 stream_options.include_usage）
@@ -378,16 +379,18 @@ class StreamTranslator:
             final_content.append({"type": "output_text", "text": item.text_buf, "annotations": []})
         if item.refusal_part_opened:
             final_content.append({"type": "refusal", "refusal": item.refusal_buf})
+        completed_item = {
+            "type": "message", "id": item.item_id, "role": "assistant",
+            "status": "completed", "content": final_content,
+        }
         yield _emit("response.output_item.done", {
             "type": "response.output_item.done",
             "sequence_number": self.state.next_seq(),
             "output_index": item.output_index,
-            "item": {
-                "type": "message", "id": item.item_id, "role": "assistant",
-                "status": "completed", "content": final_content,
-            },
+            "item": completed_item,
         })
-        # 保留 item 以便 close() 收集 output items；清理 active_text_kind
+        self.state.closed_items.append((item.output_index, completed_item))
+        self.state.message_item = None
         self.state.active_text_kind = None
 
     # --- reasoning item ---
@@ -450,16 +453,19 @@ class StreamTranslator:
                 "summary_index": 0,
                 "part": {"type": "summary_text", "text": item.text_buf},
             })
+        completed_item = {
+            "type": "reasoning", "id": item.item_id,
+            "summary": ([{"type": "summary_text", "text": item.text_buf}]
+                        if item.summary_part_opened else []),
+        }
         yield _emit("response.output_item.done", {
             "type": "response.output_item.done",
             "sequence_number": self.state.next_seq(),
             "output_index": item.output_index,
-            "item": {
-                "type": "reasoning", "id": item.item_id,
-                "summary": ([{"type": "summary_text", "text": item.text_buf}]
-                            if item.summary_part_opened else []),
-            },
+            "item": completed_item,
         })
+        self.state.closed_items.append((item.output_index, completed_item))
+        self.state.reasoning_item = None
 
     # --- function_call items ---
 
@@ -605,7 +611,7 @@ class StreamTranslator:
 
     def _collect_output_items(self) -> list[dict]:
         """按 output_index 顺序收集所有 item 的"completed"快照。"""
-        items: list[tuple[int, dict]] = []
+        items: list[tuple[int, dict]] = list(self.state.closed_items)
         if self.state.message_item is not None:
             mi = self.state.message_item
             final_content: list[dict] = []

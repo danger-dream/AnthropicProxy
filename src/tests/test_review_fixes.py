@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+import pytest
+
+import os as _ap_os
+import sys as _ap_sys
+
+_ap_sys.path.insert(
+    0,
+    _ap_os.path.dirname(
+        _ap_os.path.dirname(
+            _ap_os.path.dirname(_ap_os.path.abspath(__file__))
+        )
+    ),
+)
+from src.tests import _isolation
+
+_isolation.isolate()
+
+
+def _import_modules():
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from src import config, state_db
+    from src.openai.transform import stream_c2r
+    return {
+        "config": config,
+        "state_db": state_db,
+        "stream_c2r": stream_c2r,
+    }
+
+
+def _setup(m):
+    m["state_db"].init()
+    for row in m["state_db"].quota_load_all():
+        m["state_db"].quota_delete(row["account_key"])
+
+
+def _parse_responses_events(frames):
+    text = b"".join(frames).decode("utf-8", errors="replace")
+    out = []
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        event_name = ""
+        data_str = ""
+        for line in block.split("\n"):
+            line = line.strip()
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+            elif line.startswith("data:"):
+                data_str = line[5:].strip()
+        if not data_str:
+            continue
+        out.append((event_name, json.loads(data_str)))
+    return out
+
+
+def test_config_write_atomic_preserves_live_file_on_serialize_error(m, tmp_path):
+    cfg = m["config"]
+    original_path = cfg.CONFIG_PATH
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    try:
+        with open(cfg.CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"ok": 1}, f)
+        with pytest.raises(TypeError):
+            cfg._write_atomic({"bad": object()})
+        assert os.path.exists(cfg.CONFIG_PATH)
+        with open(cfg.CONFIG_PATH, "r", encoding="utf-8") as f:
+            assert json.load(f) == {"ok": 1}
+    finally:
+        cfg.CONFIG_PATH = original_path
+
+
+def test_quota_save_preserves_openai_snapshot_columns(m):
+    _setup(m)
+    st = m["state_db"]
+    account_key = "openai:test@example.com"
+    st.quota_save_openai_snapshot(account_key, {
+        "primary_used_pct": 42.0,
+        "primary_reset_sec": 3600,
+        "primary_window_min": 10080,
+        "secondary_used_pct": 7.0,
+        "secondary_reset_sec": 120,
+        "secondary_window_min": 300,
+        "primary_over_secondary_pct": 10.0,
+        "fetched_at": 1234567890000,
+    })
+    before = st.quota_load(account_key)
+    assert before["codex_primary_used_pct"] == 42.0
+    assert before["last_passive_update_at"] == 1234567890000
+
+    st.quota_save(account_key, {
+        "fetched_at": 1234567899999,
+        "five_hour_util": 7.0,
+        "five_hour_reset": "2026-04-20T00:00:00Z",
+        "seven_day_util": 42.0,
+        "seven_day_reset": "2026-04-27T00:00:00Z",
+        "raw_data": "{}",
+    }, email="test@example.com")
+    after = st.quota_load(account_key)
+    assert after["codex_primary_used_pct"] == 42.0
+    assert after["codex_secondary_used_pct"] == 7.0
+    assert after["last_passive_update_at"] == 1234567890000
+
+
+def test_stream_c2r_preserves_all_completed_output_items(m):
+    T = m["stream_c2r"].StreamTranslator
+    tr = T(model="gpt-5.4")
+
+    def frame(obj):
+        return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode()
+
+    seq = [
+        {"choices": [{"delta": {"content": "hello "}, "finish_reason": None}]},
+        {"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "sum", "arguments": "{\"a\":1"},
+        }]}, "finish_reason": None}]},
+        {"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "function": {"arguments": ",\"b\":2}"},
+        }]}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "world"}, "finish_reason": "stop"}]},
+    ]
+    for obj in seq:
+        list(tr.feed(frame(obj)))
+    events = _parse_responses_events(list(tr.close()))
+    completed = [data["response"] for name, data in events if name == "response.completed"][-1]
+    output = completed["output"]
+    assert len(output) == 3, output
+    assert output[0]["type"] == "message"
+    assert output[0]["content"][0]["text"] == "hello "
+    assert output[1]["type"] == "function_call"
+    assert output[1]["arguments"] == "{\"a\":1,\"b\":2}"
+    assert output[2]["type"] == "message"
+    assert output[2]["content"][0]["text"] == "world"
+    assert completed["output_text"] == "hello world"

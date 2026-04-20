@@ -32,6 +32,30 @@ _thread: Optional[threading.Thread] = None
 _running = False
 
 
+def _summarize_text(text: str) -> str:
+    """日志里只保留安全摘要，避免把 token / JSON / API Key 打进 stdout。"""
+    if not text:
+        return "empty"
+    if text.startswith("/"):
+        return f"command={text.split(None, 1)[0]}"
+    return f"text_len={len(text)}"
+
+
+def _summarize_state(state: Optional[dict]) -> str:
+    """状态机日志只输出 action 与 data 的键名，不输出敏感值。"""
+    if not isinstance(state, dict):
+        return repr(state)
+    action = state.get("action")
+    data = state.get("data")
+    if not isinstance(data, dict):
+        return f"action={action!r}"
+    keys = sorted(str(k) for k in data.keys())
+    shown = ", ".join(keys[:8])
+    if len(keys) > 8:
+        shown += ", ..."
+    return f"action={action!r}, data_keys=[{shown}]"
+
+
 # ─── 生命周期 ─────────────────────────────────────────────────────
 
 def init(bot_token: str, admin_ids: list[int]) -> None:
@@ -239,7 +263,7 @@ def _handle_callback(cb: dict) -> None:
 def _handle_message(msg: dict) -> None:
     chat_id = msg["chat"]["id"]
     text = msg.get("text", "") or ""
-    print(f"[tg] msg from {chat_id}: {text[:80]!r}")   # DEBUG
+    print(f"[tg] msg from {chat_id}: {_summarize_text(text)}")   # DEBUG
 
     if not ui.is_admin(chat_id):
         ui.send(
@@ -251,7 +275,7 @@ def _handle_message(msg: dict) -> None:
 
     # 状态机输入
     state = states.get_state(chat_id)
-    print(f"[tg] state for {chat_id}: {state}")        # DEBUG
+    print(f"[tg] state for {chat_id}: {_summarize_state(state)}")        # DEBUG
     if state:
         action = state.get("action", "")
         if apikey_menu.handle_text_state(chat_id, action, text):

@@ -1438,10 +1438,13 @@ async def _consume_stream(
                 remaining = _remaining_ms(deadline_ts)
                 if remaining <= 0:
                     await _emit_error_and_finalize(
-                        "api_error", f"upstream total timeout > {int((deadline_ts - start_time))}s",
+                        errors.ErrType.TIMEOUT,
+                        f"upstream total timeout > {int((deadline_ts - start_time))}s",
                         outcome="total_timeout",
                     )
-                    yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, "upstream total timeout")
+                    yield _sse_error_for_ingress(
+                        ingress_protocol, errors.ErrType.TIMEOUT, "upstream total timeout"
+                    )
                     return
                 wait_sec = min(idle_timeout, max(1, remaining / 1000))
                 try:
@@ -1449,17 +1452,23 @@ async def _consume_stream(
                 except asyncio.TimeoutError:
                     if _remaining_ms(deadline_ts) <= 0:
                         await _emit_error_and_finalize(
-                            "api_error", f"upstream total timeout",
+                            errors.ErrType.TIMEOUT, "upstream total timeout",
                             outcome="total_timeout",
                         )
-                        yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, "upstream total timeout")
+                        yield _sse_error_for_ingress(
+                            ingress_protocol, errors.ErrType.TIMEOUT, "upstream total timeout"
+                        )
                         return
                     await _emit_error_and_finalize(
-                        "api_error", f"upstream idle timeout > {idle_timeout}s",
+                        errors.ErrType.TIMEOUT,
+                        f"upstream idle timeout > {idle_timeout}s",
                         outcome="idle_timeout",
                     )
-                    yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API,
-                                                 f"upstream idle timeout > {idle_timeout}s")
+                    yield _sse_error_for_ingress(
+                        ingress_protocol,
+                        errors.ErrType.TIMEOUT,
+                        f"upstream idle timeout > {idle_timeout}s",
+                    )
                     return
                 except StopAsyncIteration:
                     break
