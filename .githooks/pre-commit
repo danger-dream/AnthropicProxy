@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Parrot 🦜 pre-commit hook：阻止敏感文件 / 凭证被误提交。
+#
+# 安装：git config core.hooksPath .githooks
+# 校验：git config --get core.hooksPath
+
+set -euo pipefail
+
+RED=$'\033[0;31m'
+YELLOW=$'\033[1;33m'
+GREEN=$'\033[0;32m'
+RESET=$'\033[0m'
+
+fail() {
+    echo "${RED}[pre-commit] 拒绝提交：$*${RESET}" >&2
+    exit 1
+}
+
+warn() {
+    echo "${YELLOW}[pre-commit] 警告：$*${RESET}" >&2
+}
+
+# ─── 1. 敏感文件名黑名单 ──────────────────────────────────────────
+# 这些文件即使用 -f 也绝不允许进入仓库
+SENSITIVE_FILES=(
+    "config.json"
+    "config.json.tmp"
+    "oauth.json"
+    ".anthropic_proxy_ids.json"
+    ".env"
+    "state.db"
+    "state.db-wal"
+    "state.db-shm"
+)
+
+staged_files=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$staged_files" ]; then
+    exit 0
+fi
+
+for sf in "${SENSITIVE_FILES[@]}"; do
+    if echo "$staged_files" | grep -qxF "$sf"; then
+        fail "$sf 是敏感运行时文件，不能提交（如确需提交非敏感样板，请用 config.example.json）"
+    fi
+done
+
+# 拦住 config.json.bak* / *.db / *.env* 所有变体
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+        config.json.bak*|*.env|*.env.*|.env.*|*.db|*.db-wal|*.db-shm)
+            fail "$f 匹配敏感文件通配规则"
+            ;;
+        logs/*|bak/*|.codex/*|__pycache__/*|*/__pycache__/*|venv/*|.pytest_cache/*)
+            fail "$f 属于本应 ignore 的目录（检查 .gitignore 是否完整）"
+            ;;
+    esac
+done <<< "$staged_files"
+
+# ─── 2. 凭证内容扫描 ──────────────────────────────────────────────
+# 对所有 staged 文本内容跑正则，命中则拒绝
+patterns=(
+    # OAuth / Bot token
+    'sk-ant-api0[A-Za-z0-9_-]{20,}'                 # Anthropic API key
+    'sk-ant-oat01-[A-Za-z0-9_-]{20,}'               # Anthropic OAuth access token
+    'sk-ant-ort01-[A-Za-z0-9_-]{20,}'               # Anthropic OAuth refresh token
+    'sk-proj-[A-Za-z0-9_-]{20,}'                    # OpenAI project key
+    'sk-svcacct-[A-Za-z0-9_-]{20,}'                 # OpenAI service account
+    'eyJhbGciOi[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'  # JWT
+    'ghp_[A-Za-z0-9]{30,}'                          # GitHub personal token (classic)
+    'gho_[A-Za-z0-9]{30,}'                          # GitHub OAuth token
+    'github_pat_[A-Za-z0-9_]{30,}'                  # GitHub fine-grained PAT
+    'AIza[0-9A-Za-z_-]{30,}'                        # Google API key
+    '[0-9]{8,12}:AAE[A-Za-z0-9_-]{30,}'             # Telegram bot token
+    '[0-9]{8,12}:AAG[A-Za-z0-9_-]{30,}'
+    '[0-9]{8,12}:AAH[A-Za-z0-9_-]{30,}'
+    # 通用 refresh_token / access_token 带实际值（JSON 字面量）
+    '"(refresh_token|access_token)"[[:space:]]*:[[:space:]]*"[A-Za-z0-9][A-Za-z0-9_.\/+-]{30,}"'
+)
+
+hits=0
+for f in $staged_files; do
+    # 只扫文本（大文件/二进制跳过）
+    if ! git show ":$f" 2>/dev/null | head -c 4 | grep -q -a . 2>/dev/null; then
+        continue
+    fi
+    # 跳过 example 文件和 hook 自身（hook 里天然含 pattern 示意）
+    case "$f" in
+        config.example.json|.githooks/pre-commit)
+            continue
+            ;;
+    esac
+    content=$(git show ":$f" 2>/dev/null || true)
+    [ -z "$content" ] && continue
+    for pat in "${patterns[@]}"; do
+        if echo "$content" | grep -E -q "$pat"; then
+            matched=$(echo "$content" | grep -E -o "$pat" | head -3)
+            echo "${RED}[pre-commit] 在 $f 中命中敏感模式：${RESET}" >&2
+            echo "$matched" | sed 's/\(.\{16\}\).*\(.\{6\}\)$/  \1…\2/' >&2
+            hits=$((hits + 1))
+        fi
+    done
+done
+
+if [ "$hits" -gt 0 ]; then
+    fail "共命中 $hits 处潜在凭证。如确认是误报，用 git commit --no-verify 绕过（自负风险）。"
+fi
+
+echo "${GREEN}[pre-commit] ✓ 未发现敏感文件/凭证，允许提交${RESET}" >&2
+exit 0

@@ -170,6 +170,35 @@ def test_view_detail_with_quota_cache(m):
     print("  [PASS] oauth detail (含 quota 缓存渲染)")
 
 
+def test_missing_reset_shows_upstream_not_returned(m):
+    _setup(m)
+    _add_fake_account(m, "missing-reset@x.com")
+    m["state_db"].quota_save("missing-reset@x.com", {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 0.0, "five_hour_reset": None,
+        "seven_day_util": 45.0, "seven_day_reset": None,
+        "sonnet_util": 0.0, "sonnet_reset": None,
+        "opus_util": 0.0, "opus_reset": None,
+        "raw_data": "{}",
+    })
+
+    rec = _install_recorder(m)
+    m["oauth_menu"].show(42, 100)
+    list_text = rec.last("editMessageText")["text"]
+    assert "5h 用量" in list_text and "上游未返回" in list_text
+    assert "7d 用量" in list_text and "上游未返回" in list_text
+
+    rec.clear()
+    short = m["ui"].register_code("missing-reset@x.com")
+    m["oauth_menu"].on_view(42, 100, "cb", short)
+    detail_text = rec.last("editMessageText")["text"]
+    assert "⏱ 5h: 0% (重置: 上游未返回)" in detail_text
+    assert "📅 7d: 45% (重置: 上游未返回)" in detail_text
+    assert "🤖 Sonnet 7d: 0% (重置: 上游未返回)" in detail_text
+    assert "🧠 Opus 7d: 0% (重置: 上游未返回)" in detail_text
+    print("  [PASS] missing reset renders as 上游未返回 in list + detail")
+
+
 def test_refresh_token_updates_access_and_usage(m):
     _setup(m)
     _add_fake_account(m, "bob@x.com")

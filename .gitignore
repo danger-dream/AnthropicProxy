@@ -1,22 +1,42 @@
+# ─── Python ───────────────────────────────────────────────
 venv/
 __pycache__/
-bak/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─── 运行时数据（敏感！）─────────────────────────────────────
+# 以下任一文件包含 OAuth token / API Key / Bot Token，绝对不能提交
+config.json
+config.json.tmp
+config.json.bak*
+oauth.json
+.env
+.env.*
+
+# 持久化数据库
 state.db
 state.db-shm
 state.db-wal
 state.db.pre_composite_key.bak
-*.pyc
 *.db
-*.db-wal
 *.db-shm
+*.db-wal
+
+# 运行日志
 logs/
+*.log
+
+# 设备/实例身份
 .anthropic_proxy_ids.json
 
-# 运行时配置（含 bot token / API Key / OAuth refresh_token 等敏感信息）
-# 首次启动 server.py 会自动生成默认模板
-config.json
-config.json.tmp
-config.json.bak*
-
-*.log
+# ─── 杂项 ────────────────────────────────────────────────
+bak/
+.codex/
 .DS_Store
+.idea/
+.vscode/
+*.swp

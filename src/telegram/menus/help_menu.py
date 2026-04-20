@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from ... import __version__
 from .. import ui
 
 
@@ -44,7 +45,9 @@ _HELP_TEXT = (
     "• 加新 OAuth 账号 → 「🔐 管理 OAuth」→「➕ 新增账户」→ 登录或粘贴 JSON\n"
     "• 加第三方渠道 → 「🔀 渠道管理」→「➕ 添加渠道」→ 4 步向导 + 测试\n"
     "• 调代理超时 → 「⚙ 系统设置」→「⏱ 超时设置」\n"
-    "• 紧急清所有冷却 → 「🔀 渠道管理」→「🧹 清全部错误」\n"
+    "• 紧急清所有冷却 → 「🔀 渠道管理」→「🧹 清全部错误」\n\n"
+    "──────────────\n"
+    f"Parrot v{__version__} · <a href=\"https://github.com/danger-dream/Parrot\">GitHub</a>"
 )
 
 

@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from ... import affinity, config, log_db, oauth_manager, public_ip, state_db
+from ... import __version__, affinity, config, log_db, oauth_manager, public_ip, state_db
 from ...oauth_ids import account_key as _account_key
 from ...channel import registry
 from .. import ui
@@ -100,7 +100,7 @@ def _overview() -> str:
     quota_hot = _quota_hot_count(80.0)
 
     lines = [
-        "🦜 <b>Parrot · TG 管理面板</b>",
+        "🦜 <b>Parrot · TG 管理面板</b> <code>v" + __version__ + "</code>",
         "",
         f"📡 监听 <code>:{port}</code> · 调度 <code>{mode}</code> · CCH <code>{cch}</code>",
         f"🔐 OAuth: {oauth_enabled}/{len(oauth_accounts)} 可用"

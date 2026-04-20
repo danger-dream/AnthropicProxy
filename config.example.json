@@ -1,0 +1,156 @@
+{
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 18082
+  },
+  "apiKeys": {
+    "my-downstream-key": {
+      "key": "sk-REPLACE-ME-with-any-string-downstream-clients-send-as-auth",
+      "allowedModels": []
+    }
+  },
+  "oauthAccounts": [],
+  "channels": [
+    {
+      "name": "example-anthropic-compat",
+      "type": "api",
+      "protocol": "anthropic",
+      "baseUrl": "https://your-anthropic-compat-provider.example.com",
+      "apiKey": "REPLACE_ME",
+      "models": [
+        {
+          "alias": "claude-opus-4-7",
+          "real": "claude-opus-4-7"
+        }
+      ],
+      "cc_mimicry": false,
+      "enabled": true,
+      "disabled_reason": null
+    },
+    {
+      "name": "example-openai-compat",
+      "type": "api",
+      "protocol": "openai-chat",
+      "baseUrl": "https://your-openai-compat-provider.example.com/v1",
+      "apiKey": "REPLACE_ME",
+      "models": [
+        {
+          "alias": "gpt-5.4",
+          "real": "gpt-5.4"
+        }
+      ],
+      "cc_mimicry": false,
+      "enabled": true,
+      "disabled_reason": null
+    }
+  ],
+  "timeouts": {
+    "connect": 10,
+    "firstByte": 30,
+    "idle": 120,
+    "total": 600
+  },
+  "errorWindows": [
+    1,
+    3,
+    5,
+    10,
+    15,
+    0
+  ],
+  "oauthGraceCount": 3,
+  "affinity": {
+    "ttlMinutes": 30,
+    "threshold": 3.0,
+    "cleanupIntervalSeconds": 300
+  },
+  "scoring": {
+    "emaAlpha": 0.25,
+    "recentWindow": 50,
+    "defaultScore": 3000,
+    "errorPenaltyFactor": 8,
+    "staleMinutes": 15,
+    "staleFullDecayMinutes": 30,
+    "explorationRate": 0.2
+  },
+  "cooldownRecovery": {
+    "enabled": true,
+    "intervalSeconds": 30,
+    "timeoutSeconds": 15
+  },
+  "quotaMonitor": {
+    "enabled": false,
+    "intervalSeconds": 60,
+    "disableThresholdPercent": 95,
+    "resumeThresholdPercent": 95,
+    "accessRefreshThrottleSeconds": 180
+  },
+  "contentBlacklist": {
+    "default": [],
+    "byChannel": {}
+  },
+  "notifications": {
+    "enabled": true,
+    "events": {
+      "channel_permanent": true,
+      "channel_recovered": true,
+      "quota_disabled": true,
+      "quota_resumed": true,
+      "oauth_refreshed": true,
+      "oauth_refresh_failed": true,
+      "no_channels": true,
+      "openai_store_save_failed": true
+    }
+  },
+  "cchMode": "disabled",
+  "cchStaticValue": "00000",
+  "oauthDefaultModels": [
+    "claude-opus-4-5",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001"
+  ],
+  "probe": {
+    "timeoutSeconds": 60,
+    "maxTokens": 50,
+    "userMessage": "1+1=?"
+  },
+  "telegram": {
+    "botToken": "",
+    "adminIds": []
+  },
+  "oauth": {
+    "mockMode": false,
+    "providers": {
+      "openai": {
+        "forceCodexCLI": true,
+        "enableTLSFingerprint": false,
+        "isolateSessionId": true,
+        "defaultModels": [
+          "gpt-5.2",
+          "gpt-5.2-codex",
+          "gpt-5.3-codex",
+          "gpt-5.4"
+        ]
+      }
+    }
+  },
+  "channelSelection": "smart",
+  "logDir": "logs",
+  "stateDbPath": "state.db",
+  "openai": {
+    "store": {
+      "enabled": true,
+      "ttlMinutes": 60,
+      "cleanupIntervalSeconds": 300
+    },
+    "reasoningBridge": "passthrough",
+    "translation": {
+      "enabled": true,
+      "rejectOnBuiltinTools": true,
+      "rejectOnMultiCandidate": true
+    }
+  }
+}

@@ -75,6 +75,13 @@ def _format_bjt(iso_str: Optional[str]) -> str:
     return dt.astimezone(_BJT).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _format_reset_text(iso_str: Optional[str]) -> str:
+    """配额窗口重置时间的展示文案。"""
+    if not iso_str:
+        return "上游未返回"
+    return _format_bjt(iso_str)
+
+
 def _format_remaining(iso_str: Optional[str]) -> str:
     dt = _parse_iso(iso_str)
     if dt is None:
@@ -157,13 +164,13 @@ def _format_account_block(acc: dict) -> str:
         sd_util = row.get("seven_day_util")
         if fh_util is not None:
             reset = row.get("five_hour_reset")
-            reset_str = _format_bjt(reset) if reset else "?"
+            reset_str = _format_reset_text(reset)
             lines.append(
                 f"  📊 5h 用量: <b>{fh_util:>4.0f}%</b> | 重置: <code>{reset_str}</code>"
             )
         if sd_util is not None:
             reset = row.get("seven_day_reset")
-            reset_str = _format_bjt(reset) if reset else "?"
+            reset_str = _format_reset_text(reset)
             lines.append(
                 f"  📊 7d 用量: <b>{sd_util:>4.0f}%</b> | 重置: <code>{reset_str}</code>"
             )
@@ -219,10 +226,7 @@ def _format_usage_block(account_key: str) -> str:
     def _line(label: str, util, reset) -> Optional[str]:
         if util is None:
             return None
-        line = f"{label}: {util:.0f}%"
-        if reset:
-            line += f" (重置: {_format_bjt(reset)})"
-        return line
+        return f"{label}: {util:.0f}% (重置: {_format_reset_text(reset)})"
 
     out = []
     for label, util_k, reset_k in (

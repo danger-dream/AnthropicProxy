@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from src import (
+    __version__,
     affinity, auth, config, cooldown, errors, failover,
     fingerprint, log_db, notifier, oauth_manager, probe, public_ip,
     scheduler, scorer, state_db, upstream,
@@ -174,7 +175,7 @@ async def lifespan(app: FastAPI):
         tgbot.init(tg_token, tg_admins)
         tgbot.start()
 
-    print("Parrot 🦜 (multi-family AI protocol proxy) ready")
+    print(f"Parrot 🦜 v{__version__} (multi-family AI protocol proxy) ready")
     print(f"  device_id: {DEVICE_ID[:16]}...")
     print(f"  listen: http://{cfg['listen']['host']}:{cfg['listen']['port']}/v1/messages")
     print(f"  api_keys: {len(cfg.get('apiKeys', {}))}")
@@ -278,7 +279,7 @@ async def health():
         },
         "affinity_bound": affinity.count(),
         "device_id": DEVICE_ID[:16] + "...",
-        "version": "parrot",
+        "version": __version__,
     }
 
 
