@@ -1,57 +1,82 @@
-# Anthropic Proxy
+# 🦜 Parrot
 
-**多渠道、智能调度、故障转移的 Anthropic + OpenAI 协议代理**
+[![Docker Image](https://img.shields.io/badge/ghcr.io-parrot-blue?logo=docker)](https://github.com/danger-dream/Parrot/pkgs/container/parrot)
+[![Build](https://github.com/danger-dream/Parrot/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/danger-dream/Parrot/actions/workflows/docker-publish.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-一个多协议反向代理工具，同时兼容 Anthropic `/v1/messages` 与 OpenAI
-`/v1/chat/completions`、`/v1/responses` 三条入口，支持把下游客户端的请求
-透明地路由到多种上游（Anthropic OAuth 账户 / 第三方 Anthropic 兼容云 /
-OpenAI 官方或中转），具备：
+**多家族、多渠道、故障转移的 AI 协议代理**
 
-- **三条下游入口共用一个代理**：`/v1/messages`（anthropic）、
-  `/v1/chat/completions`（openai-chat）、`/v1/responses`（openai-responses）
-- **OpenAI 家族内跨变体翻译**：chat 入口可打到 responses 上游，反之亦然；
-  流式 + 非流式双向打通，`previous_response_id` 由本地 Store 支持
-- **多渠道聚合**：Claude Code OAuth 账户 + 第三方 Coding Plan（智谱 / 天翼云
-  / 京东云 / 讯飞星辰 等）+ OpenAI 家族中转（支持 chat / responses 两套协议）
-- **智能调度**：基于滑动窗口评分（延迟 + 失败惩罚）+ 会话亲和绑定 + 20% 探索率
-- **故障转移**：未发首包 → 自动切下一候选；已发首包 → 流内 SSE error 收尾
-- **完整 CC 伪装**：与 cc-proxy 同源的请求签名逻辑（指纹 / CCH / 工具名混淆 / cache 断点）
-- **Telegram Bot 管理面板**：渠道管理 / OAuth 账户 / API Key（含协议过滤）/
-  统计 / 日志 / 系统设置 全图形化
-- **运行时保护**：四段超时独立 + 错误阶梯冷却 + 首包文本黑名单 + OAuth 配额自动禁用/恢复
+> 像鹦鹉学舌一样，把下游客户端的请求转发到多个上游，自动挑最快的、故障切到备用。
+> 双家族（Anthropic / OpenAI）、三种入口协议、多种上游协议，还能家族内互转。
+
+Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**。你手上有一堆 Claude OAuth 账号、ChatGPT Plus OAuth 账号、第三方 GLM / Codex Coding Plan，不想维护 3 套代理 + 3 套统计 + 3 个 TG Bot；Parrot 把它们统一抽象成「渠道」，配上评分调度、故障转移、会话亲和、OAuth 自动刷新、Telegram 图形面板。
 
 ---
 
-## 目录
+## 🎯 核心特性
 
-- [快速开始](#快速开始)
-- [架构概览](#架构概览)
-- [HTTP 接口](#http-接口)
-- [Telegram Bot 管理面板](#telegram-bot-管理面板)
-- [📢 通知系统](#-通知系统)
-- [配置文件](#配置文件)
-- [运维](#运维)
-- [目录结构](#目录结构)
-- [故障排查](#故障排查)
+**多家族 · 多入口**
+
+| 入口 | 协议 | 对接客户端 |
+|------|------|------|
+| `POST /v1/messages` | Anthropic Messages API | Claude Code CLI、OpenClaw、任何 Anthropic SDK |
+| `POST /v1/chat/completions` | OpenAI Chat Completions | 大部分 OpenAI SDK / 三方工具 |
+| `POST /v1/responses` | OpenAI Responses API | Codex CLI、新版 OpenAI SDK |
+
+**三类上游渠道**
+
+| 渠道 | 类型 | 说明 |
+|------|------|------|
+| 🅰 Anthropic OAuth | Claude Code 官方账户 | 完整 CC 伪装（指纹 / CCH / 工具名混淆 / cache 断点），与 cc-proxy 同源移植 |
+| 🅾 OpenAI OAuth (Codex) | ChatGPT Plus/Pro/Enterprise | 对接 `chatgpt.com/backend-api/codex/responses`，SSE 聚合、rate-limit 头自动解析 |
+| 🔀 第三方 API 渠道 | 智谱 / 天翼云 / 京东云 / 讯飞星辰 / 任何 Anthropic 或 OpenAI 兼容服务 | 可开关 CC 伪装；按 `protocol` 决定走哪种请求构造器 |
+
+**家族内互转**：`/v1/chat/completions` 下游请求可以打到 `openai-responses` 上游，反之亦然（SSE 双向状态机 + CapabilityGuard 兜底不兼容字段）。
+
+**运行时保护**
+
+- **四段超时独立**：`connect` / `firstByte` / `idle`（chunk 间）/ `total`（硬上限），任一超时都不会拖死整个请求
+- **首包锁**：发任何字节给下游前是"可切换"区；首字节发出后锁渠道，异常转 SSE error 事件收尾
+- **故障转移**：按智能排序依次试候选，`upstream_stream_only` 渠道（如 OAuth Codex）对非流式下游自动走 SSE 聚合
+- **错误阶梯冷却**：`[1, 3, 5, 10, 15, 0]` 分钟，成功一次清零；OAuth 渠道带宽容次数（`oauthGraceCount: 3`）避免偶发抖动误冷却
+- **会话亲和**：指纹 = `hash(api_key | ip | 倒数两条消息)`；30min TTL，缓存命中率显著高于随机调度
+- **OAuth 配额监控**：Claude 账户拉 `/api/oauth/usage`；OpenAI 账户解析 Codex `rate-limit` 响应头；阈值自动禁用/恢复
+- **评分调度**：滑动窗口 EMA 延迟 + 失败惩罚；带 20% 探索率避免赢家通吃
+
+**Telegram 图形管理面板**
+
+发 `/start` 进主菜单，全图形化配置（文末详述）。
 
 ---
 
-## 快速开始
+## 🚀 快速开始
 
-### 1. 安装
+提供 4 种部署方式，**推荐一键脚本**。
+
+### 方式一：一键脚本（推荐）
 
 ```bash
-git clone https://github.com/danger-dream/anthropic-proxy
-cd anthropic-proxy
-python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
+bash <(curl -Ls https://raw.githubusercontent.com/danger-dream/Parrot/main/deploy.sh)
 ```
 
-### 2. 填 Telegram Bot 配置
+脚本会：
+1. 显示项目信息 + 检查 / 引导安装 Docker + Docker Compose
+2. 交互式收集：安装目录（默认 `/opt/parrot`）/ TG Bot Token / Admin Telegram User ID / 监听端口
+3. 生成 `docker-compose.yml` + 最小 `data/config.json`
+4. `docker compose pull && up -d`，并验证 `/health` + TG Bot polling
 
-编辑 `config.json`（首次启动会自动生成模板，无文件时手动创建）：
+完成后到 Telegram 找你的 bot 发 `/start`，剩下的渠道 / OAuth / API Key 全在图形界面里配。
 
-```json
+### 方式二：Docker Compose（手动）
+
+```bash
+mkdir -p parrot/data && cd parrot
+
+# 拿 compose 模板
+curl -Lo docker-compose.yml https://raw.githubusercontent.com/danger-dream/Parrot/main/docker-compose.yml
+
+# 写最小 config.json（首次启动 server 会自动补全其余默认字段）
+cat > data/config.json <<'EOF'
 {
   "listen": { "host": "0.0.0.0", "port": 22122 },
   "telegram": {
@@ -59,34 +84,46 @@ python3 -m venv venv
     "adminIds": [<你的 Telegram user id>]
   }
 }
+EOF
+
+docker compose up -d
+docker compose logs -f
 ```
 
-其它字段留空或使用默认值即可。
-
-### 3. 启动（systemd）
+### 方式三：Docker 直跑（不用 compose）
 
 ```bash
-# /etc/systemd/system/anthropic-proxy.service 已安装
-systemctl enable anthropic-proxy
-systemctl start anthropic-proxy
+mkdir -p ./data
+# 先写 ./data/config.json（见方式二）
 
-# 状态
-systemctl status anthropic-proxy
-
-# 日志
-journalctl -u anthropic-proxy -f
+docker run -d \
+  --name parrot \
+  --restart unless-stopped \
+  -p 22122:22122 \
+  -e TZ=Asia/Shanghai \
+  -e ANTHROPIC_PROXY_DATA_DIR=/app/data \
+  -v "$PWD/data:/app/data" \
+  ghcr.io/danger-dream/parrot:latest
 ```
 
-### 4. 去 Telegram 找 bot 发 `/start`
+> `ANTHROPIC_PROXY_DATA_DIR` 是老环境变量名，为向后兼容保留；后续会加 `PARROT_DATA_DIR` 别名。
 
-所有配置都在 Telegram 图形界面完成：
-- **🔀 渠道管理**：添加第三方 API 渠道（含测试向导）
-- **🔐 管理 OAuth**：PKCE 登录添加 Claude 官方账户
-- **🔑 管理 API Key**：创建下游调用用的 Key（可设模型白名单）
-
-### 5. 下游客户端接入
+### 方式四：源码运行（开发用）
 
 ```bash
+git clone https://github.com/danger-dream/Parrot
+cd Parrot
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+
+# 编辑 config.json（首次启动会自动生成模板）
+./venv/bin/python server.py
+```
+
+### 下游客户端接入
+
+```bash
+# Anthropic 协议入口（Claude 家族）
 curl http://<server>:22122/v1/messages \
   -H "x-api-key: ccp-你的Key" \
   -H "Content-Type: application/json" \
@@ -95,187 +132,152 @@ curl http://<server>:22122/v1/messages \
     "max_tokens": 1024,
     "messages": [{ "role": "user", "content": "Hello" }]
   }'
+
+# OpenAI Chat 协议入口（GPT 家族）
+curl http://<server>:22122/v1/chat/completions \
+  -H "Authorization: Bearer ccp-你的Key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.4",
+    "messages": [{ "role": "user", "content": "Hello" }]
+  }'
+
+# OpenAI Responses 协议入口（Codex 原生）
+curl http://<server>:22122/v1/responses \
+  -H "Authorization: Bearer ccp-你的Key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.4",
+    "input": [{ "role": "user", "content": "Hello" }]
+  }'
 ```
+
+**官方 SDK 接入**：把 `baseURL` 指向 `http://<server>:22122/v1`，`apiKey` 填 Parrot 生成的下游 Key，即可直接用 `openai` / `anthropic` 官方 Python / Node SDK。
 
 ---
 
-## 架构概览
+## 🏗 架构概览
 
 ```
-┌────────────────┐
-│ 下游客户端      │  (Claude Code CLI / openclaw / SDK)
-└────────┬───────┘
-         │ x-api-key
-         ▼
-┌────────────────────────────────────────────────────────┐
-│                   FastAPI 入口                          │
-│  auth.validate → allowed_models 检查                    │
-└────────┬───────────────────────────────────────────────┘
-         │
-         ▼
-┌────────────────────────────────────────────────────────┐
-│  scheduler.schedule                                     │
-│    1. 筛选可用渠道（enabled + 非冷却 + 支持模型）        │
-│    2. 会话亲和（fingerprint = key+ip+msg[-2:] 的 hash）│
-│    3. 评分排序（EMA 延迟 + 失败惩罚 + 20% 探索率）      │
-└────────┬───────────────────────────────────────────────┘
-         │ candidates: [(channel, resolved_model), ...]
-         ▼
-┌────────────────────────────────────────────────────────┐
-│  failover.run_failover (顺序尝试)                       │
-│    • _try_channel                                       │
-│        build_upstream_request →                         │
-│        httpx.stream (连接/首字/读 硬超时)               │
-│        首包安全检查（黑名单 / upstream error JSON）     │
-│    • 未发首包失败 → 切下一候选                          │
-│    • 已发首包失败 → 流内 SSE error 收尾                 │
-└────────┬───────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────┬──────────────────┐
-  │ OAuthChannel     │ ApiChannel        │
-  │ (官方+CC伪装)    │ (第三方云厂商)    │
-  └──────────────────┴──────────────────┘
-         │                   │
-         ▼                   ▼
-   api.anthropic.com      第三方 Anthropic 兼容服务
+┌────────────────────────────────────────────────────────────────┐
+│ 下游客户端（Anthropic SDK / OpenAI SDK / Codex CLI / Claude Code CLI）│
+└──────────────┬──────────────┬──────────────┬──────────────────┘
+               │              │              │
+     POST /v1/messages   /v1/chat/...   /v1/responses
+               │              │              │
+               ▼              ▼              ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │               FastAPI 入口 + auth + 日志落盘              │
+  └──────────────────────────┬───────────────────────────────┘
+                             │ ingress_protocol =
+                             │   anthropic | chat | responses
+                             ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ scheduler.schedule                                        │
+  │   1. 按 ingress 家族硬过滤（anthropic 家族 ↔ openai 家族）│
+  │   2. 筛选 enabled + 非冷却 + 支持模型的渠道              │
+  │   3. 会话亲和（fingerprint = key+ip+msg[-2:] 的 hash）   │
+  │   4. 评分排序（EMA 延迟 + 失败惩罚 + 20% 探索率）        │
+  └──────────────────────────┬───────────────────────────────┘
+                             │ candidates: [(channel, model), ...]
+                             ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ failover.run_failover (顺序尝试 + 首包锁)                 │
+  │   ingress=anthropic    → AnthropicOAuth / ApiChannel     │
+  │   ingress=chat         → OpenAIApiChannel / OpenAIOAuth  │
+  │   ingress=responses    → 同上（responses 优先）           │
+  │   跨变体时走 chat↔responses 双向 SSE 状态机              │
+  │   upstream_stream_only 渠道对非流式请求用 SSE 聚合器兜底 │
+  └──────────────────────────┬───────────────────────────────┘
+                             │
+         ┌───────────────────┼───────────────────────┐
+         ▼                   ▼                       ▼
+  🅰 Anthropic OAuth    🅾 OpenAI OAuth         🔀 Third-party API
+  (Claude Code CC伪装)  (chatgpt.com/codex)     (智谱/天翼云/京东云/讯飞…)
+         │                   │                       │
+         ▼                   ▼                       ▼
+    api.anthropic.com  chatgpt.com/backend-api    third-party endpoints
 ```
 
-**核心特性：**
-
-| 维度 | 说明 |
-|---|---|
-| **首包锁** | 向下游发任何字节前为"可切换"区；首字节发出后锁定渠道 |
-| **四段超时** | `connect` / `firstByte` / `idle`（chunk 间）/ `total`（硬上限） |
-| **会话亲和** | 指纹 = `hash(key \| ip \| 倒数两条消息 canonical JSON)`，30min TTL |
-| **错误冷却** | 阶梯 `[1, 3, 5, 10, 15, 0]` 分钟，`0` = 永久；成功一次清零 |
-| **OAuth 宽容次数** | 默认 3 —— OAuth 渠道前 3 次失败仅累计计数不冷却（避免单账号偶发故障导致全部 Claude 模型不可用），第 4 次起按上述阶梯 |
-| **CC 伪装** | 完整移植 Claude Code，OAuth 渠道强制启用；API 渠道可选 |
-| **OAuth 配额监控** | 每 60s 拉 usage，≥95% 自动禁用，resets_at 过后自动恢复 |
-
-详见 `docs/` 目录下 12 篇设计文档。
+详细设计见 `docs/` 目录（12 篇）和 `docs/openai/` 子目录（10 篇）。
 
 ---
 
-## HTTP 接口
+## 🌐 HTTP 接口
 
 ### `POST /v1/messages`
 **完整兼容 Anthropic Messages API**。鉴权通过 `x-api-key` 或 `Authorization: Bearer <key>`。
 
-- 流式（`stream: true`，默认）：SSE 流
-- 非流式：JSON 响应
-- 错误：标准 Anthropic 错误格式 `{"type": "error", "error": {"type": "...", "message": "..."}}`
+- 流式（`stream: true`，默认）：SSE
+- 非流式：JSON
+- 错误：Anthropic 标准错误格式
 
-### `POST /v1/chat/completions` ✨ OpenAI 家族
-**完整兼容 OpenAI Chat Completions API**。鉴权用 `Authorization: Bearer <key>`。
+### `POST /v1/chat/completions`
+**完整兼容 OpenAI Chat Completions API**。鉴权通过 `Authorization: Bearer <key>`。
 
-- 流式（`stream: true`）/ 非流式（默认）
-- 错误：OpenAI 格式 `{"error": {"message":..., "type":..., "code":..., "param":...}}`
-- 跨变体：若 API Key 命中的是 `protocol=openai-responses` 渠道，代理会在内部把
-  请求翻译为 Responses，响应再反向翻译回 `chat.completion` 形态
-
-### `POST /v1/responses` ✨ OpenAI 家族
-**完整兼容 OpenAI Responses API**（含 `previous_response_id` 多轮续接）。
-
-- 流式 / 非流式
-- `previous_response_id` 由本地 Store 支持（`openai.store.enabled=true` 默认开）：
-  即使上游是无状态的 `openai-chat`，也能由代理展开历史 items 续接对话
-- 拒绝字段：`conversation` / `background:true` / `include: ["reasoning.encrypted_content"]`
-  （当上游为 chat 时）— 跨变体死角由 guard 统一拦成 400
-
-OpenAI 支持的详细设计、字段映射、死角清单见 [`docs/openai/`](docs/openai/)。
+### `POST /v1/responses`
+**完整兼容 OpenAI Responses API**。支持 `previous_response_id` 续写（本地 store）、`reasoning.effort`、Codex 工具调用等。
 
 ### `GET /v1/models`
-**Anthropic 标准模型列表**。返回当前所有启用渠道聚合的可用模型：
-
-- 按 API Key 的 `allowedModels` 白名单过滤
-- 按 API Key 的 `allowedProtocols` 家族过滤（解决两家族同名模型冲突，例：
-  `claude-3.5` 同时出现在 anthropic 与 openai 中转上）
-- TG Bot「🔑 管理 API Key」→「🔌 编辑允许协议」可勾选 anthropic / chat / responses 任意组合
-
-```bash
-curl http://<server>:22122/v1/models -H "x-api-key: ccp-xxx"
-```
-
-```json
-{
-  "data": [
-    { "type": "model", "id": "claude-opus-4-7", "display_name": "claude-opus-4-7", "created_at": "2025-01-01T00:00:00Z" },
-    { "type": "model", "id": "glm-5", "display_name": "glm-5", "created_at": "2025-01-01T00:00:00Z" }
-  ],
-  "first_id": "claude-opus-4-7",
-  "last_id": "glm-5",
-  "has_more": false
-}
-```
+返回当前所有启用渠道聚合的可用模型（按 API Key 白名单过滤），Anthropic 标准格式。
 
 ### `GET /health`
 运维健康检查（无鉴权）：
 ```json
 {
   "status": "ok",          // ok | degraded | error
-  "channels": { "total": 5, "enabled": 5, "oauth": 0, "api": 5 },
-  "affinity_bound": 3,
+  "channels": { "total": 13, "enabled": 13, "oauth": 7, "api": 6 },
+  "affinity_bound": 64,
   "device_id": "...",
-  "version": "anthropic-proxy"
+  "version": "parrot"
 }
 ```
 
 ---
 
-## Telegram Bot 管理面板
+## 💬 Telegram Bot 管理面板
 
 发 `/start` 进入主菜单（2×4 布局）：
 
 ```
-[📊 状态总览]  [📋 最近日志]
-[📈 统计汇总]  [🔀 渠道管理]
+[📊 状态总览]   [📋 最近日志]
+[📈 统计汇总]   [🔀 渠道管理]
 [🔐 管理 OAuth] [🔑 管理 API Key]
-[⚙ 系统设置]   [❓ 帮助]
+[⚙ 系统设置]    [❓ 帮助]
 ```
 
-### 📊 状态总览
-运行时长 · 渠道状态 · 今日请求 · ⚡ 最快渠道 Top5 · ⚠ 问题渠道清单 · 📈 配额预警（≥80%）
+### 📊 状态总览（两家族分段）
+- 运行时长 · 选路模式 · 亲和绑定数
+- 🅰 Anthropic / 🅾 OpenAI 各一行渠道统计（可用 / 冷却 / 永久 / 禁用）
+- 今日请求按家族分组展示（成功率 / 首字延迟 / 总耗时 / TPS）
+- ⚡ 最快渠道按家族各 Top 5
+- 📈 配额预警（≥80%）带家族前缀
+- ⚠ 问题渠道清单
 
-### 📈 统计汇总（4×4 时间×维度）
+### 📈 统计汇总（4×4 时间×维度 + 两家族）
 - 时间：今天 / 3 天 / 7 天 / 本月
-- 维度：汇总（一屏全展）/ 按渠道 / 按模型 / 按 Key
-- 汇总视图：Tokens / 请求 / 缓存 / 耗时 / 重试 / 亲和 / 三维 Top3 / 最近未命中 / 最近调用
+- 维度：汇总（两家族分段）/ 按渠道 / 按模型 / 按 Key
+- **汇总视图**：先 🅰 Anthropic 段（overall + 按渠道 Top3 + 按模型 Top3），后 🅾 OpenAI 段（同上，完整含重试/亲和）；底部跨家族按 Key Top + 最近调用（带家族图标）+ 未命中样本
+- **专题视图**：按渠道 / 按模型 Top10，每条前缀 🅰/🅾 家族图标
 
 ### 📋 最近日志
 15 条最新请求，每条一个 `📄 #N 详情` 按钮点进详情页（完整重试链 + 请求/响应 body）。
 
 ### 🔀 渠道管理
-- 添加向导（5 步 + 测试面板）：名称 → URL → **协议** → API Key → 模型列表 → 测试
-- 协议 3 选 1：Anthropic / OpenAI Chat / OpenAI Responses（openai-* 自动关闭 CC 伪装）
-- 渠道详情：模型状态、健康图标（🟢🟡🟠🔴）、统计、冷却、亲和数；openai-* 渠道显示协议行
-- 编辑：名称 / URL / Key / 模型 / 🔌 切换协议 / 🎭 CC 伪装切换（仅 anthropic）
-- 测试模型：单/全部；成功 8s / 失败 30s 自动删除进度消息（openai-* 按对应 API 构造探测 payload）
+添加向导（4 步 + 测试面板）、渠道详情、编辑、测试模型（单/全部）。
 
-### 🔐 管理 OAuth
-- PKCE 登录（浏览器授权 + 粘贴 code）
-- 手动粘贴 OAuth JSON
-- 配额查看（5h / 7d / Sonnet 7d / Opus 7d，含 reset 倒计时）
-- 刷新 Token / 刷新用量 / 启停 / 删除
+### 🔐 管理 OAuth（支持两家族）
+- ➕ 新增账户：第一步选 Claude / OpenAI；Claude 支持 PKCE 登录 + 粘贴 JSON；OpenAI 粘贴 refresh_token
+- 每条账户显示：状态图标 / 过期时间 / 5h 7d 用量 / 月度统计 / 冷却中的模型
+- 详情页：两家族统一布局（提供者 / 计划 / 过期 / 上次刷新 / 使用量 / 月度）
+- 操作：刷新 Token / 刷新用量 / 清模型错误 / 清亲和绑定 / 启停 / 删除
+- 底部批量：🔄 刷新全部用量 / 🧹 清除所有账户错误（有冷却才显示）
 
 ### 🔑 管理 API Key
-- 列表直接显示完整 Key（单击即复制）
-- **每个 Key 可设模型白名单**（多选勾选界面；空 = 无限制）
-- **每个 Key 可设允许协议**（🔌 多选 anthropic / chat / responses；空 = 三个入口全放行）
-- 删除二次确认（含 Key 末 8 字符防误删）
+列表直接显示完整 Key（单击即复制）；每个 Key 可设模型白名单（多选勾选）；删除二次确认。
 
 ### ⚙ 系统设置
-- 超时（连接 / 首字 / 空闲 / 总）
-- 错误阶梯
-- 评分参数（emaAlpha / 窗口 / 失败惩罚 / 探索率）
-- 亲和参数（TTL / 打破阈值）
-- CCH 模式（disabled / dynamic / static）
-- 渠道选择模式（smart / order）
-- **📈 配额监控**：开关 / 检查间隔 / 禁用阈值（**默认关闭** —— 频繁拉 `/api/oauth/usage` 可能被风控）
-- **🔔 通知设置**：总开关 + 每个事件单独开关
-- 首包黑名单（default + byChannel）
-
-**所有设置均热加载，无需重启。**
+超时 / 错误阶梯 / 评分参数 / 亲和参数 / CCH 模式 / 渠道选择模式 / 配额监控 / 通知设置 / 首包黑名单。**所有设置均热加载，无需重启。**
 
 ---
 
@@ -293,202 +295,250 @@ curl http://<server>:22122/v1/models -H "x-api-key: ccp-xxx"
 | ❌ OAuth Token 刷新失败 | refresh_token 失效，标 auth_error | ✅ |
 | 🚨 无可用渠道告警 | 请求模型在所有渠道都不可用（503）| ✅ |
 
-**防误报**：
-- "永久冻结"只在状态变化时（普通冷却 → 永久）通知一次，不会重复打扰
-- "渠道恢复"只在被清除前真正在冷却中（非"成功一次清错误计数"）才通知
-
 **节流**：`无可用渠道告警` 同 model 5 分钟内最多发一次。
-
-**实现细节**：`notifier.notify_event(key, text)` 异步入队（不阻塞调用方），由 worker 线程消费 → TG admin 广播。
 
 ---
 
-## 配置文件
+## ⚙ 配置文件
 
 `config.json` 是唯一配置来源，运行时自动持久化（tmp + `os.replace` 原子写 + 3 份备份轮转）。
 
-完整字段说明见 `docs/02-config-schema.md`。关键字段速查：
+完整字段说明见 `docs/02-config-schema.md` 和 `docs/openai/02-config-schema.md`。关键字段速查：
 
 ```jsonc
 {
   "listen":   { "host": "0.0.0.0", "port": 22122 },
   "apiKeys":  { "default": { "key": "ccp-xxx", "allowedModels": [] } },
-  "oauthAccounts": [ { "email": "...", "access_token": "...", "refresh_token": "...", "expired": "...", "enabled": true, "disabled_reason": null, "models": [] } ],
-  "channels": [ { "name": "智谱", "type": "api", "baseUrl": "https://...", "apiKey": "...", "models": [{"real": "GLM-5", "alias": "glm-5"}], "cc_mimicry": true, "enabled": true } ],
-  "timeouts": { "connect": 10, "firstByte": 30, "idle": 120, "total": 600 },
-  "errorWindows": [1, 3, 5, 10, 15, 0],
-  "oauthGraceCount": 3,    // OAuth 前 N 次失败不冷却；只对 oauth: 前缀的渠道生效
-  "affinity":  { "ttlMinutes": 30, "threshold": 3.0, "cleanupIntervalSeconds": 300 },
-  "scoring":   { "emaAlpha": 0.25, "recentWindow": 50, "defaultScore": 3000, "errorPenaltyFactor": 8, "staleMinutes": 15, "staleFullDecayMinutes": 30, "explorationRate": 0.2 },
+  "oauthAccounts": [
+    { "email": "xxx@example.com", "provider": "claude", "access_token": "...", "refresh_token": "...", "expired": "..." },
+    { "email": "yyy@example.com", "provider": "openai", "access_token": "...", "refresh_token": "...", "plan_type": "plus", "chatgpt_account_id": "..." }
+  ],
+  "channels": [
+    { "name": "智谱 Max", "type": "api", "protocol": "anthropic", "baseUrl": "https://...", "apiKey": "...", "models": [{"real": "GLM-5", "alias": "glm-5"}], "cc_mimicry": true, "enabled": true },
+    { "name": "OpenAI 3P", "type": "api", "protocol": "openai-responses", "baseUrl": "https://...", "apiKey": "...", "models": [...], "enabled": true }
+  ],
+  "timeouts":      { "connect": 10, "firstByte": 30, "idle": 120, "total": 600 },
+  "errorWindows":  [1, 3, 5, 10, 15, 0],
+  "oauthGraceCount": 3,
+  "affinity":      { "ttlMinutes": 30, "threshold": 3.0, "cleanupIntervalSeconds": 300 },
+  "scoring":       { "emaAlpha": 0.25, "recentWindow": 50, "defaultScore": 3000, "errorPenaltyFactor": 8, "staleMinutes": 15, "staleFullDecayMinutes": 30, "explorationRate": 0.2 },
   "quotaMonitor":  { "enabled": false, "intervalSeconds": 60, "disableThresholdPercent": 95, "resumeThresholdPercent": 95 },
-  "notifications": {
-    "enabled": true,
-    "events": {
-      "channel_permanent": true, "channel_recovered": true,
-      "quota_disabled": true,    "quota_resumed":   true,
-      "oauth_refreshed": true,   "oauth_refresh_failed": true,
-      "no_channels":     true
+  "accessRefreshThrottleSeconds": 180,
+  "providers": {
+    "openai": {
+      "forceCodexCLI": true,
+      "enableTLSFingerprint": false,
+      "isolateSessionId": true,
+      "defaultModels": ["gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4"]
     }
   },
+  "notifications": { "enabled": true, "events": { ... } },
   "cchMode": "disabled",
-  "channelSelection": "smart",
-  "telegram": { "botToken": "...", "adminIds": [123] },
-  "oauth": { "mockMode": false }
+  "telegram": { "botToken": "...", "adminIds": [123] }
 }
 ```
 
-> `quotaMonitor.enabled` **默认关闭** —— 启用后每 N 秒拉一次每个 OAuth 账号的 `/api/oauth/usage`，频繁请求可能被 Anthropic 风控盯上。需要时在「⚙ 系统设置」→「📈 配额监控」打开。
+> `quotaMonitor.enabled` **默认关闭** —— 启用后每 N 秒拉一次每个 OAuth 账号的 usage（Claude 走 `/api/oauth/usage`，OpenAI 走 Codex 探测头），频繁请求可能被风控盯上。
 
-> `notifications.events.<key>` 控制每个事件是否推送给 TG admin，关掉的事件只打到 journal 不发 TG。
-
-**不可热加载字段**（改后需重启）：`listen.host` / `listen.port` / `stateDbPath` / `logDir` / `telegram.botToken` / `telegram.adminIds`。
+**不可热加载字段**（改后需重启容器）：`listen.host` / `listen.port` / `stateDbPath` / `logDir` / `telegram.botToken` / `telegram.adminIds`。
 
 ---
 
-## 运维
+## 🛠 运维
 
-### 启动 / 停止 / 重启 / 状态
+所有持久化数据集中在 `<安装目录>/data/`：`config.json` / `state.db` / `logs/` / `.anthropic_proxy_ids.json`。
+
+### 启动 / 停止 / 重启 / 状态（Docker Compose）
 
 ```bash
-systemctl start    anthropic-proxy
-systemctl stop     anthropic-proxy
-systemctl restart  anthropic-proxy
-systemctl status   anthropic-proxy
+cd <安装目录>
+docker compose up -d         # 启动
+docker compose stop          # 停止
+docker compose restart       # 重启
+docker compose ps            # 状态
+docker compose down          # 停止 + 删容器（数据保留在 ./data）
 ```
+
+### 升级到最新镜像
+
+```bash
+cd <安装目录>
+docker compose pull
+docker compose up -d
+```
+
+> 或重跑一次一键脚本（选 `Upgrade` 模式），等价。
 
 ### 日志
 
 ```bash
-# 实时
-journalctl -u anthropic-proxy -f
-
-# 最近 100 条
-journalctl -u anthropic-proxy -n 100
-
-# 某段时间
-journalctl -u anthropic-proxy --since "2026-04-18 10:00" --until "2026-04-18 11:00"
+cd <安装目录>
+docker compose logs -f                 # 实时
+docker compose logs --tail 100         # 最近 100 条
+docker compose logs --since 1h         # 最近 1 小时
 ```
 
 ### 业务日志（请求流水）
 
-按月分库在 `logs/YYYY-MM.db`（SQLite）。在 TG Bot「📋 最近日志」查看；或直接 `sqlite3 logs/2026-04.db`。
+按月分库在 `data/logs/YYYY-MM.db`（SQLite）。在 TG Bot「📋 最近日志」查看；或宿主机直接 `sqlite3 <安装目录>/data/logs/2026-04.db`。
 
 ### 状态数据
 
-`state.db`（SQLite）：performance_stats / channel_errors / cache_affinities / oauth_quota_cache。永久保留，记录渠道性能、冷却、亲和绑定、OAuth 配额缓存。
+`data/state.db`（SQLite）：performance_stats / channel_errors / cache_affinities / oauth_quota_cache / openai_response_store。永久保留。
 
 ### 配置备份
 
-每次配置修改都自动轮转 3 份备份：
+每次配置修改都自动轮转 3 份备份（位于 `data/` 目录）：
 ```
-config.json
-config.json.bak.1   (上一版)
-config.json.bak.2
-config.json.bak.3   (最老)
+data/config.json
+data/config.json.bak.1   (上一版)
+data/config.json.bak.2
+data/config.json.bak.3   (最老)
 ```
+
+### 源码 / systemd 部署的运维
+
+如果走「方式四：源码运行」并自己写了 systemd unit，则按该 unit 名管理：
+
+```bash
+systemctl start/stop/restart/status <你的unit名>
+journalctl -u <你的unit名> -f
+```
+
+数据文件默认在源码目录下（不设 `ANTHROPIC_PROXY_DATA_DIR` 时回退到 `BASE_DIR`）。
 
 ---
 
-## 目录结构
+## 📁 目录结构
 
 ```
-anthropic-proxy/
+Parrot/
 ├── README.md                    ← 本文档
 ├── DESIGN.md                    ← 设计方案总纲
-├── docs/                        ← 12 篇分章节设计文档
-├── config.json                  ← 唯一配置文件
-├── state.db                     ← 运行时状态（永久）
-├── logs/YYYY-MM.db              ← 按月分库业务日志
-├── .anthropic_proxy_ids.json    ← device_id 持久化
+├── docs/                        ← 12 篇 Anthropic 侧设计文档
+│   └── openai/                  ← 10 篇 OpenAI 扩展设计文档
+├── Dockerfile                   ← 多阶段镜像构建
+├── docker-compose.yml           ← 默认 compose 模板（GHCR 镜像）
+├── docker-entrypoint.sh         ← root→app 降权入口
+├── .dockerignore
+├── deploy.sh                    ← 一键部署脚本（交互式）
+├── .github/workflows/
+│   └── docker-publish.yml       ← GitHub Actions：push → 构建多架构镜像 → GHCR
 ├── server.py                    ← FastAPI 入口
-├── deploy.sh                    ← 参考部署脚本
 ├── requirements.txt
+├── data/                        ← 运行时持久化（容器挂载点；源码模式不存在）
+│   ├── config.json              ← 唯一配置文件
+│   ├── state.db                 ← 运行时状态（永久）
+│   ├── logs/YYYY-MM.db          ← 按月分库业务日志
+│   └── .anthropic_proxy_ids.json ← device_id 持久化
 └── src/
     ├── config.py                ← 配置加载/保存/热加载
     ├── auth.py                  ← 下游 API Key 验证
-    ├── errors.py                ← Anthropic 标准错误响应
-    ├── state_db.py              ← state.db 读写接口
-    ├── log_db.py                ← 按月日志库读写 + 跨月聚合
-    ├── public_ip.py             ← 启动后台获取外网 IPv4
-    ├── fingerprint.py           ← 会话亲和指纹
-    ├── affinity.py              ← 亲和表（内存 + 持久化）
-    ├── scorer.py                ← 滑动窗口 EMA 评分 + 探索
-    ├── cooldown.py              ← 错误阶梯冷却
-    ├── scheduler.py             ← 主调度入口
-    ├── failover.py              ← 故障转移主循环
-    ├── blacklist.py             ← 首包文本黑名单
-    ├── probe.py                 ← API 渠道探测
-    ├── oauth_manager.py         ← 多 OAuth 账户管理
-    ├── upstream.py              ← 上游 httpx client + SSE 工具
-    ├── notifier.py              ← 管理员通知（异步队列 + worker）
+    ├── errors.py                ← 标准错误响应
+    ├── state_db.py              ← state.db 读写
+    ├── log_db.py                ← 按月日志库读写 + 跨月聚合（支持 family 过滤）
+    ├── public_ip.py
+    ├── fingerprint.py           ← 会话亲和指纹（按 Anthropic 标准字段归一化）
+    ├── affinity.py
+    ├── scorer.py
+    ├── cooldown.py              ← OAuth 渠道带 grace count
+    ├── scheduler.py             ← 按 ingress 家族过滤 + 亲和 + 评分
+    ├── failover.py              ← 故障转移 + upstream_stream_only SSE 聚合
+    ├── blacklist.py
+    ├── probe.py
+    ├── oauth_manager.py         ← 多 OAuth 账户管理（Claude + OpenAI）
+    ├── upstream.py              ← httpx client + SSE 工具 + 家族 Builder
+    ├── notifier.py
     ├── transform/
-    │   ├── cc_mimicry.py        ← CC 伪装（与 cc-proxy 同源）
-    │   └── standard.py          ← 非 CC 伪装的标准转换
+    │   ├── cc_mimicry.py        ← Claude CC 伪装（与 cc-proxy 同源）
+    │   └── standard.py
     ├── channel/
-    │   ├── base.py              ← Channel 抽象基类
-    │   ├── oauth_channel.py     ← OAuth 渠道
-    │   ├── api_channel.py       ← 第三方 API 渠道
-    │   └── registry.py          ← 渠道注册表
-    ├── telegram/
-    │   ├── bot.py               ← 长轮询主循环
-    │   ├── ui.py                ← UI 工具（消息发送/HTML/按钮/通知）
-    │   ├── states.py            ← 用户输入状态机
-    │   └── menus/
-    │       ├── main.py          ← 主菜单
-    │       ├── status_menu.py   ← 状态总览
-    │       ├── stats_menu.py    ← 统计汇总（cc-proxy 风格一屏全展）
-    │       ├── logs_menu.py     ← 最近日志
-    │       ├── channel_menu.py  ← 渠道管理（含测试向导）
-    │       ├── oauth_menu.py    ← OAuth 账户管理
-    │       ├── apikey_menu.py   ← API Key 管理（含模型白名单）
-    │       ├── system_menu.py   ← 系统设置
-    │       └── help_menu.py     ← 帮助页
-    └── tests/
-        ├── _isolation.py        ← 测试隔离工具（tmpdir）
-        └── test_m*.py           ← 按里程碑组织的集成测试（86 条）
+    │   ├── base.py              ← upstream_stream_only 抽象
+    │   ├── oauth_channel.py     ← Anthropic OAuth 渠道
+    │   ├── openai_oauth_channel.py ← OpenAI Codex OAuth 渠道
+    │   ├── api_channel.py       ← Anthropic 协议第三方 API 渠道
+    │   └── registry.py
+    ├── oauth/
+    │   └── openai.py            ← OpenAI OAuth refresh + 限额头解析
+    ├── openai/                  ← OpenAI 协议子树（4700+ 行）
+    │   ├── handler.py           ← chat/completions + responses 入口
+    │   ├── store.py             ← previous_response_id 本地 store
+    │   ├── channel/api_channel.py ← OpenAI 兼容第三方 API 渠道
+    │   └── transform/           ← chat↔responses 双向 SSE 状态机 + guard
+    └── telegram/
+        ├── bot.py
+        ├── ui.py                ← 含 family_of / family_tag helpers
+        └── menus/
+            ├── main.py
+            ├── status_menu.py   ← 两家族分段 + 最快渠道 Top 5
+            ├── stats_menu.py    ← 家族化汇总 + 专题 + Key 家族拆分
+            ├── logs_menu.py
+            ├── channel_menu.py
+            ├── oauth_menu.py    ← 支持 Claude + OpenAI 双家族管理
+            ├── apikey_menu.py
+            ├── system_menu.py
+            └── help_menu.py
 ```
 
 ---
 
-## 故障排查
+## 🧪 端到端测试
+
+用官方 `openai` SDK（Python 2.32+ / Node 6.34+）端到端跑的测试矩阵：
+
+| 场景 | Python | Node | 备注 |
+|------|--------|------|------|
+| chat.completions 非流式 + 逻辑推理 | ✅ | ✅ | 走 SSE 聚合路径 |
+| chat.completions 流式 + 编码题 | ✅ | ✅ | 真正 SSE 透传 |
+| responses 非流式 + 多轮 function calling | ✅ | ✅ | 2 轮完成 3 个 tool 调用 |
+| responses 流式 + reasoning.effort=medium | ✅ | ✅ | 9 种事件类型全齐 |
+| messages 流式 + CC 伪装 (Claude) | ✅ | ✅ | 走 cc-proxy 同源伪装 |
+
+测试脚本见本 repo `tests/` 目录。
+
+---
+
+## 🔍 故障排查
 
 ### `/health` 显示 `error` 或 `degraded`
 - **error**：无启用渠道 → 加至少一个渠道（TG bot「🔀 渠道管理」或「🔐 管理 OAuth」）
-- **degraded**：有渠道但全部冷却 → 「🔀 渠道管理」→「🧹 清全部错误」，或等 `errorWindows` 时间过去
+- **degraded**：有渠道但全部冷却 → 「🔀 渠道管理」→「🧹 清全部错误」，或 TG bot 的「🔐 管理 OAuth」→「🧹 清除所有账户错误」
 
 ### 下游返回 503 `No available channels for model: xxx`
 该模型在所有启用渠道里都不存在。检查：
-- 模型名拼写（OAuth 是真实名；API 渠道按渠道的 `alias` 匹配）
+- 模型名拼写
 - 渠道是否被禁用 / 配额禁用 / auth_error
+- 对 OpenAI OAuth：`gpt-5.2-codex` 对 ChatGPT 账号（Plus/Pro/Enterprise）不支持，会被自动剔除；这种情况返回 404
 
 ### 下游返回 403 `Model 'xxx' is not allowed for this API key`
-该 Key 设了模型白名单但请求模型不在里面。去 TG bot「🔑 管理 API Key」→ 点 Key 名字 →「🎯 编辑允许模型」调整，或清空白名单。
+该 Key 设了模型白名单但请求模型不在里面。去 TG bot「🔑 管理 API Key」→ 编辑 Key 的允许模型。
 
 ### TG bot 无响应
-`journalctl -u anthropic-proxy -n 50` 看最近日志：
-- 如看到 `Conflict: terminated by other getUpdates request` → 有多个实例在拉同一 bot，杀掉多余的
-- 如看到 `Invalid bot token` → 检查 `config.json` 的 `telegram.botToken`
-- 其它错误按 traceback 定位
-
-### OAuth 单账号偶发失败导致全部 Claude 模型不可用？
-默认 `oauthGraceCount = 3`，OAuth 渠道前 3 次连续失败仅累计计数不进冷却，第 4 次起才按 `errorWindows` 阶梯。任意一次成功立即清零。
-
-- 仍想更宽容：「⚙ 系统设置」→「⛔ 错误阶梯」→「✏ OAuth 宽容次数」改更大值（如 5）
-- 已经被冷却的 OAuth 渠道：「🔐 管理 OAuth」→ 选账号 →「🧹 清模型错误」一键清
-
-### 上游推理慢被 `idle timeout` 误杀？
-默认 `idle = 120s`（chunk 之间最长空闲）。Claude 长 thinking / GLM 大模型可能 chunk 间隔很长。可在「⚙ 系统设置」→「⏱ 超时设置」继续放宽。
+`docker compose logs --tail 50` 看最近日志：
+- `Conflict: terminated by other getUpdates request` → 有多个实例在拉同一 bot
+- `Invalid bot token` → 检查 `config.json` 的 `telegram.botToken`
 
 ### OAuth 账户被标 `auth_error`
-refresh_token 已失效。在 TG bot「🔐 管理 OAuth」→ 点该账户 →「🔄 刷新 Token」；若还是失败则删除后用「➕ 新增账户」→「🌐 登录获取 Token」走 PKCE 重新登录。
+refresh_token 已失效。在 TG bot「🔐 管理 OAuth」→ 点该账户 →「🔄 刷新 Token」；若还是失败则删除后重新添加。
 
-### TG 通知太吵 / 太静
-- 太吵：「⚙ 系统设置」→「🔔 通知设置」可关闭单个事件，或一键关总开关
-- 太静：检查总开关是否开启；检查具体事件是否被关；查 journal 里是否有 `[notify:<key>:off]` 之类的字样
-- 永远收不到："已禁用" 不会推、`adminIds` 没配或填错（注意是 int 不是 string）
+### OpenAI OAuth 请求老是 503 `non-JSON response` ❓
+已修复（v0.x 起）。如升级后仍遇到，检查 OAuth 渠道的 `upstream_stream_only` 属性是否为 True（源码部署场景）。
 
-### 配额监控该开吗？
-默认关闭。**短期建议**：试用阶段先开几天观察，OAuth 账号触达阈值前就被禁用是个好功能；长期跑可以关掉减少 `/api/oauth/usage` 调用频次以避免风控。手动判断额度可以随时点「🔐 管理 OAuth」→ 选某账号 →「📊 刷新用量」。
+### 查某次请求为什么失败
+「📋 最近日志」→ 找到那条 → 点「📄 #N」→ **重试链**会显示每次尝试的渠道 + outcome + 错误原因。
 
-### 看某次请求为什么失败
-「📋 最近日志」→ 找到那条 → 点「📄 #N」进详情 → **重试链**会显示每次尝试的渠道 + outcome + 错误原因。
+---
+
+## 📜 更名说明
+
+项目原名 `AnthropicProxy`，在支持 OpenAI 之后改名为 **Parrot**（取自「鹦鹉学舌」，贴切于协议代理的本质）。
+
+- 旧仓库 `danger-dream/AnthropicProxy` 已通过 GitHub 自动跳转到本仓库
+- 旧镜像 `ghcr.io/danger-dream/anthropicproxy` 暂时与新镜像并存（7-14 天后下线）
+- 环境变量 `ANTHROPIC_PROXY_DATA_DIR` 为了向后兼容保持不变；后续会加 `PARROT_DATA_DIR` 别名
+
+---
+
+## 📄 License
+
+MIT — 见 [LICENSE](LICENSE)
