@@ -1,4 +1,4 @@
-# AnthropicProxy 默认 compose 编排
+# Parrot 默认 compose 编排 🦜
 # 一键脚本和手动部署都用这份。
 #
 # - 默认拉取已构建好的多架构镜像（GHCR）。本地开发改成 `build: .` 即可。
@@ -7,8 +7,8 @@
 
 services:
   anthropic-proxy:
-    image: ghcr.io/danger-dream/anthropicproxy:latest
-    container_name: anthropic-proxy
+    image: ghcr.io/danger-dream/parrot:latest
+    container_name: parrot
     restart: unless-stopped
     ports:
       - "22122:22122"

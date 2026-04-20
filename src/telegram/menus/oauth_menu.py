@@ -178,6 +178,20 @@ def _format_account_block(acc: dict) -> str:
                 f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
             )
 
+    # 冷却状态（该账号下所有模型聚合）：简短提示；详情在详情页展开
+    from ... import cooldown as _cd
+    ck = f"oauth:{email}"
+    cds = [e for e in _cd.active_entries() if e.get("channel_key") == ck]
+    if cds:
+        perm_n = sum(1 for e in cds if e.get("cooldown_until") == -1)
+        cool_n = len(cds) - perm_n
+        parts = []
+        if perm_n:
+            parts.append(f"🔴 永久冻结 {perm_n} 个模型")
+        if cool_n:
+            parts.append(f"🟠 冷却 {cool_n} 个模型")
+        lines.append("  ⚠ " + " · ".join(parts))
+
     return "\n".join(lines)
 
 
@@ -205,19 +219,9 @@ def _format_usage_block(email: str) -> str:
         if line:
             out.append(line)
 
-    # OpenAI Codex 原始 primary/secondary 窗口（用于排查，按需显示）
-    codex_primary_pct = row.get("codex_primary_used_pct")
-    codex_primary_win = row.get("codex_primary_window_min")
-    codex_secondary_pct = row.get("codex_secondary_used_pct")
-    codex_secondary_win = row.get("codex_secondary_window_min")
-    if codex_primary_pct is not None or codex_secondary_pct is not None:
-        out.append("<i>── Codex 原始窗口 ──</i>")
-        if codex_primary_pct is not None:
-            win = f"{codex_primary_win}min" if codex_primary_win else "?"
-            out.append(f"primary ({win}): {codex_primary_pct:.0f}%")
-        if codex_secondary_pct is not None:
-            win = f"{codex_secondary_win}min" if codex_secondary_win else "?"
-            out.append(f"secondary ({win}): {codex_secondary_pct:.0f}%")
+    # 注：OpenAI 的 codex_primary_* / codex_secondary_* 是对齐到 five_hour/seven_day
+    # 的原始窗口数据，其 util 值已被 normalize_codex_snapshot 填进上面的"5h/7d"两行，
+    # 这里不再重复展示（老大反馈内容冗余）。
 
     ex_used = row.get("extra_used")
     ex_limit = row.get("extra_limit")
@@ -249,12 +253,28 @@ def _list_text_and_kb() -> tuple[str, dict]:
     user_disabled = sum(1 for a in accounts if a.get("disabled_reason") == "user")
     auth_err = sum(1 for a in accounts if a.get("disabled_reason") == "auth_error")
 
+    # 冷却统计：按 oauth:email 聚合；一个账号只要有任何模型处于冷却，就计数一次
+    from ... import cooldown as _cd
+    cd_keys_any: set[str] = set()
+    cd_keys_perm: set[str] = set()
+    for e in _cd.active_entries():
+        ck = e.get("channel_key", "")
+        if not ck.startswith("oauth:"):
+            continue
+        cd_keys_any.add(ck)
+        if e.get("cooldown_until") == -1:
+            cd_keys_perm.add(ck)
+    cooling_only = len(cd_keys_any - cd_keys_perm)
+    permanent = len(cd_keys_perm)
+
     summary = (
         f"🔐 <b>OAuth 账户管理</b>\n"
         f"共 {total} 个账户 | 正常 {normal}"
         + (f" | 配额 {quota_disabled}" if quota_disabled else "")
         + (f" | 用户禁用 {user_disabled}" if user_disabled else "")
         + (f" | 认证失败 {auth_err}" if auth_err else "")
+        + (f" | ⚠ 冷却 {cooling_only}" if cooling_only else "")
+        + (f" | 🔴 永久 {permanent}" if permanent else "")
     )
 
     if not accounts:
@@ -280,6 +300,9 @@ def _list_text_and_kb() -> tuple[str, dict]:
         ui.btn("➕ 新增账户", "oa:add"),
         ui.btn("🔄 刷新全部用量", "oa:refresh_all"),
     ])
+    # 只有存在 OAuth 账号的冷却条目时才显示"清除所有错误"（避免空操作按钮）
+    if cd_keys_any:
+        rows.append([ui.btn(f"🧹 清除所有账户错误（{len(cd_keys_any)} 个）", "oa:clear_all_errors")])
     rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
     return ui.truncate(text), ui.inline_kb(rows)
 
@@ -364,11 +387,11 @@ def _detail_text_and_kb(email: str) -> tuple[Optional[str], Optional[dict]]:
     provider_line = ""
     if prov == "openai":
         plan = acc.get("plan_type") or "?"
-        acct_id = acc.get("chatgpt_account_id") or "?"
         provider_line = (
-            f"Provider: <code>🅾 OpenAI (Codex)</code> · plan: <code>{ui.escape_html(plan)}</code>\n"
-            f"Account ID: <code>{ui.escape_html(acct_id)}</code>\n"
+            f"提供者: <code>🅾 OpenAI (Codex)</code> · 计划: <code>{ui.escape_html(plan)}</code>\n"
         )
+    elif prov == "claude":
+        provider_line = f"提供者: <code>🅰 Anthropic (Claude)</code>\n"
     text = (
         f"{icon} <b>{ui.escape_html(email)}</b>\n\n"
         f"状态: <code>{ui.escape_html('enabled' if acc.get('enabled', True) and not acc.get('disabled_reason') else reason)}</code>\n"
@@ -1072,12 +1095,30 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
 
 # ─── 路由分发 ─────────────────────────────────────────────────────
 
+def on_clear_all_errors(chat_id: int, message_id: int, cb_id: str) -> None:
+    """清除所有 OAuth 账户的模型冷却（按 oauth: 前缀批量 clear）。"""
+    from ... import cooldown as _cd
+    cd_keys = sorted({
+        e["channel_key"] for e in _cd.active_entries()
+        if e.get("channel_key", "").startswith("oauth:")
+    })
+    cleared = 0
+    for ck in cd_keys:
+        _cd.clear(ck, model=None)
+        cleared += 1
+    ui.answer_cb(cb_id, f"已清除 {cleared} 个账户的冷却")
+    show(chat_id, message_id)
+
+
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
     if data == "menu:oauth":
         show(chat_id, message_id, cb_id)
         return True
     if data == "oa:refresh_all":
         on_refresh_all(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:clear_all_errors":
+        on_clear_all_errors(chat_id, message_id, cb_id)
         return True
     if data == "oa:add":
         on_add_menu(chat_id, message_id, cb_id)

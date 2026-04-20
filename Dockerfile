@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# AnthropicProxy 多阶段构建
+# Parrot 多阶段构建
 # - builder：装依赖到独立 venv
 # - runtime：拷代码 + venv，非 root 运行
 

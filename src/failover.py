@@ -668,6 +668,19 @@ async def _consume_non_stream(
     translator_ctx: Optional[dict] = None,
     body: Optional[dict] = None,
 ) -> AttemptResult:
+    # stream-only 上游分流：OpenAI OAuth (chatgpt.com/backend-api/codex) 只返回 SSE，
+    # 下游若请求非流式，这里把 SSE 聚合成完整 JSON 再走原有 translator / 落库链路。
+    if getattr(ch, "upstream_stream_only", False):
+        return await _consume_stream_as_non_stream(
+            ctx, upstream_resp, ch, resolved_model, dynamic_map,
+            connect_ms, start_time, request_id,
+            messages, api_key_name, client_ip,
+            fp_query, retry_count_so_far, affinity_hit,
+            ingress_protocol=ingress_protocol,
+            translator_ctx=translator_ctx,
+            body=body,
+        )
+
     # 读 body：用剩余总时间作为硬超时（httpx 的 read timeout 只保证单次 chunk 间隔）
     cfg = config.get()
     total_timeout = int((cfg.get("timeouts") or {}).get("total", 600))
@@ -778,6 +791,205 @@ async def _consume_non_stream(
         connect_ms=connect_ms, total_ms=total_ms, http_status=upstream_resp.status_code,
         usage=usage, assistant_response=assistant_msg,
         full_response_text=restored.decode("utf-8", errors="replace") if isinstance(restored, bytes) else str(restored),
+    )
+
+
+
+# ─── Stream-only 上游 → 非流式聚合 ─────────────────────────────────
+
+async def _consume_stream_as_non_stream(
+    ctx, upstream_resp: httpx.Response, ch: Channel, resolved_model: str,
+    dynamic_map: Optional[dict],
+    connect_ms: int, start_time: float, request_id: str,
+    messages: list, api_key_name: Optional[str], client_ip: str,
+    fp_query: Optional[str], retry_count_so_far: int, affinity_hit: int,
+    *, ingress_protocol: str = "anthropic",
+    translator_ctx: Optional[dict] = None,
+    body: Optional[dict] = None,
+) -> AttemptResult:
+    """处理 upstream_stream_only=True 渠道的非流式下游请求。
+
+    读取上游 SSE → 用 ResponsesSSEAssistantBuilder 聚合 → 构造成完整 /v1/responses
+    JSON → 走与 _consume_non_stream 一致的 translator / 黑名单 / 落库 / 亲和链路。
+    """
+    cfg = config.get()
+    timeouts = cfg.get("timeouts") or {}
+    total_timeout = int(timeouts.get("total", 600))
+    first_byte_timeout = int(timeouts.get("firstByte", 30))
+    idle_timeout = int(timeouts.get("idle", 30))
+    deadline_ts = start_time + total_timeout
+
+    # 上游是 openai-responses SSE（目前唯一 stream-only 渠道是 OpenAIOAuthChannel，
+    # 其 protocol 固定为 "openai-responses"）
+    assert getattr(ch, "protocol", "") == "openai-responses", \
+        f"_consume_stream_as_non_stream only supports openai-responses upstream, got {getattr(ch, 'protocol', None)!r}"
+
+    raw_buf = bytearray()
+    aiter = upstream_resp.aiter_bytes()
+
+    # 1) 首字节
+    first_wait = min(first_byte_timeout, max(1, int(deadline_ts - time.time())))
+    try:
+        first_chunk = await asyncio.wait_for(aiter.__anext__(), timeout=first_wait)
+    except asyncio.TimeoutError:
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="first_byte_timeout", connect_ms=connect_ms,
+            error_detail=f"first byte timeout (> {first_wait}s) [stream-only→non-stream]",
+        )
+    except StopAsyncIteration:
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="closed_before_first_byte", connect_ms=connect_ms,
+            error_detail="upstream closed stream before first byte [stream-only→non-stream]",
+        )
+    except Exception as exc:
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="transport_error", connect_ms=connect_ms,
+            error_detail=f"first byte transport: {exc} [stream-only→non-stream]",
+        )
+
+    first_byte_ms = int((time.time() - start_time) * 1000)
+    if not first_chunk:
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="closed_before_first_byte", connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+            error_detail="upstream sent empty first chunk [stream-only→non-stream]",
+        )
+
+    # 2) 首包还原 + 错误检查（复用流式路径的 toolkit）
+    first_chunk_restored = await ch.restore_response(first_chunk, dynamic_map=dynamic_map)
+    toolkit = _toolkit_for(ch)
+
+    first_event = toolkit["first_event_parser"](first_chunk_restored)
+    if first_event and (
+        first_event.get("type") == "error"
+        or isinstance(first_event.get("error"), dict)
+        or first_event.get("_event_name") == "error"
+    ):
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="upstream_error_json",
+            connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+            error_detail=json.dumps(first_event.get("error", first_event), ensure_ascii=False)[:2000],
+        )
+
+    bl_hit = blacklist.match(first_chunk_restored, ch.key)
+    if bl_hit:
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="blacklist_hit",
+            connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+            error_detail=f"blacklist: {bl_hit}",
+        )
+
+    # 3) 读完剩余 chunk + 聚合
+    builder = toolkit["stream_builder"]()  # ResponsesSSEAssistantBuilder
+    tracker = toolkit["stream_tracker"]()  # Usage / 状态追踪
+    builder.feed(first_chunk_restored)
+    tracker.feed(first_chunk_restored)
+    raw_buf.extend(first_chunk_restored if isinstance(first_chunk_restored, (bytes, bytearray)) else first_chunk_restored.encode("utf-8", errors="replace"))
+
+    while True:
+        now = time.time()
+        if now >= deadline_ts:
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="total_timeout",
+                connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=f"total timeout reading SSE (> {total_timeout}s) [stream-only→non-stream]",
+            )
+        wait_s = max(1, min(idle_timeout, int(deadline_ts - now)))
+        try:
+            chunk = await asyncio.wait_for(aiter.__anext__(), timeout=wait_s)
+        except asyncio.TimeoutError:
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="idle_timeout",
+                connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=f"idle timeout (> {idle_timeout}s) [stream-only→non-stream]",
+            )
+        except StopAsyncIteration:
+            break
+        except Exception as exc:
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="transport_error",
+                connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=f"read SSE chunk: {exc} [stream-only→non-stream]",
+            )
+        if not chunk:
+            continue
+        restored_chunk = await ch.restore_response(chunk, dynamic_map=dynamic_map)
+        builder.feed(restored_chunk)
+        tracker.feed(restored_chunk)
+        raw_buf.extend(restored_chunk if isinstance(restored_chunk, (bytes, bytearray)) else restored_chunk.encode("utf-8", errors="replace"))
+
+    resp_headers = _pick_upstream_headers(upstream_resp)
+    await _safe_exit(ctx)
+
+    if not builder.has_any_event:
+        return AttemptResult(
+            outcome="upstream_malformed",
+            connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+            error_detail="stream ended without any SSE event [stream-only→non-stream]",
+        )
+
+    # 4) 聚合成完整 /v1/responses JSON
+    obj = builder.to_full_json(fallback_model=resolved_model)
+
+    # 把 tracker 收集到的 usage 合并进去（tracker 负责 responses.completed 的 usage 解析）
+    try:
+        usage_from_tracker = tracker.usage if hasattr(tracker, "usage") else None
+        if usage_from_tracker:
+            obj.setdefault("usage", usage_from_tracker)
+    except Exception:
+        pass
+
+    total_ms = int((time.time() - start_time) * 1000)
+
+    # 5) 用标准 extract_usage 抽 usage（对齐现有落库口径）
+    usage = toolkit["extract_usage_json"](obj)
+    assistant_msg = {"role": "assistant", "content": obj.get("output") or []}
+
+    scorer.record_success(
+        ch.key, resolved_model,
+        connect_ms=connect_ms, first_byte_ms=first_byte_ms, total_ms=total_ms,
+    )
+    cooldown.clear(ch.key, resolved_model)
+
+    response_body_text = bytes(raw_buf).decode("utf-8", errors="replace")
+    await asyncio.to_thread(
+        log_db.finish_success, request_id, ch.key, ch.type, resolved_model,
+        input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"],
+        cache_creation_tokens=usage["cache_creation"], cache_read_tokens=usage["cache_read"],
+        connect_ms=connect_ms, first_token_ms=first_byte_ms, total_ms=total_ms,
+        retry_count=retry_count_so_far, affinity_hit=affinity_hit,
+        response_body=response_body_text,
+        http_status=upstream_resp.status_code,
+        upstream_protocol=getattr(ch, "protocol", "anthropic"),
+    )
+
+    # 6) 走跨变体 translator（如果 ingress 是 chat，上游 responses JSON 要翻译成 chat.completion JSON）
+    out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
+
+    # 亲和写入（与 _consume_non_stream 一致）
+    _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
+                                messages, assistant_msg, body, out_obj,
+                                ch.key, resolved_model)
+
+    response = JSONResponse(
+        content=out_obj,
+        status_code=upstream_resp.status_code,
+        headers=resp_headers,
+    )
+    return AttemptResult(
+        outcome="success", success=True, response=response,
+        connect_ms=connect_ms, first_byte_ms=first_byte_ms, total_ms=total_ms,
+        http_status=upstream_resp.status_code,
+        usage=usage, assistant_response=assistant_msg,
+        full_response_text=response_body_text,
     )
 
 

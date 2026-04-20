@@ -10,8 +10,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # 注意：GHCR 镜像名必须全小写
-  IMAGE_NAME: ${{ github.repository_owner }}/anthropicproxy
+  # 注意：GHCR 镜像名必须全小写；本仓库发布为 ghcr.io/<owner>/parrot
+  IMAGE_NAME: ${{ github.repository_owner }}/parrot
 
 jobs:
   build-and-push:
