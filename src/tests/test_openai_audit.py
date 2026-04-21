@@ -58,11 +58,14 @@ def _setup(m):
     m["state_db"].perf_delete()
     m["state_db"].error_delete()
     m["state_db"].affinity_delete()
+    m["state_db"].client_affinity_delete()
     m["openai_store"]._reset_for_test()
     for mod_name in ("affinity", "cooldown", "scorer"):
         mod = m[mod_name]
         mod._initialized = False
+    m["affinity"]._client_initialized = False
     m["affinity"].init()
+    m["affinity"].client_init()
     m["cooldown"].init()
     m["scorer"].init()
 

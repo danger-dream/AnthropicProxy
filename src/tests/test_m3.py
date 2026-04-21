@@ -46,11 +46,14 @@ def _reset_all_state(m):
     m["state_db"].perf_delete()
     m["state_db"].error_delete()
     m["state_db"].affinity_delete()
+    m["state_db"].client_affinity_delete()
     # 重置内存层：把 _initialized 置 False 强制重载
     for mod_name in ("affinity", "cooldown", "scorer"):
         mod = m[mod_name]
         mod._initialized = False
+    m["affinity"]._client_initialized = False
     m["affinity"].init()
+    m["affinity"].client_init()
     m["cooldown"].init()
     m["scorer"].init()
 

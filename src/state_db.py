@@ -72,6 +72,16 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_affinity_used ON cache_affinities(last_used);
     CREATE INDEX IF NOT EXISTS idx_affinity_channel ON cache_affinities(channel_key);
 
+    CREATE TABLE IF NOT EXISTS client_affinities (
+      client_key   TEXT PRIMARY KEY,
+      channel_key  TEXT NOT NULL,
+      model        TEXT NOT NULL,
+      last_used    INTEGER NOT NULL,
+      created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_client_aff_used ON client_affinities(last_used);
+    CREATE INDEX IF NOT EXISTS idx_client_aff_channel ON client_affinities(channel_key);
+
     CREATE TABLE IF NOT EXISTS schema_meta (
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -564,6 +574,91 @@ def affinity_cleanup(ttl_ms: int) -> int:
     with _write_lock:
         cur = _get_conn().execute(
             "DELETE FROM cache_affinities WHERE last_used < ?",
+            (cutoff,),
+        )
+        _get_conn().commit()
+        return cur.rowcount
+
+
+# ─── client_affinities ─────────────────────────────────────────────
+
+def client_affinity_upsert(client_key: str, channel_key: str, model: str,
+                           last_used: int | None = None) -> None:
+    ts = last_used if last_used is not None else now_ms()
+    with _write_lock:
+        conn = _get_conn()
+        cur = conn.execute(
+            """UPDATE client_affinities
+               SET channel_key=?, model=?, last_used=?
+               WHERE client_key=?""",
+            (channel_key, model, ts, client_key),
+        )
+        if cur.rowcount == 0:
+            conn.execute(
+                """INSERT INTO client_affinities
+                   (client_key, channel_key, model, last_used, created_at)
+                   VALUES (?,?,?,?,?)""",
+                (client_key, channel_key, model, ts, ts),
+            )
+        conn.commit()
+
+
+def client_affinity_load_all() -> list[dict]:
+    rows = _get_conn().execute("SELECT * FROM client_affinities").fetchall()
+    return [dict(r) for r in rows]
+
+
+def client_affinity_delete(client_key: str | None = None) -> None:
+    with _write_lock:
+        if client_key:
+            _get_conn().execute(
+                "DELETE FROM client_affinities WHERE client_key=?",
+                (client_key,),
+            )
+        else:
+            _get_conn().execute("DELETE FROM client_affinities")
+        _get_conn().commit()
+
+
+def client_affinity_delete_by_channel(channel_key: str) -> None:
+    with _write_lock:
+        _get_conn().execute(
+            "DELETE FROM client_affinities WHERE channel_key=?",
+            (channel_key,),
+        )
+        _get_conn().commit()
+
+
+def client_affinity_delete_stale_channels(live_keys: Iterable[str]) -> None:
+    live_set = set(live_keys)
+    with _write_lock:
+        rows = _get_conn().execute(
+            "SELECT DISTINCT channel_key FROM client_affinities"
+        ).fetchall()
+        stale = [r["channel_key"] for r in rows if r["channel_key"] not in live_set]
+        for k in stale:
+            _get_conn().execute(
+                "DELETE FROM client_affinities WHERE channel_key=?", (k,)
+            )
+        _get_conn().commit()
+
+
+def client_affinity_rename_channel(old_key: str, new_key: str) -> None:
+    if old_key == new_key:
+        return
+    with _write_lock:
+        _get_conn().execute(
+            "UPDATE client_affinities SET channel_key=? WHERE channel_key=?",
+            (new_key, old_key),
+        )
+        _get_conn().commit()
+
+
+def client_affinity_cleanup(ttl_ms: int) -> int:
+    cutoff = now_ms() - ttl_ms
+    with _write_lock:
+        cur = _get_conn().execute(
+            "DELETE FROM client_affinities WHERE last_used < ?",
             (cutoff,),
         )
         _get_conn().commit()

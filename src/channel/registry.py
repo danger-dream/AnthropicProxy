@@ -79,6 +79,7 @@ def _sync_state_db_with_channels() -> None:
             state_db.error_delete(row["channel_key"])
 
     state_db.affinity_delete_stale_channels(live_keys)
+    state_db.client_affinity_delete_stale_channels(live_keys)
 
 
 def all_channels() -> list[Channel]:
@@ -253,6 +254,7 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
         scorer.rename_channel(old_key, new_key)
         cooldown.rename_channel(old_key, new_key)
         affinity.rename_channel(old_key, new_key)
+        affinity.client_rename_channel(old_key, new_key)
 
     rebuild_from_config()
     return {"name": new_name}
@@ -278,5 +280,6 @@ def delete_api_channel(name: str) -> bool:
     scorer.clear_stats(key)
     cooldown.clear(key)
     affinity.delete_by_channel(key)
+    affinity.client_delete_by_channel(key)
     rebuild_from_config()
     return True

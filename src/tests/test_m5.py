@@ -48,6 +48,7 @@ def _reset(m):
     m["state_db"].perf_delete()
     m["state_db"].error_delete()
     m["state_db"].affinity_delete()
+    m["state_db"].client_affinity_delete()
     for mod_name in ("cooldown", "scorer"):
         m[mod_name]._initialized = False
     m["cooldown"].init()

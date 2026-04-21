@@ -17,10 +17,12 @@ class ScheduleResult:
     """调度结果，包含候选序列与亲和相关元数据。"""
 
     def __init__(self, candidates: list[tuple[Channel, str]],
-                 fp_query: Optional[str], affinity_hit: bool):
+                 fp_query: Optional[str], affinity_hit: bool,
+                 client_key: Optional[str] = None):
         self.candidates = candidates
         self.fp_query = fp_query         # 本次请求计算得到的查询指纹（可用于后续事件记录）
         self.affinity_hit = affinity_hit
+        self.client_key = client_key     # client-level affinity key（failover 写入用）
 
     def __bool__(self) -> bool:
         return bool(self.candidates)
@@ -58,15 +60,28 @@ def _filter_candidates(requested_model: str,
 
 def _apply_affinity(candidates: list[tuple[Channel, str]],
                     fp_query: Optional[str],
-                    cfg: dict) -> tuple[list[tuple[Channel, str]], bool]:
+                    cfg: dict,
+                    client_key: Optional[str] = None,
+                    ) -> tuple[list[tuple[Channel, str]], bool]:
     """尝试把亲和绑定的渠道顶到首位，必要时打破绑定。
+
+    优先使用 fingerprint 亲和（精确会话级别）。
+    若 fp_query 为 None 或未命中，回退到 client-level soft affinity。
 
     返回 (新 candidates, 是否亲和命中)。
     """
-    if not fp_query or len(candidates) <= 1:
+    if len(candidates) <= 1:
         return candidates, False
 
-    bound = affinity.get(fp_query)
+    # 1. 尝试 fingerprint 亲和
+    bound = affinity.get(fp_query) if fp_query else None
+    source = "fp"  # 记录命中来源
+
+    # 2. 回退到 client-level soft affinity
+    if not bound and client_key:
+        bound = affinity.client_get(client_key)
+        source = "client"
+
     if not bound:
         return candidates, False
 
@@ -90,14 +105,18 @@ def _apply_affinity(candidates: list[tuple[Channel, str]],
     # 给 1.0 的下限避免乘 0 导致永远不打破。
     baseline = max(best_score, 1.0)
     if bound_score > baseline * threshold:
-        affinity.delete(fp_query)
+        if source == "fp" and fp_query:
+            affinity.delete(fp_query)
+        elif source == "client" and client_key:
+            affinity.client_delete(client_key)
         return candidates, False
 
     # 命中：把绑定目标顶到首位
     if bound_idx != 0:
         candidates = list(candidates)
         candidates.insert(0, candidates.pop(bound_idx))
-    affinity.touch(fp_query)
+    if source == "fp" and fp_query:
+        affinity.touch(fp_query)
     return candidates, True
 
 
@@ -131,6 +150,9 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
             api_key_name, client_ip, body.get("messages") or []
         )
 
+    # 构造 client-level affinity key
+    client_key = affinity.make_client_key(api_key_name, client_ip, requested_model)
+
     cfg = config.get()
     mode = (cfg.get("channelSelection") or "smart").lower()
 
@@ -138,6 +160,7 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
         candidates = scorer.sort_by_score(candidates)
     # "order" 模式：按注册表原始顺序（config 中定义的顺序）
 
-    candidates, affinity_hit = _apply_affinity(candidates, fp_query, cfg)
+    candidates, affinity_hit = _apply_affinity(candidates, fp_query, cfg,
+                                               client_key=client_key)
 
-    return ScheduleResult(candidates, fp_query, affinity_hit)
+    return ScheduleResult(candidates, fp_query, affinity_hit, client_key=client_key)

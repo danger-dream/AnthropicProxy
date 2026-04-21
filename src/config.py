@@ -50,6 +50,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ttlMinutes": 30,
         "threshold": 3.0,
         "cleanupIntervalSeconds": 300,
+        "clientTtlMinutes": 120,
     },
     "scoring": {
         "emaAlpha": 0.25,

@@ -98,8 +98,9 @@ async def _affinity_cleanup_loop():
         await asyncio.sleep(interval)
         try:
             cleared = affinity.cleanup()
-            if cleared:
-                print(f"[affinity] cleaned {cleared} stale entries")
+            client_cleared = affinity.client_cleanup()
+            if cleared or client_cleared:
+                print(f"[affinity] cleaned {cleared} fp + {client_cleared} client stale entries")
         except Exception as e:
             print(f"[affinity] cleanup failed: {e}")
 
@@ -145,6 +146,7 @@ async def lifespan(app: FastAPI):
 
     # 内存表从 state.db 恢复
     affinity.init()
+    affinity.client_init()
     cooldown.init()
     scorer.init()
 
@@ -278,6 +280,7 @@ async def health():
             "api": api_count,
         },
         "affinity_bound": affinity.count(),
+        "client_affinity_bound": affinity.client_count(),
         "device_id": DEVICE_ID[:16] + "...",
         "version": __version__,
     }

@@ -371,6 +371,7 @@ def _write_affinity_non_stream(
     out_obj: dict,
     channel_key: str,
     resolved_model: str,
+    client_key: Optional[str] = None,
 ) -> None:
     """成功完成非流式请求后按 ingress 走对应家族的 fingerprint_write。"""
     fp_write: Optional[str] = None
@@ -393,6 +394,9 @@ def _write_affinity_non_stream(
         )
     if fp_write:
         affinity.upsert(fp_write, channel_key, resolved_model)
+    # 同步更新 client-level soft affinity
+    if client_key:
+        affinity.client_upsert(client_key, channel_key, resolved_model)
 
 
 def _responses_current_input_items(body: dict) -> list:
@@ -562,6 +566,7 @@ async def run_failover(
     candidates = list(schedule_result.candidates)
     affinity_hit = 1 if schedule_result.affinity_hit else 0
     fp_query = schedule_result.fp_query
+    client_key = getattr(schedule_result, "client_key", None)
 
     cfg = config.get()
     timeouts = cfg.get("timeouts") or {}
@@ -597,6 +602,7 @@ async def run_failover(
             fp_query, body.get("messages") or [], api_key_name, client_ip,
             request_id, retry_count, affinity_hit,
             ingress_protocol=ingress_protocol,
+            client_key=client_key,
         )
         last_result = result
 
@@ -708,6 +714,7 @@ async def _try_channel(
     api_key_name: Optional[str], client_ip: str,
     request_id: str, retry_count_so_far: int, affinity_hit: int,
     *, ingress_protocol: str = "anthropic",
+    client_key: Optional[str] = None,
 ) -> AttemptResult:
     cfg = config.get()
     timeouts = cfg.get("timeouts") or {}
@@ -844,6 +851,7 @@ async def _try_channel(
                 ingress_protocol=ingress_protocol,
                 translator_ctx=upstream_req.translator_ctx,
                 body=body,
+                client_key=client_key,
             )
 
         # 4. 流式分支
@@ -853,6 +861,7 @@ async def _try_channel(
             first_byte_timeout, idle_timeout,
             request_id, messages, api_key_name, client_ip,
             fp_query, retry_count_so_far, affinity_hit,
+            client_key=client_key,
             ingress_protocol=ingress_protocol,
             translator_ctx=upstream_req.translator_ctx,
             body=body,
@@ -887,6 +896,7 @@ async def _consume_non_stream(
     *, ingress_protocol: str = "anthropic",
     translator_ctx: Optional[dict] = None,
     body: Optional[dict] = None,
+    client_key: Optional[str] = None,
 ) -> AttemptResult:
     # stream-only 上游分流：OpenAI OAuth (chatgpt.com/backend-api/codex) 只返回 SSE，
     # 下游若请求非流式，这里把 SSE 聚合成完整 JSON 再走原有 translator / 落库链路。
@@ -899,6 +909,7 @@ async def _consume_non_stream(
             ingress_protocol=ingress_protocol,
             translator_ctx=translator_ctx,
             body=body,
+            client_key=client_key,
         )
 
     # 读 body：用剩余总时间作为硬超时（httpx 的 read timeout 只保证单次 chunk 间隔）
@@ -999,7 +1010,8 @@ async def _consume_non_stream(
     # 亲和写入（按 ingress 选 fingerprint_write 的参数空间与函数）
     _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
                                 messages, assistant_msg, body, out_obj,
-                                ch.key, resolved_model)
+                                ch.key, resolved_model,
+                                client_key=client_key)
 
     response = JSONResponse(
         content=out_obj,
@@ -1026,6 +1038,7 @@ async def _consume_stream_as_non_stream(
     *, ingress_protocol: str = "anthropic",
     translator_ctx: Optional[dict] = None,
     body: Optional[dict] = None,
+    client_key: Optional[str] = None,
 ) -> AttemptResult:
     """处理 upstream_stream_only=True 渠道的非流式下游请求。
 
@@ -1197,7 +1210,8 @@ async def _consume_stream_as_non_stream(
     # 亲和写入（与 _consume_non_stream 一致）
     _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
                                 messages, assistant_msg, body, out_obj,
-                                ch.key, resolved_model)
+                                ch.key, resolved_model,
+                                client_key=client_key)
 
     response = JSONResponse(
         content=out_obj,
@@ -1225,6 +1239,7 @@ async def _consume_stream(
     *, ingress_protocol: str = "anthropic",
     translator_ctx: Optional[dict] = None,
     body: Optional[dict] = None,
+    client_key: Optional[str] = None,
 ) -> AttemptResult:
     aiter = upstream_resp.aiter_bytes()
 
@@ -1369,6 +1384,9 @@ async def _consume_stream(
             )
         if fp_write:
             affinity.upsert(fp_write, ch.key, resolved_model)
+        # 同步更新 client-level soft affinity
+        if client_key:
+            affinity.client_upsert(client_key, ch.key, resolved_model)
 
         # shield：客户端断开导致的 CancelledError 不应中断 DB 写入，否则
         # 日志会残留 pending。(参见 _finalize_client_cancelled 早退守卫)

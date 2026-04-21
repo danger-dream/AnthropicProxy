@@ -56,10 +56,13 @@ def _setup(m):
     m["state_db"].perf_delete()
     m["state_db"].error_delete()
     m["state_db"].affinity_delete()
+    m["state_db"].client_affinity_delete()
     for mod_name in ("affinity", "cooldown", "scorer"):
         mod = m[mod_name]
         mod._initialized = False
+    m["affinity"]._client_initialized = False
     m["affinity"].init()
+    m["affinity"].client_init()
     m["cooldown"].init()
     m["scorer"].init()
 
@@ -514,6 +517,7 @@ def main() -> int:
         m["state_db"].perf_delete()
         m["state_db"].error_delete()
         m["state_db"].affinity_delete()
+        m["state_db"].client_affinity_delete()
 
     print(f"\nRESULT: {passed} / {len(tests)} passed")
     return 0 if passed == len(tests) else 1
