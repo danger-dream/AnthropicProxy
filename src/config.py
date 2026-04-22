@@ -32,6 +32,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "idle": 120,    # chunk 之间最长空闲；上游推理慢需要更宽松
         "total": 600,
     },
+    # 渠道并发限制（2026-04-22 新增）
+    # 每个渠道同一时刻最多多少个在途请求；满了则在候选渠道里排队等位。
+    # queueWaitSeconds 到了仍无位置 → 客户端收到 429 rate_limit_error。
+    "concurrency": {
+        "enabled": True,
+        "queueWaitSeconds": 30,           # TG Bot 可改，全满排队超时
+        "defaultMaxConcurrent": 0,        # 渠道未配 maxConcurrent 时的默认（0=不限）
+    },
     "errorWindows": [1, 3, 5, 10, 15, 0],
     # OAuth 渠道宽容次数：前 N 次失败只累计计数不进入冷却（成功一次清零）。
     # 第 N+1 次失败开始按 errorWindows 阶梯。设计目的：避免单 OAuth 账号
@@ -117,6 +125,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "telegram": {
         "botToken": "",
         "adminIds": [],
+        # 统计汇总页各段可见性（仅影响 TG Bot 「📈 统计汇总」汇总视图；
+        # 专题视图不受影响）。默认全可见；用户可在「📈 统计汇总」→「⚙ 设置」切换。
+        "statsVisibility": {
+            "byChannel": True,     # 按渠道 Top（家族段内）
+            "byModel": True,       # 按模型 Top（家族段内）
+            "byApiKey": True,      # 按 Key Top（跨家族）
+            "cacheMisses": True,   # 最近未命中样本
+            "recentCalls": True,   # 最近调用
+        },
     },
     "oauth": {
         "mockMode": False,

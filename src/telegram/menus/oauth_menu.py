@@ -426,10 +426,13 @@ def _detail_text_and_kb(account_key: str) -> tuple[Optional[str], Optional[dict]
         )
     elif prov == "claude":
         provider_line = f"提供者: <code>🅰 Anthropic (Claude)</code>\n"
+    max_cc = int(acc.get("maxConcurrent", 0) or 0)
+    max_cc_label = str(max_cc) if max_cc > 0 else "默认"
     text = (
         f"{icon} <b>{ui.escape_html(email)}</b>\n\n"
         f"状态: <code>{ui.escape_html('enabled' if acc.get('enabled', True) and not acc.get('disabled_reason') else reason)}</code>\n"
         f"{provider_line}"
+        f"⚡ 并发上限: <code>{max_cc_label}</code>\n"
         f"过期: <code>{_format_bjt(acc.get('expired'))}</code> ({_format_remaining(acc.get('expired'))})\n"
         f"上次刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
         f"<b>📊 使用量</b>\n{_format_usage_block(account_key)}"
@@ -463,6 +466,7 @@ def _detail_text_and_kb(account_key: str) -> tuple[Optional[str], Optional[dict]
          ui.btn("📊 刷新用量",   f"oa:refresh_usage:{short}")],
         [ui.btn("🧹 清模型错误", f"oa:clear_errors:{short}"),
          ui.btn("🔗 清亲和绑定", f"oa:clear_affinity:{short}")],
+        [ui.btn(f"⚡ 修改并发上限（当前: {max_cc_label}）", f"oa:emax:{short}")],
         [ui.btn(toggle_label,     f"oa:toggle:{short}"),
          ui.btn("🗑 删除",         f"oa:delete_ask:{short}")],
         [ui.btn("◀ 返回 OAuth 列表", "menu:oauth")],
@@ -1302,6 +1306,9 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("oa:delete_exec:"):
         on_delete_exec(chat_id, message_id, cb_id, data.split(":", 2)[2])
         return True
+    if data.startswith("oa:emax:"):
+        on_edit_max_concurrent(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
     return False
 
 
@@ -1318,4 +1325,56 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
     if action == "oa_openai_rt":
         on_set_rt_openai_input(chat_id, text)
         return True
+    if action == "oa_emax":
+        on_edit_max_concurrent_input(chat_id, text)
+        return True
     return False
+
+
+# ─── 并发上限编辑 ─────────────────────────────────────────────────
+
+def on_edit_max_concurrent(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "oa_emax", {"account_key": ak, "short": short})
+    ui.edit(
+        chat_id, message_id,
+        "请输入该 OAuth 账户的并发上限（整数 ≥0）：\n"
+        "• <code>0</code> = 使用全局默认（「⚙ 系统设置 → ⚡ 并发限制」里配的 defaultMaxConcurrent）\n"
+        "• 正整数 = 该账户同时允许最多 N 个在途请求，超出则排队\n\n"
+        "例：<code>3</code>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", f"oa:view:{short}")]]),
+    )
+
+
+def on_edit_max_concurrent_input(chat_id: int, text: str) -> None:
+    state = states.get_state(chat_id)
+    data = (state.get("data") or {}) if state else {}
+    ak = data.get("account_key")
+    short = data.get("short", "")
+    if not ak:
+        ui.send(chat_id, "❌ 状态已失效，请重新进入编辑")
+        states.pop_state(chat_id)
+        return
+    try:
+        v = int((text or "").strip())
+        if v < 0:
+            raise ValueError
+    except ValueError:
+        ui.send(chat_id, "❌ 需要非负整数，请重新输入：")
+        return
+    try:
+        oauth_manager.update_max_concurrent(ak, v)
+    except Exception as exc:
+        ui.send(chat_id, f"❌ 失败: <code>{ui.escape_html(str(exc))}</code>")
+        return
+    states.pop_state(chat_id)
+    label = "默认" if v == 0 else str(v)
+    ui.send_result(
+        chat_id, f"✅ 并发上限已更新为 <code>{label}</code>",
+        extra_rows=[[ui.btn("◀ 返回账户详情", f"oa:view:{short}")]],
+        back_label="🏠 主菜单", back_callback="menu:main",
+    )

@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timedelta, timezone
 
-from ... import log_db
+from ... import concurrency, config, log_db
 from .. import ui
 
 
@@ -370,8 +370,11 @@ def _section_overall_compact(overall: dict) -> str:
 
 
 def _section_family(family: str, result: dict,
-                    model_channels: dict[str, list[dict]] | None = None) -> str:
-    """单个家族完整段：overall + by_channel Top3 + by_model Top3。"""
+                    model_channels: dict[str, list[dict]] | None = None,
+                    *,
+                    show_by_channel: bool = True,
+                    show_by_model: bool = True) -> str:
+    """单个家族完整段：overall + (可选) by_channel Top3 + (可选) by_model Top3。"""
     overall = result.get("overall") or {}
     if int(overall.get("total") or 0) == 0:
         return ""  # 没流量不展示
@@ -379,30 +382,32 @@ def _section_family(family: str, result: dict,
     tag = ui.family_tag(family)
     parts = [f"<b>{tag}</b>", _section_overall_compact(overall)]
 
-    by_channel = _strip_unknown(result.get("by_channel") or [])
-    if by_channel:
-        block = _summary_dim_block(
-            "按渠道 Top",
-            by_channel[:3],
-            lambda k: f"{_channel_icon(k)} <code>{ui.escape_html(_ch_short_name(k))}</code>",
-        )
-        parts.append("")
-        parts.append(block)
+    if show_by_channel:
+        by_channel = _strip_unknown(result.get("by_channel") or [])
+        if by_channel:
+            block = _summary_dim_block(
+                "按渠道 Top",
+                by_channel[:3],
+                lambda k: f"{_channel_icon(k)} <code>{ui.escape_html(_ch_short_name(k))}</code>",
+            )
+            parts.append("")
+            parts.append(block)
 
-    by_model = _strip_unknown(result.get("by_model") or [])
-    if by_model:
-        mc = model_channels or {}
-        block = _summary_dim_block(
-            "按模型 Top",
-            by_model[:3],
-            lambda k: f"<code>{ui.escape_html(k)}</code>",
-            extra_line=lambda k: (
-                "所属: " + _render_model_channels(mc.get(k) or [])
-                if mc.get(k) else ""
-            ),
-        )
-        parts.append("")
-        parts.append(block)
+    if show_by_model:
+        by_model = _strip_unknown(result.get("by_model") or [])
+        if by_model:
+            mc = model_channels or {}
+            block = _summary_dim_block(
+                "按模型 Top",
+                by_model[:3],
+                lambda k: f"<code>{ui.escape_html(k)}</code>",
+                extra_line=lambda k: (
+                    "所属: " + _render_model_channels(mc.get(k) or [])
+                    if mc.get(k) else ""
+                ),
+            )
+            parts.append("")
+            parts.append(block)
 
     return "\n".join(parts)
 
@@ -440,7 +445,26 @@ def _render_overall(result: dict, period: str,
     sep = "─" * 18
     header = f"📊 <b>统计 — {_PERIOD_LABELS.get(period, period)}</b>"
 
+    # 读可见性配置
+    vis = (config.get().get("telegram") or {}).get("statsVisibility") or {}
+    show_by_channel = bool(vis.get("byChannel", True))
+    show_by_model = bool(vis.get("byModel", True))
+    show_by_apikey = bool(vis.get("byApiKey", True))
+    show_misses = bool(vis.get("cacheMisses", True))
+    show_recent = bool(vis.get("recentCalls", True))
+
     sections: list[str] = [header]
+
+    # 并发概要（启用时）
+    cc_cfg = config.get().get("concurrency") or {}
+    if bool(cc_cfg.get("enabled", True)):
+        totals = concurrency.totals()
+        if totals["in_flight"] > 0 or totals["waiting"] > 0:
+            sections.append(
+                f"⚡ 并发: 在途 <b>{totals['in_flight']}</b>"
+                f" · 排队 <b>{totals['waiting']}</b>"
+                f" · 追踪 {totals['tracked_channels']} 个"
+            )
 
     # 家族段：按固定顺序 anthropic → openai
     family_results = family_results or {}
@@ -449,7 +473,11 @@ def _render_overall(result: dict, period: str,
         fr = family_results.get(fam)
         if not fr:
             continue
-        block = _section_family(fam, fr, model_channels)
+        block = _section_family(
+            fam, fr, model_channels,
+            show_by_channel=show_by_channel,
+            show_by_model=show_by_model,
+        )
         if block:
             sections.append(sep)
             sections.append(block)
@@ -461,7 +489,7 @@ def _render_overall(result: dict, period: str,
         sections.append(_section_overall(result.get("overall") or {}))
 
     # 跨家族 Key Top
-    by_apikey = _strip_unknown(result.get("by_apikey") or [])
+    by_apikey = _strip_unknown(result.get("by_apikey") or []) if show_by_apikey else []
     if by_apikey:
         sections.append(sep)
         kfs = key_family_split or {}
@@ -482,12 +510,12 @@ def _render_overall(result: dict, period: str,
         sections.append(block)
 
     # 未命中样本 / 最近调用（跨家族，带家族标签）
-    misses = _section_cache_misses(result.get("recent_cache_misses") or [])
+    misses = _section_cache_misses(result.get("recent_cache_misses") or []) if show_misses else ""
     if misses:
         sections.append("")
         sections.append(misses)
 
-    calls = _section_recent_calls(result.get("recent_calls") or [])
+    calls = _section_recent_calls(result.get("recent_calls") or []) if show_recent else ""
     if calls:
         sections.append("")
         sections.append(calls)
@@ -592,12 +620,19 @@ def _kb(period: str, dim: str) -> dict:
         _cell(period, "model", "模型"),
         _cell(period, "apikey", "Key"),
     ]
-    return ui.inline_kb([
-        row_period,
-        row_dim,
-        [ui.btn("🔄 刷新", f"stats:view:{period}:{dim}"),
-         ui.btn("◀ 返回主菜单", "menu:main")],
-    ])
+    rows = [row_period, row_dim]
+    if dim == "all":
+        rows.append([
+            ui.btn("🔄 刷新", f"stats:view:{period}:{dim}"),
+            ui.btn("⚙ 设置", f"stats:vis:{period}"),
+            ui.btn("◀ 返回主菜单", "menu:main"),
+        ])
+    else:
+        rows.append([
+            ui.btn("🔄 刷新", f"stats:view:{period}:{dim}"),
+            ui.btn("◀ 返回主菜单", "menu:main"),
+        ])
+    return ui.inline_kb(rows)
 
 
 # ─── 编排 + 入口 ─────────────────────────────────────────────────
@@ -691,4 +726,92 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         if len(parts) >= 4:
             view(chat_id, message_id, cb_id, parts[2], parts[3])
             return True
+    if data.startswith("stats:vis:"):
+        parts = data.split(":")
+        if len(parts) >= 3:
+            view_visibility(chat_id, message_id, cb_id, parts[2])
+            return True
+    if data.startswith("stats:vistog:"):
+        parts = data.split(":")
+        if len(parts) >= 4:
+            toggle_visibility(chat_id, message_id, cb_id, parts[2], parts[3])
+            return True
     return False
+
+
+# ─── 可见性设置 ───────────────────────────────────────────────────
+# 控制「📈 统计汇总」汇总视图 (dim=all) 里各段的显示/隐藏。
+# 配置写入 telegram.statsVisibility；默认全 True。
+
+_VIS_ITEMS = [
+    # (key, label, description)
+    ("byChannel",   "按渠道 Top",   "每个家族内的渠道 Top3"),
+    ("byModel",     "按模型 Top",   "每个家族内的模型 Top3"),
+    ("byApiKey",    "按 Key Top",   "跨家族的 API Key Top"),
+    ("cacheMisses", "未命中样本",   "最近缓存未命中请求"),
+    ("recentCalls", "最近调用",     "最近调用记录流"),
+]
+
+
+def _vis_get() -> dict:
+    """拿到当前可见性配置，缺失字段全填 True。"""
+    from ... import config as _cfg
+    tg = _cfg.get().get("telegram") or {}
+    cur = dict(tg.get("statsVisibility") or {})
+    for k, *_ in _VIS_ITEMS:
+        cur.setdefault(k, True)
+    return cur
+
+
+def _vis_text_and_kb(period: str) -> tuple[str, dict]:
+    vis = _vis_get()
+    lines = [
+        "⚙ <b>统计汇总 · 显示设置</b>",
+        "",
+        "下方每一项可切换显示状态。关闭后刷新 / 下次进入「统计汇总」将不再显示。",
+        "",
+        "<b>基本信息</b>（两家族概览）· <code>始终可见</code>",
+        "",
+        "<b>可切换段：</b>",
+    ]
+    rows = []
+    for key, label, desc in _VIS_ITEMS:
+        on = bool(vis.get(key, True))
+        tag = "✅ 显示" if on else "⬛ 隐藏"
+        lines.append(f"  {tag} · <b>{label}</b> — <i>{desc}</i>")
+        rows.append([ui.btn(
+            ("⬛ 隐藏 " if on else "✅ 显示 ") + label,
+            f"stats:vistog:{period}:{key}",
+        )])
+    rows.append([
+        ui.btn("◀ 返回统计汇总", f"stats:view:{period}:all"),
+        ui.btn("🏠 主菜单", "menu:main"),
+    ])
+    return "\n".join(lines), ui.inline_kb(rows)
+
+
+def view_visibility(chat_id: int, message_id: int, cb_id: str, period: str) -> None:
+    ui.answer_cb(cb_id)
+    if period not in _VALID_PERIODS:
+        period = "0"
+    text, kb = _vis_text_and_kb(period)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def toggle_visibility(chat_id: int, message_id: int, cb_id: str,
+                      period: str, key: str) -> None:
+    valid_keys = {k for k, *_ in _VIS_ITEMS}
+    if key not in valid_keys:
+        ui.answer_cb(cb_id, "无效项")
+        return
+    from ... import config as _cfg
+    cur = _vis_get()
+    new_val = not bool(cur.get(key, True))
+
+    def _mut(c):
+        tg = c.setdefault("telegram", {})
+        sv = tg.setdefault("statsVisibility", {})
+        sv[key] = new_val
+    _cfg.update(_mut)
+    ui.answer_cb(cb_id, "已显示" if new_val else "已隐藏")
+    view_visibility(chat_id, message_id, "", period)

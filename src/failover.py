@@ -22,8 +22,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 import threading
 
 from . import (
-    affinity, blacklist, config, cooldown, errors, fingerprint, log_db,
-    notifier, oauth_manager, scorer, state_db, upstream,
+    affinity, blacklist, concurrency, config, cooldown, errors, fingerprint,
+    log_db, notifier, oauth_manager, scorer, state_db, upstream,
 )
 from .channel.base import Channel
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
@@ -586,6 +586,8 @@ async def run_failover(
     pending = list(candidates)  # 仍从首位取
     idx = 0
     attempt_order = 0
+    # 并发饱和的候选：scheduler filter 挑出来的 + main loop 中竞态占满的
+    saturated_extras: list[tuple[Channel, str]] = []
 
     while idx < len(pending):
         ch, resolved_model = pending[idx]
@@ -593,17 +595,38 @@ async def run_failover(
         last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
         last_ch_protocol = getattr(ch, "protocol", "anthropic")
 
+        # 并发 slot 获取（快速路径；filter 过但竞态满了 → 放到 saturated 备选）
+        acquired = await concurrency.try_acquire(ch.key)
+        if not acquired:
+            # 竞态：filter 时还有位置，现在满了 → 作为排队备选
+            # 注：_filter_candidates 已把饱和的挑走，这里主要兜底并发 filter 后瞬间占满的情况
+            saturated_extras.append((ch, resolved_model))
+            idx += 1
+            continue
+
         attempt_id = log_db.record_retry_attempt(
             request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
         )
 
-        result = await _try_channel(
-            ch, resolved_model, body, is_stream, deadline_ts, start_time,
-            fp_query, body.get("messages") or [], api_key_name, client_ip,
-            request_id, retry_count, affinity_hit,
-            ingress_protocol=ingress_protocol,
-            client_key=client_key,
-        )
+        release_done = False
+        def _release_once(_key=ch.key):
+            nonlocal release_done
+            if release_done:
+                return
+            release_done = True
+            concurrency.release(_key)
+
+        try:
+            result = await _try_channel(
+                ch, resolved_model, body, is_stream, deadline_ts, start_time,
+                fp_query, body.get("messages") or [], api_key_name, client_ip,
+                request_id, retry_count, affinity_hit,
+                ingress_protocol=ingress_protocol,
+                client_key=client_key,
+            )
+        except BaseException:
+            _release_once()
+            raise
         last_result = result
 
         log_db.update_retry_attempt(
@@ -616,7 +639,11 @@ async def run_failover(
         if result.success or result.stream_started:
             # 成功已完成；或已发首包但出错（已用 SSE error 收尾）
             # 注意：scorer / cooldown / affinity / log_db 在 _try_channel 内完成
+            # 并发 slot release 挂到响应体 finally：stream 消费完 / 客户端断开都会释放
+            _attach_release_to_response(result.response, _release_once)
             return result.response
+        # 非成功：立即释放 slot，进入下一候选
+        _release_once()
 
         # 请求级 guard 错误：所有 openai 候选语义一致，切也无用，直接短路 4xx
         if result.outcome == "guard_error":
@@ -674,6 +701,91 @@ async def run_failover(
         retry_count += 1
         idx += 1
 
+    # 排队等位：pending 全部失败 / 全部饱和 → 汇总 saturated 候选去排队等任一空位
+    # （scheduler 已挑出的 + main loop 竞态占满的）
+    saturated_all: list[tuple[Channel, str]] = list(schedule_result.saturated) + saturated_extras
+    # 去重：同 (ch.key, model) 保留首次出现，保持原优先级
+    if saturated_all:
+        seen = set()
+        deduped: list[tuple[Channel, str]] = []
+        for ch, m in saturated_all:
+            k = (ch.key, m)
+            if k in seen:
+                continue
+            seen.add(k)
+            deduped.append((ch, m))
+        saturated_all = deduped
+
+    if saturated_all:
+        cc_cfg = cfg.get("concurrency") or {}
+        queue_wait_s = float(cc_cfg.get("queueWaitSeconds", 30))
+        # 不能超过整体 deadline
+        remaining_total = max(0.0, deadline_ts - time.time())
+        queue_timeout = min(queue_wait_s, remaining_total)
+        if queue_timeout > 0:
+            candidate_keys = [(ch.key, (ch, m)) for ch, m in saturated_all]
+            acquired = await concurrency.acquire_from_candidates(candidate_keys, queue_timeout)
+            if acquired is not None:
+                _ch_key, payload = acquired
+                ch, resolved_model = payload  # type: ignore[assignment]
+                attempt_order += 1
+                last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
+                last_ch_protocol = getattr(ch, "protocol", "anthropic")
+
+                attempt_id = log_db.record_retry_attempt(
+                    request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
+                )
+                release_done2 = False
+                def _release_q(_key=ch.key):
+                    nonlocal release_done2
+                    if release_done2:
+                        return
+                    release_done2 = True
+                    concurrency.release(_key)
+                try:
+                    result = await _try_channel(
+                        ch, resolved_model, body, is_stream, deadline_ts, start_time,
+                        fp_query, body.get("messages") or [], api_key_name, client_ip,
+                        request_id, retry_count, affinity_hit,
+                        ingress_protocol=ingress_protocol,
+                        client_key=client_key,
+                    )
+                except BaseException:
+                    _release_q()
+                    raise
+                last_result = result
+                log_db.update_retry_attempt(
+                    attempt_id,
+                    connect_ms=result.connect_ms, first_byte_ms=result.first_byte_ms,
+                    ended_at=time.time(), outcome=result.outcome,
+                    error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
+                )
+                if result.success or result.stream_started:
+                    _attach_release_to_response(result.response, _release_q)
+                    return result.response
+                _release_q()
+                # 排队拿到的这次也失败了 → 落入"全失败"分支
+                if _should_cooldown(result.outcome):
+                    cooldown.record_error(ch.key, resolved_model, result.error_detail)
+                scorer.record_failure(ch.key, resolved_model, connect_ms=result.connect_ms)
+                retry_count += 1
+            else:
+                # 队列超时 → 直接返回 429 rate_limit_error，不混入上游失败
+                total_ms = int((time.time() - start_time) * 1000)
+                queue_err_msg = (
+                    f"All candidate channels saturated; queue wait {queue_wait_s:.0f}s timed out."
+                )
+                await asyncio.to_thread(
+                    log_db.finish_error, request_id, queue_err_msg, retry_count,
+                    final_channel_key=None, final_channel_type=None, final_model=None,
+                    connect_ms=None, first_token_ms=None, total_ms=total_ms,
+                    http_status=429, affinity_hit=affinity_hit,
+                    upstream_protocol=None,
+                )
+                return _json_error_for_ingress(
+                    ingress_protocol, 429, "rate_limit_error", queue_err_msg,
+                )
+
     # 全失败
     err_detail = (last_result.error_detail if last_result else "no candidates") or "unknown"
     err_type = _err_type_from_outcome(
@@ -703,6 +815,36 @@ async def run_failover(
         upstream_protocol=last_ch_protocol,
     )
     return _json_error_for_ingress(ingress_protocol, status, err_type, msg)
+
+
+# ─── 并发 slot release 辅助 ──────────────────────────────────────
+
+def _attach_release_to_response(response: Response, release_fn) -> None:
+    """把 release_fn 挂到 StreamingResponse 的 body_iterator finally 上。
+
+    - StreamingResponse：wrap body_iterator，async for 结束后（含 CancelledError）
+      调 release_fn；这样客户端断开 / 流正常完成 / 异常 都会释放。
+    - 非 StreamingResponse（JSONResponse 等）：立即调用 release_fn。
+    """
+    if not isinstance(response, StreamingResponse):
+        try:
+            release_fn()
+        except Exception:
+            pass
+        return
+    original = response.body_iterator
+
+    async def _wrapped():
+        try:
+            async for chunk in original:
+                yield chunk
+        finally:
+            try:
+                release_fn()
+            except Exception:
+                pass
+
+    response.body_iterator = _wrapped()
 
 
 # ─── 单渠道尝试 ──────────────────────────────────────────────────

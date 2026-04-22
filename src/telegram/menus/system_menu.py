@@ -10,7 +10,7 @@ import json
 import re
 from typing import Any
 
-from ... import config
+from ... import concurrency, config
 from .. import states, ui
 from . import main as main_menu
 
@@ -55,7 +55,8 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("🚦 选择模式", "sys:show:chsel")],
         [ui.btn("📈 配额监控", "sys:show:quota"),
          ui.btn("🔔 通知设置", "sys:show:notif")],
-        [ui.btn("🛡 首包黑名单", "sys:show:blacklist")],
+        [ui.btn("🛡 首包黑名单", "sys:show:blacklist"),
+         ui.btn("⚡ 并发限制", "sys:show:concurrency")],
         [ui.btn("◀ 返回主菜单", "menu:main")],
     ])
     return text, kb
@@ -845,6 +846,12 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         _bl_del_exec(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data == "sys:bl_add_ch":      _bl_add_ch(chat_id, message_id, cb_id); return True
 
+    # 并发限制
+    if data == "sys:show:concurrency":        _show_concurrency(chat_id, message_id, cb_id); return True
+    if data == "sys:cc_toggle":               _on_cc_toggle(chat_id, message_id, cb_id); return True
+    if data == "sys:edit:cc_queue_wait":      _edit_cc_queue_wait(chat_id, message_id, cb_id); return True
+    if data == "sys:edit:cc_default_max":     _edit_cc_default_max(chat_id, message_id, cb_id); return True
+
     return False
 
 
@@ -873,4 +880,141 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         _on_quota_interval_input(chat_id, text); return True
     if action == "sys_quota_threshold":
         _on_quota_threshold_input(chat_id, text); return True
+    if action == "sys_cc_queue_wait":
+        _on_cc_queue_wait_input(chat_id, text); return True
+    if action == "sys_cc_default_max":
+        _on_cc_default_max_input(chat_id, text); return True
     return False
+
+
+# ─── 并发限制 ─────────────────────────────────────────────────────
+
+def _show_concurrency(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    cfg = config.get()
+    cc_cfg = cfg.get("concurrency") or {}
+    enabled = bool(cc_cfg.get("enabled", True))
+    queue_wait = int(cc_cfg.get("queueWaitSeconds", 30))
+    default_max = int(cc_cfg.get("defaultMaxConcurrent", 0))
+
+    totals = concurrency.totals()
+    snap = concurrency.snapshot()
+
+    lines = [
+        "⚡ <b>渠道并发限制</b>",
+        "",
+        f"总开关: <code>{'开' if enabled else '关'}</code>",
+        f"队列等待: <code>{queue_wait}s</code>（全满时最长排队，超时返回 429）",
+        f"默认上限: <code>{default_max if default_max > 0 else '不限'}</code>"
+        " （渠道未配 <code>maxConcurrent</code> 时用这个）",
+        "",
+        f"当前在途: <b>{totals['in_flight']}</b> · 排队中: <b>{totals['waiting']}</b>"
+        f" · 追踪渠道: {totals['tracked_channels']}",
+    ]
+
+    if snap:
+        lines.append("")
+        lines.append("📊 <b>渠道分布</b>")
+        for row in snap[:20]:  # 最多展示 20 条，避免超长
+            ck = row["channel_key"]
+            inf = row["in_flight"]
+            mx = row["max_concurrent"]
+            wt = row["waiting"]
+            if row["unlimited"]:
+                usage = f"{inf}/∞"
+            else:
+                usage = f"{inf}/{mx}"
+                if inf >= mx and mx > 0:
+                    usage = "🔴 " + usage
+                elif mx > 0 and inf >= mx * 0.8:
+                    usage = "🟡 " + usage
+            wait_s = f" · 排队 {wt}" if wt > 0 else ""
+            lines.append(f"  <code>{ui.escape_html(ck)}</code> · {usage}{wait_s}")
+        if len(snap) > 20:
+            lines.append(f"  <i>...（还有 {len(snap) - 20} 个未列出）</i>")
+    else:
+        lines.append("")
+        lines.append("<i>暂无活跃渠道记录（服务启动后还没处理过请求）。</i>")
+
+    lines.append("")
+    lines.append("<i>提示：每个渠道的 <code>maxConcurrent</code> 在「🔀 渠道管理」"
+                 "或「🔐 管理 OAuth」对应渠道的详情页设置。</i>")
+
+    kb = ui.inline_kb([
+        [ui.btn(
+            "🔴 关闭并发限制" if enabled else "🟢 开启并发限制",
+            "sys:cc_toggle",
+        )],
+        [ui.btn("✏ 修改队列等待", "sys:edit:cc_queue_wait"),
+         ui.btn("✏ 修改默认上限", "sys:edit:cc_default_max")],
+        [ui.btn("🔄 刷新", "sys:show:concurrency")],
+        [ui.btn("◀ 返回设置", "menu:settings")],
+    ])
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=kb)
+
+
+def _on_cc_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id, "已切换")
+    cfg = config.get()
+    cur = bool((cfg.get("concurrency") or {}).get("enabled", True))
+    new_val = not cur
+    def _mut(c):
+        c.setdefault("concurrency", {})["enabled"] = new_val
+    config.update(_mut)
+    _show_concurrency(chat_id, message_id, "")
+
+
+def _edit_cc_queue_wait(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "sys_cc_queue_wait")
+    ui.edit(
+        chat_id, message_id,
+        "请输入队列等待时长（秒，整数 ≥0；0 表示不排队直接 429）：\n"
+        "例：<code>30</code>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:show:concurrency")]]),
+    )
+
+
+def _on_cc_queue_wait_input(chat_id: int, text: str) -> None:
+    try:
+        v = int((text or "").strip())
+        if v < 0:
+            raise ValueError
+    except ValueError:
+        ui.send(chat_id, "❌ 需要非负整数，请重新输入：")
+        return
+    def _mut(c):
+        c.setdefault("concurrency", {})["queueWaitSeconds"] = v
+    config.update(_mut)
+    states.clear_state(chat_id)
+    ui.send(chat_id, f"✅ 队列等待已更新为 <code>{v}s</code>")
+    send_new(chat_id)
+
+
+def _edit_cc_default_max(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "sys_cc_default_max")
+    ui.edit(
+        chat_id, message_id,
+        "请输入默认最大并发数（整数 ≥0；0 表示不限制）：\n"
+        "此值在各渠道未设置 <code>maxConcurrent</code> 时生效。\n\n"
+        "例：<code>5</code>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:show:concurrency")]]),
+    )
+
+
+def _on_cc_default_max_input(chat_id: int, text: str) -> None:
+    try:
+        v = int((text or "").strip())
+        if v < 0:
+            raise ValueError
+    except ValueError:
+        ui.send(chat_id, "❌ 需要非负整数，请重新输入：")
+        return
+    def _mut(c):
+        c.setdefault("concurrency", {})["defaultMaxConcurrent"] = v
+    config.update(_mut)
+    states.clear_state(chat_id)
+    label = "不限" if v == 0 else str(v)
+    ui.send(chat_id, f"✅ 默认最大并发数已更新为 <code>{label}</code>")
+    send_new(chat_id)

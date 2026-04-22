@@ -342,6 +342,7 @@ def _detail_text_and_kb(name: str) -> tuple[Optional[str], Optional[dict]]:
         lines.append(f"🔌 协议: <code>{ui.escape_html(_PROTOCOL_LABEL.get(protocol, protocol))}</code>")
     lines += [
         f"🎭 CC 伪装: <code>{'开启' if ch.cc_mimicry else '关闭'}</code>",
+        f"⚡ 并发上限: <code>{getattr(ch, 'max_concurrent', 0) or '默认'}</code>",
         f"{'✅' if enabled else '⬛'} 状态: <code>{'enabled' if enabled else (ch.disabled_reason or 'disabled')}</code>",
         "",
         f"<b>📋 模型 ({len(ch.models)} 个)</b>",
@@ -1069,6 +1070,8 @@ def on_edit_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
          ui.btn("✏ URL",    f"ch:eurl:{short}")],
         [ui.btn("✏ API Key", f"ch:ekey:{short}"),
          ui.btn("✏ 模型列表", f"ch:emodels:{short}")],
+        [ui.btn(f"⚡ 并发上限（当前: {getattr(ch, 'max_concurrent', 0) or '默认'}）",
+                f"ch:emax:{short}")],
         [ui.btn(f"🔌 切换协议（当前: {_PROTOCOL_LABEL.get(protocol, protocol)}）",
                 f"ch:eproto:{short}")],
     ]
@@ -1150,6 +1153,17 @@ def on_edit_models(chat_id: int, message_id: int, cb_id: str, short: str) -> Non
                  "请输入新的模型列表（格式 <code>真实名[:别名]</code>，逗号/分号分隔）：")
 
 
+def on_edit_max_concurrent(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    _edit_prompt(
+        chat_id, message_id, short, "max",
+        "请输入该渠道的并发上限（整数 ≥0）：\n"
+        "• <code>0</code> = 使用全局默认（「⚙ 系统设置 → ⚡ 并发限制」里配的 defaultMaxConcurrent）\n"
+        "• 正整数 = 该渠道同时允许最多 N 个在途请求，超出则排队\n\n"
+        "例：<code>5</code>",
+    )
+
+
 def on_edit_cc_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     name = ui.resolve_code(short)
     ch = registry.get_channel(f"api:{name}") if name else None
@@ -1180,6 +1194,8 @@ def _do_edit(chat_id: int, short: str, field: str, value: Any) -> tuple[bool, st
             patch = {"apiKey": value}
         elif field == "models":
             patch = {"models": value}
+        elif field == "maxConcurrent":
+            patch = {"maxConcurrent": value}
         registry.update_api_channel(name, patch)
     except Exception as exc:
         return False, str(exc)
@@ -1195,8 +1211,11 @@ def handle_edit_text(chat_id: int, action: str, text: str) -> bool:
     def _ok_result(msg: str, target_short: str) -> None:
         ui.send_result(
             chat_id, msg,
-            extra_rows=[[ui.btn("◀ 返回该渠道详情", f"ch:view:{target_short}")]],
-            back_label="🏠 主菜单", back_callback="menu:main",
+            extra_rows=[
+                [ui.btn("◀ 返回渠道详情", f"ch:view:{target_short}")],
+                [ui.btn("📋 返回渠道列表", "menu:channel")],
+            ],
+            back_label="🏠 返回主菜单", back_callback="menu:main",
         )
 
     if action == "ch_edit_name":
@@ -1235,6 +1254,22 @@ def handle_edit_text(chat_id: int, action: str, text: str) -> bool:
             return True
         states.pop_state(chat_id)
         _ok_result("✅ API Key 已更新", short)
+        return True
+    if action == "ch_edit_max":
+        try:
+            v = int((text or "").strip())
+            if v < 0:
+                raise ValueError
+        except ValueError:
+            ui.send(chat_id, "❌ 需要非负整数，请重新输入：")
+            return True
+        ok, result = _do_edit(chat_id, short, "maxConcurrent", v)
+        if not ok:
+            ui.send(chat_id, f"❌ {ui.escape_html(result)}")
+            return True
+        states.pop_state(chat_id)
+        label = "默认" if v == 0 else str(v)
+        _ok_result(f"✅ 并发上限已更新为 <code>{label}</code>", short)
         return True
     if action == "ch_edit_models":
         try:
@@ -1312,6 +1347,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         on_edit_models(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:ecc:"):
         on_edit_cc_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:emax:"):
+        on_edit_max_concurrent(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:eproto:"):
         on_edit_protocol(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:seproto:"):

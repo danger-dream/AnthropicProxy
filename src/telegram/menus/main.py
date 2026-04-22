@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from ... import __version__, affinity, config, log_db, oauth_manager, public_ip, state_db
+from ... import __version__, affinity, concurrency, config, log_db, oauth_manager, public_ip, state_db
 from ...oauth_ids import account_key as _account_key
 from ...channel import registry
 from .. import ui
@@ -110,6 +110,25 @@ def _overview() -> str:
         f"🔀 API 渠道: {api_enabled}/{len(api_channels)} 可用 · registry {total_registered}",
         f"🔑 下游 Key: {len(api_keys)} 个 · 🔗 亲和绑定 {affinity.count()}",
     ]
+
+    # 并发队列（总开关关闭时标注为"关"，开启时显示在途 / 排队 / 追踪渠道数）
+    cc_cfg = cfg.get("concurrency") or {}
+    if bool(cc_cfg.get("enabled", True)):
+        cc_totals = concurrency.totals()
+        inf = cc_totals["in_flight"]
+        wait = cc_totals["waiting"]
+        track = cc_totals["tracked_channels"]
+        icon = "⚡"
+        if wait > 0:
+            icon = "🟡"  # 有排队 → 有压力
+        elif inf == 0 and track == 0:
+            icon = "💤"  # 冷启动
+        lines.append(
+            f"{icon} 并发: 在途 <b>{inf}</b> · 排队 <b>{wait}</b>"
+            f" · 追踪 {track} 个渠道"
+        )
+    else:
+        lines.append("⚡ 并发: <code>关闭</code>")
 
     # 配额预警提示
     if quota_hot > 0:

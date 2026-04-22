@@ -185,6 +185,7 @@ def add_api_channel(entry: dict) -> dict:
             "protocol": protocol,
             "models": list(entry.get("models") or []),
             "cc_mimicry": bool(entry.get("cc_mimicry", default_cc)),
+            "maxConcurrent": int(entry.get("maxConcurrent", 0) or 0),
             "enabled": bool(entry.get("enabled", True)),
             "disabled_reason": None,
         }
@@ -238,6 +239,11 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
         if "enabled" in patch:
             target["enabled"] = bool(patch["enabled"])
             target["disabled_reason"] = None if patch["enabled"] else "user"
+        if "maxConcurrent" in patch:
+            try:
+                target["maxConcurrent"] = max(0, int(patch["maxConcurrent"] or 0))
+            except (TypeError, ValueError):
+                target["maxConcurrent"] = 0
         if "name" in patch:
             target["name"] = patch["name"]
 
@@ -255,6 +261,8 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
         cooldown.rename_channel(old_key, new_key)
         affinity.rename_channel(old_key, new_key)
         affinity.client_rename_channel(old_key, new_key)
+        from .. import concurrency
+        concurrency.rename_channel(old_key, new_key)
 
     rebuild_from_config()
     return {"name": new_name}
@@ -281,5 +289,7 @@ def delete_api_channel(name: str) -> bool:
     cooldown.clear(key)
     affinity.delete_by_channel(key)
     affinity.client_delete_by_channel(key)
+    from .. import concurrency
+    concurrency.forget_channel(key)
     rebuild_from_config()
     return True

@@ -63,6 +63,11 @@ class ApiChannel(Channel):
         self.cc_mimicry = bool(entry.get("cc_mimicry", True))
         self.enabled = bool(entry.get("enabled", True))
         self.disabled_reason = entry.get("disabled_reason")
+        # 并发限制：0 或缺省 → 用 concurrency.defaultMaxConcurrent（仍 0 则不限）
+        try:
+            self.max_concurrent = int(entry.get("maxConcurrent", 0) or 0)
+        except (TypeError, ValueError):
+            self.max_concurrent = 0
         # ApiChannel 只处理 anthropic 协议；openai-* 会被 registry factory 分派到
         # src/openai/channel/api_channel.py::OpenAIApiChannel。这里做防御性 assert
         # 保证配置中的 protocol 与实际类一致，避免误配置造成难查 bug。

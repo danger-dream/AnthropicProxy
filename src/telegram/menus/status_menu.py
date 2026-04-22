@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from ... import affinity, config, cooldown, log_db, oauth_manager, scorer, state_db
+from ... import affinity, concurrency, config, cooldown, log_db, oauth_manager, scorer, state_db
 from ...oauth_ids import account_key as _account_key
 from ...channel import registry
 from .. import ui
@@ -329,6 +329,53 @@ def _render_fastest_family(fam: str, items: list, tps_map: dict) -> list[str]:
     return out
 
 
+def _concurrency_block(cc_cfg: dict) -> list[str]:
+    """状态总览里的并发信息块：总计 + 配置 + 各渠道一行。"""
+    totals = concurrency.totals()
+    default_max = int(cc_cfg.get("defaultMaxConcurrent", 0))
+    queue_wait = int(cc_cfg.get("queueWaitSeconds", 30))
+    out = [
+        f"  在途 <b>{totals['in_flight']}</b>"
+        f" · 排队 <b>{totals['waiting']}</b>"
+        f" · 追踪 {totals['tracked_channels']} 个渠道",
+        f"  默认上限 <code>{default_max if default_max > 0 else '不限'}</code>"
+        f" · 队列等待 <code>{queue_wait}s</code>",
+    ]
+    snap = concurrency.snapshot()
+    # 只列"有在途 / 有排队 / 已饱和"的渠道，减少噪声
+    interesting = [
+        r for r in snap
+        if r["in_flight"] > 0 or r["waiting"] > 0
+        or (not r["unlimited"] and r["max_concurrent"] > 0
+            and r["in_flight"] >= r["max_concurrent"])
+    ]
+    if not interesting:
+        out.append("  <i>所有渠道均空闲。</i>")
+        return out
+
+    for row in interesting[:10]:
+        ck = row["channel_key"]
+        inf = row["in_flight"]
+        mx = row["max_concurrent"]
+        wt = row["waiting"]
+        if row["unlimited"]:
+            usage = f"{inf}/∞"
+            icon = "⚪"
+        else:
+            usage = f"{inf}/{mx}"
+            if inf >= mx and mx > 0:
+                icon = "🔴"
+            elif mx > 0 and inf >= mx * 0.8:
+                icon = "🟡"
+            else:
+                icon = "🟢"
+        wait_part = f" · 排队 <b>{wt}</b>" if wt > 0 else ""
+        out.append(f"  {icon} <code>{ui.escape_html(ck)}</code> · {usage}{wait_part}")
+    if len(interesting) > 10:
+        out.append(f"  <i>...还有 {len(interesting) - 10} 个未列出</i>")
+    return out
+
+
 def _compose() -> tuple[str, dict]:
     cfg = config.get()
     uptime = _fmt_uptime(time.time() - _SERVICE_START_TS)
@@ -388,6 +435,12 @@ def _compose() -> tuple[str, dict]:
     if quota_warn:
         lines += ["", "<b>📈 配额预警 (≥80%):</b>"]
         lines += quota_warn
+
+    # 并发队列（只要启用了并发限制就显示）
+    cc_cfg = cfg.get("concurrency") or {}
+    if bool(cc_cfg.get("enabled", True)):
+        lines += ["", "<b>⚡ 并发队列:</b>"]
+        lines += _concurrency_block(cc_cfg)
 
     # 问题渠道
     if problems:

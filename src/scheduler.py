@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from . import affinity, config, cooldown, fingerprint, scorer
+from . import affinity, concurrency, config, cooldown, fingerprint, scorer
 from .channel import registry
 from .channel.base import Channel
 
@@ -18,14 +18,18 @@ class ScheduleResult:
 
     def __init__(self, candidates: list[tuple[Channel, str]],
                  fp_query: Optional[str], affinity_hit: bool,
-                 client_key: Optional[str] = None):
+                 client_key: Optional[str] = None,
+                 saturated: Optional[list[tuple[Channel, str]]] = None):
         self.candidates = candidates
         self.fp_query = fp_query         # 本次请求计算得到的查询指纹（可用于后续事件记录）
         self.affinity_hit = affinity_hit
         self.client_key = client_key     # client-level affinity key（failover 写入用）
+        # 并发饱和（in_flight >= max）的候选：正常 candidates 全部失败后，
+        # failover 会把 saturated 作为"可排队等位"的备选集。
+        self.saturated: list[tuple[Channel, str]] = saturated or []
 
     def __bool__(self) -> bool:
-        return bool(self.candidates)
+        return bool(self.candidates) or bool(self.saturated)
 
 
 # ─── 筛选 ─────────────────────────────────────────────────────────
@@ -36,9 +40,15 @@ def _family(proto: str) -> str:
 
 
 def _filter_candidates(requested_model: str,
-                       ingress_protocol: str = "anthropic") -> list[tuple[Channel, str]]:
+                       ingress_protocol: str = "anthropic",
+                       ) -> tuple[list[tuple[Channel, str]], list[tuple[Channel, str]]]:
+    """返回 (available, saturated)：
+       available = 可立即尝试的候选；
+       saturated = 其它条件 OK 但当前并发满的候选（作为排队备选）。
+    """
     ingress_family = _family(ingress_protocol)
-    out: list[tuple[Channel, str]] = []
+    available: list[tuple[Channel, str]] = []
+    saturated: list[tuple[Channel, str]] = []
     for ch in registry.all_channels():
         if not ch.enabled:
             continue
@@ -52,8 +62,11 @@ def _filter_candidates(requested_model: str,
             continue
         if cooldown.is_blocked(ch.key, resolved):
             continue
-        out.append((ch, resolved))
-    return out
+        if concurrency.is_saturated(ch.key):
+            saturated.append((ch, resolved))
+            continue
+        available.append((ch, resolved))
+    return available, saturated
 
 
 # ─── 亲和匹配 ─────────────────────────────────────────────────────
@@ -141,8 +154,8 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
     if not requested_model:
         return ScheduleResult([], None, False)
 
-    candidates = _filter_candidates(requested_model, ingress_protocol)
-    if not candidates:
+    candidates, saturated = _filter_candidates(requested_model, ingress_protocol)
+    if not candidates and not saturated:
         return ScheduleResult([], None, False)
 
     if fp_query is None and ingress_protocol == "anthropic":
@@ -158,9 +171,11 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
 
     if mode == "smart":
         candidates = scorer.sort_by_score(candidates)
+        saturated = scorer.sort_by_score(saturated)
     # "order" 模式：按注册表原始顺序（config 中定义的顺序）
 
     candidates, affinity_hit = _apply_affinity(candidates, fp_query, cfg,
                                                client_key=client_key)
 
-    return ScheduleResult(candidates, fp_query, affinity_hit, client_key=client_key)
+    return ScheduleResult(candidates, fp_query, affinity_hit,
+                          client_key=client_key, saturated=saturated)

@@ -24,6 +24,10 @@ class OAuthChannel(Channel):
         self.display_name = self.email
         self.enabled = bool(account.get("enabled", True))
         self.disabled_reason = account.get("disabled_reason")
+        try:
+            self.max_concurrent = int(account.get("maxConcurrent", 0) or 0)
+        except (TypeError, ValueError):
+            self.max_concurrent = 0
 
         models = account.get("models") or []
         self.models: list[str] = list(models) if models else list(default_models)

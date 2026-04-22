@@ -974,6 +974,25 @@ def update_models(account_key: str, models: list[str]) -> None:
     config.update(mutate)
 
 
+def update_max_concurrent(account_key: str, max_concurrent: int) -> None:
+    """设置 OAuth 账户的并发上限。0 / 负数 → 用全局 defaultMaxConcurrent。"""
+    has_prov = ":" in account_key
+    target_provider, target_email = _split_ak(account_key)
+    v = max(0, int(max_concurrent or 0))
+
+    def mutate(cfg):
+        for acc in cfg.get("oauthAccounts", []):
+            if acc.get("email") != target_email:
+                continue
+            if has_prov:
+                acc_prov = _normalize_provider(acc.get("provider") or _DEFAULT_PROVIDER)
+                if acc_prov != target_provider:
+                    continue
+            acc["maxConcurrent"] = v
+            return
+    config.update(mutate)
+
+
 # ─── PKCE 登录 ───────────────────────────────────────────────────
 
 def pkce_generate() -> tuple[str, str]:
