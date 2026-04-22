@@ -365,7 +365,10 @@ def transform_request(body, email=""):
     if "context_management" in body:
         payload["context_management"] = body["context_management"]
     elif "thinking" in body:
-        payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
+        t = body["thinking"]
+        _thinking_enabled = isinstance(t, dict) and t.get("type") in ("enabled", "adaptive")
+        if _thinking_enabled:
+            payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
 
     if "output_config" in body:
         payload["output_config"] = body["output_config"]
