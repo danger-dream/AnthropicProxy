@@ -225,6 +225,29 @@ def delete_message(chat_id: int, message_id: int) -> Optional[dict]:
     return api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
 
 
+def send_photo(chat_id: int, path: str, caption: str = "") -> Optional[dict]:
+    """发送本地图片文件。用于图片日志的「查看图片」按钮。"""
+    if not _bot_token:
+        return None
+    url = f"https://api.telegram.org/bot{_bot_token}/sendPhoto"
+    try:
+        session = _get_session()
+        with open(path, "rb") as f:
+            data: dict[str, Any] = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = caption
+                data["parse_mode"] = "HTML"
+            resp = session.post(url, data=data, files={"photo": (path.rsplit("/", 1)[-1], f)})
+        result = resp.json()
+        if isinstance(result, dict) and result.get("ok"):
+            return result
+        print(f"[tg] sendPhoto not ok: {str(result)[:200]}")
+        return result
+    except Exception as exc:
+        print(f"[tg] sendPhoto failed: {exc}")
+        return None
+
+
 def set_my_commands(commands: list[dict]) -> Optional[dict]:
     return api("setMyCommands", {"commands": commands})
 

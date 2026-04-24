@@ -26,8 +26,9 @@ state.db.pre_composite_key.bak
 *.db-shm
 *.db-wal
 
-# 运行日志
+# 运行日志 / 图片缓存
 logs/
+images/
 *.log
 
 # 设备/实例身份

@@ -28,10 +28,13 @@ def _import_modules():
         sys.path.insert(0, root)
     from src import config, state_db
     from src.openai.transform import stream_c2r
+    from src.transform import cc_mimicry, standard
     return {
         "config": config,
         "state_db": state_db,
         "stream_c2r": stream_c2r,
+        "cc_mimicry": cc_mimicry,
+        "standard": standard,
     }
 
 
@@ -144,3 +147,69 @@ def test_stream_c2r_preserves_all_completed_output_items(m):
     assert output[2]["type"] == "message"
     assert output[2]["content"][0]["text"] == "world"
     assert completed["output_text"] == "hello world"
+
+
+def test_anthropic_transforms_default_stream_false(m):
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    std = m["standard"].standard_transform(body)
+    cc, _ = m["cc_mimicry"].transform_request(body)
+    assert std["stream"] is False
+    assert cc["stream"] is False
+
+
+def test_restore_tool_names_only_protocol_tool_name_fields(m):
+    cc = m["cc_mimicry"]
+    dynamic_map = {"original_tool": "fake_tool"}
+    event = {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "fake_tool",
+            "input": {},
+        },
+    }
+    text_event = {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "text_delta", "text": "fake_tool cc_sess_list"},
+    }
+    raw = (
+        "event: content_block_start\n"
+        "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+        "event: content_block_delta\n"
+        "data: " + json.dumps(text_event, ensure_ascii=False) + "\n\n"
+    ).encode("utf-8")
+
+    restored = cc._restore_tool_names_in_chunk(raw, dynamic_map).decode("utf-8")
+    blocks = _parse_responses_events([restored.encode("utf-8")])
+    assert blocks[0][1]["content_block"]["name"] == "original_tool"
+    assert blocks[1][1]["delta"]["text"] == "fake_tool cc_sess_list"
+
+
+def test_restore_static_tool_prefix_only_protocol_tool_name_fields(m):
+    cc = m["cc_mimicry"]
+    obj = {
+        "type": "message",
+        "content": [
+            {"type": "text", "text": "cc_sess_list should stay in text"},
+            {"type": "tool_use", "id": "toolu_1", "name": "cc_sess_list", "input": {}},
+        ],
+    }
+    raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    restored = json.loads(cc._restore_tool_names_in_chunk(raw).decode("utf-8"))
+    assert restored["content"][0]["text"] == "cc_sess_list should stay in text"
+    assert restored["content"][1]["name"] == "sessions_list"
+
+
+def test_restore_tool_name_field_in_incomplete_sse_json(m):
+    cc = m["cc_mimicry"]
+    raw = b'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"cc_sess_list"'
+    restored = cc._restore_tool_names_in_chunk(raw)
+    assert b'"name":"sessions_list"' in restored
+    assert b'cc_sess_list' not in restored

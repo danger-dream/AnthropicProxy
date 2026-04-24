@@ -442,7 +442,7 @@ def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
     # 只有存在 OAuth 账号的冷却条目时才显示"清除所有错误"（避免空操作按钮）
     if cd_keys_any:
         rows.append([ui.btn(f"🧹 清除所有账户错误（{len(cd_keys_any)} 个）", f"oa:clear_all_errors:{page}")])
-    rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
+    rows.append([ui.btn("🖼 图片生成", "img:show"), ui.btn("◀ 返回主菜单", "menu:main")])
     return ui.truncate(text), ui.inline_kb(rows)
 
 

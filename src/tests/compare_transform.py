@@ -314,21 +314,31 @@ def compare_headers(cc_mod, ap_mod, token="fake_token_for_test"):
 
 
 def compare_restore(cc_mod, ap_mod):
-    """测试 _restore_tool_names_in_chunk 还原逻辑。"""
+    """测试 _restore_tool_names_in_chunk 还原逻辑。
+
+    注：请求构造仍要求与 cc-proxy 字节级一致；响应还原这里有意偏离 cc-proxy：
+    只还原协议 JSON 里的 tool_use/server_tool_use.name，不能再全 chunk 字节替换，
+    否则会误伤正文文本。
+    """
+    _ = cc_mod  # 保留签名，方便 main 调用结构不变
     cases = [
-        (b"the cc_sess_list method was called", None),
-        (b'{"name":"cc_ses_get"}', None),
+        (b"the cc_sess_list method was called", None,
+         b"the cc_sess_list method was called"),
+        (b'{"name":"cc_ses_get"}', None,
+         b'{"name":"cc_ses_get"}'),
+        (b'{"type":"tool_use","name":"cc_ses_get","input":{}}', None,
+         b'{"type":"tool_use","name":"session_get","input":{}}'),
         (b'{"type":"tool_use","name":"analyze_too00","input":{}}',
-         {"tool_alpha": "analyze_too00"}),
+         {"tool_alpha": "analyze_too00"},
+         b'{"type":"tool_use","name":"tool_alpha","input":{}}'),
     ]
     all_ok = True
-    for i, (chunk, dmap) in enumerate(cases):
-        a = cc_mod._restore_tool_names_in_chunk(chunk, dmap)
-        b = ap_mod._restore_tool_names_in_chunk(chunk, dmap)
-        if a == b:
-            print(f"  [ OK ] restore_tool_names case {i}: {len(a)}B -> {a!r}")
+    for i, (chunk, dmap, expected) in enumerate(cases):
+        got = ap_mod._restore_tool_names_in_chunk(chunk, dmap)
+        if got == expected:
+            print(f"  [ OK ] restore_tool_names case {i}: {len(got)}B -> {got!r}")
         else:
-            print(f"  [FAIL] restore case {i}: cc={a!r} ap={b!r}")
+            print(f"  [FAIL] restore case {i}: expected={expected!r} got={got!r}")
             all_ok = False
     return all_ok
 

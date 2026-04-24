@@ -31,7 +31,7 @@ def standard_transform(body: dict) -> dict:
         "model": body["model"],
         "messages": messages,
         "max_tokens": body.get("max_tokens", 4096),
-        "stream": body.get("stream", True),
+        "stream": body.get("stream", False),
     }
 
     # system 字段：原样保留；若是 list，末 block 打 ephemeral 1h 断点

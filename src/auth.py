@@ -46,6 +46,17 @@ def validate(headers) -> tuple[Optional[str], list[str], Optional[str]]:
     return None, [], "Invalid API key"
 
 
+def images_allowed(key_name: Optional[str]) -> bool:
+    """该 Key 是否允许调用 Parrot 图片生成/编辑接口。默认 False。"""
+    if not key_name:
+        return False
+    cfg = config.get()
+    entry = (cfg.get("apiKeys") or {}).get(key_name)
+    if not isinstance(entry, dict):
+        return False
+    return bool(entry.get("allowImages", False))
+
+
 def get_allowed_protocols(key_name: Optional[str]) -> list[str]:
     """返回该 Key 的 allowedProtocols 列表；空/未设 = 无限制（对所有入口开放）。
 

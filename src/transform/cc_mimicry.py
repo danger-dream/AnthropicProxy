@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import uuid
 
 import xxhash
@@ -300,16 +301,94 @@ def _sanitize_tool_name(name, dynamic_map=None):
     return name
 
 
-def _restore_tool_names_in_chunk(chunk_bytes, dynamic_map=None):
-    # 动态映射还原（假名→原名），长的先替换避免子串冲突
+def _restore_tool_name_value(name, dynamic_map=None):
+    """只还原协议里的工具名值，避免全 chunk 替换误伤正文文本。"""
+    if not isinstance(name, str):
+        return name
     if dynamic_map:
-        sorted_items = sorted(dynamic_map.items(), key=lambda x: len(x[1]), reverse=True)
-        for original, fake in sorted_items:
-            chunk_bytes = chunk_bytes.replace(fake.encode(), original.encode())
-    # 静态映射还原
+        for original, fake in dynamic_map.items():
+            if name == fake:
+                return original
     for prefix, replacement in TOOL_NAME_REWRITES.items():
-        chunk_bytes = chunk_bytes.replace(replacement.encode(), prefix.encode())
-    return chunk_bytes
+        if name.startswith(replacement):
+            return prefix + name[len(replacement):]
+    return name
+
+
+def _restore_tool_names_in_obj(obj, dynamic_map=None):
+    """递归处理 JSON 对象，但只改 tool_use/server_tool_use 的 name 字段。"""
+    if isinstance(obj, list):
+        return [_restore_tool_names_in_obj(x, dynamic_map) for x in obj]
+    if not isinstance(obj, dict):
+        return obj
+
+    out = {k: _restore_tool_names_in_obj(v, dynamic_map) for k, v in obj.items()}
+    if out.get("type") in ("tool_use", "server_tool_use") and "name" in out:
+        out["name"] = _restore_tool_name_value(out.get("name"), dynamic_map)
+    return out
+
+
+def _restore_tool_names_in_name_fields_bytes(data, dynamic_map=None):
+    """JSON 不完整时的兜底：只替换原始字节里的 "name":"..." 字段值。"""
+    if not isinstance(data, (bytes, bytearray)):
+        return data
+
+    def repl(match):
+        value = match.group(3).decode("utf-8", errors="replace")
+        restored = _restore_tool_name_value(value, dynamic_map)
+        if restored == value:
+            return match.group(0)
+        quote = match.group(2)
+        return b'"name"' + match.group(1) + quote + restored.encode("utf-8") + quote
+
+    # 只匹配未转义的 JSON name 字段，不碰 text_delta 里的普通正文。
+    return re.sub(rb'"name"(\s*:\s*)(["\'])([^"\']*)\2', repl, bytes(data))
+
+
+def _restore_tool_names_in_json_bytes(data, dynamic_map=None):
+    try:
+        obj = json.loads(data)
+    except Exception:
+        return _restore_tool_names_in_name_fields_bytes(data, dynamic_map)
+    obj = _restore_tool_names_in_obj(obj, dynamic_map)
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _restore_tool_names_in_sse_chunk(chunk_bytes, dynamic_map=None):
+    try:
+        text = chunk_bytes.decode("utf-8")
+    except Exception:
+        return chunk_bytes
+
+    out = []
+    changed = False
+    for line in text.splitlines(keepends=True):
+        line_body = line.rstrip("\r\n")
+        newline = line[len(line_body):]
+        if not line_body.startswith("data:"):
+            out.append(line)
+            continue
+        data = line_body[5:].strip()
+        if not data or data == "[DONE]":
+            out.append(line)
+            continue
+        restored = _restore_tool_names_in_json_bytes(data.encode("utf-8"), dynamic_map)
+        if restored != data.encode("utf-8"):
+            changed = True
+            out.append("data: " + restored.decode("utf-8") + newline)
+        else:
+            out.append(line)
+    if not changed:
+        return chunk_bytes
+    return "".join(out).encode("utf-8")
+
+
+def _restore_tool_names_in_chunk(chunk_bytes, dynamic_map=None):
+    # SSE：只处理 data 行里的 JSON，不碰 event 行 / 正文里的普通文本。
+    if b"data:" in chunk_bytes:
+        return _restore_tool_names_in_sse_chunk(chunk_bytes, dynamic_map)
+    # 非流式 JSON：只处理 tool_use/server_tool_use.name。
+    return _restore_tool_names_in_json_bytes(chunk_bytes, dynamic_map)
 
 
 # ─── 请求转换 ───（仅签名参数化 email；函数体与 cc-proxy 一致）
@@ -328,7 +407,7 @@ def transform_request(body, email=""):
         "messages": messages,
         "system": system_blocks,
         "max_tokens": body.get("max_tokens", 128000),
-        "stream": body.get("stream", True),
+        "stream": body.get("stream", False),
         "metadata": build_metadata(email),
         "temperature": 1,
     }

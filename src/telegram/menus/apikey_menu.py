@@ -109,6 +109,10 @@ def _fmt_allowed_protocols(protos: list[str]) -> str:
     return "🔌 允许协议: " + " · ".join(f"<b>{_PROTOCOL_LABEL.get(p, p)}</b>" for p in protos)
 
 
+def _fmt_allow_images(entry: dict) -> str:
+    return "🖼 图片接口: " + ("<b>允许</b>" if entry.get("allowImages") else "<b>禁止</b>")
+
+
 # ─── 列表视图 ─────────────────────────────────────────────────────
 
 def _render_list() -> tuple[str, dict]:
@@ -140,7 +144,8 @@ def _render_list() -> tuple[str, dict]:
             lines.append(
                 f"• <b>{ui.escape_html(name)}</b>\n"
                 f"  <code>{ui.escape_html(key_str)}</code>\n"
-                f"  {_fmt_allowed(allowed)}"
+                f"  {_fmt_allowed(allowed)}\n"
+                f"  {_fmt_allow_images(entry if isinstance(entry, dict) else {})}"
                 f"{tps_line}"
             )
         lines.append("\n<i>Tip: 单击 Key 即可复制。</i>")
@@ -198,6 +203,9 @@ def _render_detail(name: str) -> tuple[Optional[str], Optional[dict]]:
     lines.append(_fmt_allowed_protocols(allowed_protos))
     if not allowed_protos:
         lines.append("  <i>（未限制时，该 Key 可同时用于 /v1/messages、/v1/chat/completions、/v1/responses）</i>")
+    lines.append("")
+    lines.append(_fmt_allow_images(entry))
+    lines.append("  <i>图片生成/编辑是单独权限，默认关闭。</i>")
 
     # 本月使用统计
     ms = _key_month_stats(name)
@@ -221,9 +229,11 @@ def _render_detail(name: str) -> tuple[Optional[str], Optional[dict]]:
             )
 
     short = _short_of(name)
+    img_label = "🖼 禁用图片接口" if entry.get("allowImages") else "🖼 允许图片接口"
     rows = [
         [ui.btn("🎯 编辑允许模型", f"ak:perm:{short}")],
         [ui.btn("🔌 编辑允许协议", f"ak:proto:{short}")],
+        [ui.btn(img_label, f"ak:img:{short}")],
         [ui.btn("🗑 删除", f"ak:del:{short}")],
         [ui.btn("◀ 返回列表", "menu:apikey")],
     ]
@@ -271,6 +281,7 @@ def on_add_name_input(chat_id: int, text: str) -> None:
         cfg.setdefault("apiKeys", {})[name] = {
             "key": api_key,
             "allowedModels": [],
+            "allowImages": False,
         }
     config.update(_mutate)
     states.pop_state(chat_id)
@@ -330,6 +341,29 @@ def on_del_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
              ui.btn("🏠 主菜单", "menu:main")],
         ]),
     )
+
+
+def on_images_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    name = _name_of(short)
+    entry = _get_entry(name) if name else None
+    if entry is None:
+        ui.answer_cb(cb_id, "未找到 Key")
+        show(chat_id, message_id)
+        return
+
+    def _mutate(cfg):
+        keys = cfg.setdefault("apiKeys", {})
+        cur = keys.get(name)
+        if isinstance(cur, str):
+            cur = {"key": cur, "allowedModels": [], "allowImages": False}
+            keys[name] = cur
+        if isinstance(cur, dict):
+            cur["allowImages"] = not bool(cur.get("allowImages", False))
+    config.update(_mutate)
+    ui.answer_cb(cb_id, "已切换")
+    text, kb = _render_detail(name)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 允许模型多选 ────────────────────────────────────────────────
@@ -638,6 +672,9 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data.startswith("ak:del:"):
         on_del_confirm(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:img:"):
+        on_images_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2])
         return True
 
     # 允许模型多选

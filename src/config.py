@@ -26,6 +26,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "apiKeys": {},
     "oauthAccounts": [],
     "channels": [],
+    "images": {
+        "enabled": True,
+        "mainModel": "gpt-5.4-mini",
+        "toolModel": "gpt-image-2",
+        "disabledAccounts": [],
+        "cacheEnabled": False,
+        "cachePath": "images",
+        "cacheRetentionDays": 0,
+        "cacheMaxBytes": 1073741824,
+        "accountCooldownSeconds": 300,
+        "requestTimeoutSeconds": 180,
+        "maxPromptChars": 4000,
+        "maxInputImageBytes": 20971520,
+        "dbPath": "image_logs.db",
+    },
     "timeouts": {
         "connect": 10,
         "firstByte": 30,
@@ -242,6 +257,10 @@ def _normalize_api_keys(cfg: dict) -> bool:
                 continue
             if "allowedModels" not in v:
                 v["allowedModels"] = []
+                changed = True
+            if "allowImages" not in v:
+                # 新增图片接口权限默认关闭，避免老 Key 自动获得新能力。
+                v["allowImages"] = False
                 changed = True
         else:
             # 其它类型（list / None 等）视为无效

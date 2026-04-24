@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src import (
     __version__,
     affinity, auth, config, cooldown, errors, failover,
-    fingerprint, log_db, model_mapping, notifier, oauth_manager, probe,
+    fingerprint, image_db, log_db, model_mapping, notifier, oauth_manager, probe,
     public_ip, scheduler, scorer, state_db, upstream,
 )
 from src.channel import registry
@@ -75,6 +75,10 @@ async def _wal_checkpoint_loop():
             log_db.checkpoint()
         except Exception as e:
             print(f"[log_db] checkpoint failed: {e}")
+        try:
+            image_db.checkpoint()
+        except Exception as e:
+            print(f"[image_db] checkpoint failed: {e}")
 
 
 async def _stale_pending_loop():
@@ -110,6 +114,7 @@ async def lifespan(app: FastAPI):
     # 持久化层
     state_db.init()
     log_db.init()
+    image_db.init()
     await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
 
     # 老数据 provider 字段回填（无 provider 字段的账户默认 claude；幂等）
@@ -369,6 +374,20 @@ async def proxy_responses(request: Request):
     return await handle(request, ingress_protocol="responses")
 
 
+@app.post("/v1/images/generate")
+async def proxy_images_generate(request: Request):
+    """Parrot 封装版图片生成入口：prompt + 可选 size。"""
+    from src.openai.images_simple import handle_generate
+    return await handle_generate(request)
+
+
+@app.post("/v1/images/edit")
+async def proxy_images_edit(request: Request):
+    """Parrot 封装版图片编辑入口：prompt + image + 可选 size。"""
+    from src.openai.images_simple import handle_edit
+    return await handle_edit(request)
+
+
 @app.post("/v1/messages")
 async def proxy_messages(request: Request):
     start_time = time.time()
@@ -410,7 +429,7 @@ async def proxy_messages(request: Request):
             f"(allowed: {', '.join(allowed_models) or 'none'})",
         )
 
-    is_stream = bool(body.get("stream", True))
+    is_stream = bool(body.get("stream", False))
     messages = body.get("messages") or []
     tools = body.get("tools") or []
 

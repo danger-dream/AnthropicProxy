@@ -21,7 +21,7 @@ from typing import Optional
 
 from . import states, ui
 from .menus import (
-    apikey_menu, channel_menu, help_menu, logs_menu, mapping_menu,
+    apikey_menu, channel_menu, help_menu, image_menu, logs_menu, mapping_menu,
     oauth_defaults_menu, oauth_menu, stats_menu, status_menu, system_menu,
 )
 from .menus import main as main_menu
@@ -238,6 +238,10 @@ def _handle_callback(cb: dict) -> None:
     if oauth_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
+    # 图片生成菜单
+    if image_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
+
     # 渠道管理菜单
     if channel_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
@@ -293,6 +297,9 @@ def _handle_message(msg: dict) -> None:
             return
         if oauth_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by oauth_menu (action={action})")
+            return
+        if image_menu.handle_text_state(chat_id, action, text):
+            print(f"[tg] handled by image_menu (action={action})")
             return
         if channel_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by channel_menu (action={action})")
