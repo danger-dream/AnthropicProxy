@@ -502,10 +502,12 @@ class StreamTranslator:
                 "summary_index": 0,
                 "part": {"type": "summary_text", "text": item.text_buf},
             })
+        # 03-fix-plan 附录 #1: reasoning item 加 status:"completed"
         completed_item = {
             "type": "reasoning", "id": item.item_id,
             "summary": ([{"type": "summary_text", "text": item.text_buf}]
                         if item.summary_part_opened else []),
+            "status": "completed",
         }
         yield _emit("response.output_item.done", {
             "type": "response.output_item.done",
@@ -776,6 +778,7 @@ class StreamTranslator:
                 "type": "reasoning", "id": ri.item_id,
                 "summary": ([{"type": "summary_text", "text": ri.text_buf}]
                             if ri.summary_part_opened else []),
+                "status": "completed",
             }))
         for fc in self.state.fc_by_chat_index.values():
             items.append((fc.output_index, {

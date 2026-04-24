@@ -236,7 +236,18 @@ class StreamTranslator:
 
     def _on_output_item_added(self, data: dict) -> Iterator[bytes]:
         item = data.get("item") or {}
-        if item.get("type") != "function_call":
+        item_type = item.get("type")
+        # 02-bug-findings #33: 上游连续 emit 多个 message item 时，
+        # 下游 chat 流应每个 message 一个 role chunk 来分段；
+        # 否则所有 text 会被合并到同一个 message 里、丢段落。
+        if item_type == "message":
+            # 第二次及以后看到 message item.added，强制再发 role chunk 让下游开新段
+            if self.state.role_sent:
+                # 重置标志让 _ensure_role_sent 再发一次 role chunk
+                self.state.role_sent = False
+                yield from self._ensure_role_sent()
+            return
+        if item_type != "function_call":
             return
         output_index = int(data.get("output_index", 0))
         tc_index = self.state.next_tc_index

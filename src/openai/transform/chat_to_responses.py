@@ -177,9 +177,10 @@ def _messages_to_input_items(messages: list) -> list:
             continue
 
         # system / developer / user
+        # 02-bug-findings #22: spec EasyInputMessage.role 同时支持 system 和 developer。
+        # 之前强制改名 system→developer，会让 system > developer 优先级的模型被弱化。
+        # 现在保留原 role 不动；developer 也直接透传。
         mapped_role = role or "user"
-        if mapped_role == "system":
-            mapped_role = "developer"  # Responses 推荐 developer
         items.append({
             "type": "message", "role": mapped_role,
             "content": _content_chat_to_responses(msg.get("content", "")),

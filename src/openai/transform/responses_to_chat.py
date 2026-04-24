@@ -260,10 +260,15 @@ def _input_items_to_messages(items: list) -> list:
 
         elif t == "function_call_output":
             _flush()
+            # 02-bug-findings #3: spec FunctionCallOutputItemParam.output 是
+            # oneOf {string, array<{InputTextContent|InputImageContent|InputFileContent}>}。
+            # array 时若直接放进 chat tool message.content，chat 上游会 400
+            # （tool message 只允许 string 或 array<{type:text}>）。
+            # 这里统一拍扁为字符串，仅取 input_text/output_text/text 部分。
             messages.append({
                 "role": "tool",
                 "tool_call_id": item.get("call_id") or "",
-                "content": item.get("output") or "",
+                "content": _flatten_function_call_output(item.get("output")),
             })
 
         elif t == "custom_tool_call":
@@ -318,6 +323,34 @@ def _input_items_to_messages(items: list) -> list:
     return messages
 
 
+def _flatten_function_call_output(output) -> str:
+    """02-bug-findings #3: spec FunctionCallOutputItemParam.output 可为 array<part>，
+    chat tool message.content 只接受 string 或 array<text>，统一拍扁为字符串。
+    """
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list):
+        parts: list[str] = []
+        for p in output:
+            if isinstance(p, dict):
+                t = p.get("type")
+                if t in ("input_text", "output_text", "text"):
+                    txt = p.get("text")
+                    if isinstance(txt, str):
+                        parts.append(txt)
+                # 其他 part type（image/file）丢失文本表示，跳过
+            elif isinstance(p, str):
+                parts.append(p)
+        return "".join(parts)
+    # 任何其他类型：dump 成 JSON 字符串
+    try:
+        return json.dumps(output, ensure_ascii=False)
+    except Exception:
+        return str(output)
+
+
 def _content_responses_to_chat(content) -> Any:
     """Responses message content[] → chat parts 或 string。"""
     if not isinstance(content, list):
@@ -344,8 +377,9 @@ def _content_responses_to_chat(content) -> Any:
                 if k in p:
                     f[k] = p[k]
             out.append({"type": "file", "file": f})
-        elif pt == "input_audio":
-            out.append({"type": "input_audio", "input_audio": p.get("input_audio") or {}})
+        # 02-bug-findings #6: spec ResponseInputContent 仅 oneOf
+        # {input_text, input_image, input_file}，没有 input_audio。该分支以前
+        # 是死代码（guard 已拦客户端发的 input_audio）；这里不再保留 fallback。
         elif pt == "refusal":
             # chat 里没有 refusal part；用空 text 占位，refusal 字段由 translate_response 单独带
             out.append({"type": "text", "text": ""})

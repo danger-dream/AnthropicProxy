@@ -31,3 +31,40 @@
 - stream_c2r 新增 `_CustomToolCallItem` 数据类与 `_handle_custom_tool_call_delta` 状态机，与 `_FunctionCallItem` 共享 output_index 顺序但事件名分别为 `response.custom_tool_call_input.delta/done`。
 - 同 chat 流的 type=custom tool_call 与 type=function tool_call 通过 `tc.get("type") == "custom"` 在首包识别；后续续包仅按 index 路由，**不会**因为续包不再带 type 而退化处理。
 - `_collect_output_items` 与 `_close_all_function_calls` 都更新为同时收集 function_call 与 custom_tool_call。
+
+## Patch 4
+
+### 设计说明
+
+- `chat_to_responses.translate_response` 新增 `_gather_annotations` helper，与 `_gather_function_calls` / `_gather_refusal` / `_gather_reasoning_summary` 同级。
+- `responses_to_chat.translate_response` 在构造 output_text part 时把 chat msg.annotations 直接列表拷贝过去（保持原 annotation dict 结构，不做格式判断；spec 与 chat 端 url_citation 等结构 1:1）。
+- stream_r2c #35：chat SSE 协议没有 annotation 增量事件，本实现把 annotation 累积到 state.annotations，由 `get_downstream_chat_assistant()` 汇总到 message.annotations 供 failover fingerprint_write_chat 等下游用途使用。流式过程中**不**主动 yield annotation 事件给下游 chat。
+
+## Patch 5
+
+### 设计说明
+
+- `RESPONSE_ERROR_CODES` 取自 `schemas_registry: ResponseError.code` enum 全部 18 个值；`_CHAT_TYPE_TO_RESP_CODE` 映射涵盖 OpenAI/Anthropic/常见上游的 error.type 主流命名。
+- stream_c2r._emit_failed 的 error 字段从 `{message, type}` 改为 spec 正式的 `{message, code}`，符合 ResponseError 形状。
+- #18 legacy delta.function_call：复用 _handle_tool_call_delta，固定 index=0，等价于把"老协议第一个函数调用"挂在 tool_calls[0]。
+- #10 assistant 全空 skip：此修复仅作用于 `t == "message" and role == "assistant"` 直接走 message 分支的情况；走 pending_assistant 分支（带 tool_calls）的逻辑由 `_flush()` 自然处理（content=None 与 tool_calls 共存合法）。
+
+## Patch 6
+
+### 偏离 / 调整
+
+1. **`test_openai_m3.py::test_c2r_translate_request_basics` 测试更新（必要）**
+   - 原断言 `items[0]["role"] == "developer"`，对应原"system→developer 强制改名"行为。
+   - Patch 6 / #22 修复后，system 保持原 role；测试改成断言 `"system"`。
+
+### 设计说明
+
+- 03-fix-plan 把 #44/#45/#46 SSE 多 data 行拼接列在 Patch 6，但生产中从未观察到。本 Patch 加了一个最低断言 (test_bug45_sse_multiple_data_lines_join) 验证不 raise；多 data 行的完整 SSE-spec 拼接（用 `\n` join）暂未实现，因为：
+  - 生产 chat / responses 上游都只发一行 data
+  - 改动会影响所有 SSE 解析路径，风险大于收益
+  - 列入 05-implementation-diary.md 的 TODO，需要时再做
+- #19（reasoning summary vs reasoning_text 区分）：当前实现把 summary 与 reasoning_text 都拼到 `reasoning_content`，下次回放全部当 summary。03 标 P2，影响仅限于"完整往返时 reasoning_text/summary 角色互换"。本 Patch 不动语义（保持 P0/P1 优先），列入 TODO。
+- #36（_stringify_tool_content 严格化）：assistant array content 的拍扁路径用 `_stringify_tool_content`，行为基本正确（仅取 text）。本 Patch 不重写为专用函数，保持现状；将来若发现 assistant content 中混入非 text/refusal part 才需要重构。
+- #38（reasoning 跨轮保留）：02 文档自己降级为低优；保持现状。
+- #44/#46 SSE [DONE] 处理：responses 流通常不发 [DONE]，本代码 silently no-op，符合预期，不动。
+- 附录小修：reasoning item 加 status:"completed"（已加）；GuardError 已支持 422（构造函数本身就接 status int，无需修改）。

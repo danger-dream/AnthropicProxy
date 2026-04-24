@@ -138,6 +138,19 @@ def guard_chat_to_responses(body: dict,
     if not isinstance(body, dict):
         _fail(400, "invalid_request_error", "request body must be a JSON object")
 
+    # 02-bug-findings #40: prediction 字段在 responses 没对应概念。
+    # 翻译时会被 drop，但客户端可能"以为"会做 prediction，实际无效。
+    # 不阻断（避免破坏现有客户端），但 log warning 让运维能看到。
+    if body.get("prediction") is not None:
+        try:
+            import logging
+            logging.getLogger("parrot.openai").warning(
+                "[guard] prediction field is dropped when routing to responses upstream"
+                " (no equivalent in Responses API); request continues without prediction"
+            )
+        except Exception:
+            pass
+
     if reject_on_multi_candidate:
         n = body.get("n")
         if isinstance(n, int) and n > 1:

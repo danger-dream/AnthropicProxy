@@ -187,8 +187,9 @@ def test_c2r_translate_request_basics(m):
                              "parameters": {"type": "object"}, "strict": False}]
     assert out["tool_choice"] == {"type": "function", "name": "get_w"}
     items = out["input"]
-    # 期望：developer message + user message + function_call item + function_call_output item
-    assert items[0]["type"] == "message" and items[0]["role"] == "developer"
+    # Patch 6 / #22: system role 不再被强制改为 developer，保持原 role
+    # 期望：system message + user message + function_call item + function_call_output item
+    assert items[0]["type"] == "message" and items[0]["role"] == "system"
     assert items[1]["type"] == "message" and items[1]["role"] == "user"
     assert items[1]["content"] == [{"type": "input_text", "text": "hi"}]
     # assistant with tool_calls: assistant message skipped (empty content), function_call item added
