@@ -123,6 +123,52 @@ def _zero() -> dict:
 # passthrough 路径会原样转发，跨变体路径由 guard 在 include 里拦截。
 
 
+# ─── ResponseUsage builder ───────────────────────────────────────
+#
+# spec: ResponseUsage（schemas_registry: ResponseUsage）required:
+#   - input_tokens, input_tokens_details, output_tokens, output_tokens_details, total_tokens
+# spec: input_tokens_details required: cached_tokens
+# spec: output_tokens_details required: reasoning_tokens
+#
+# 之前各 _usage_* 函数在 cached/reasoning 为 0 时省略整段 details，导致严格客户端
+# 反序列化失败（02-bug-findings #9）。本函数统一构造，cached/reasoning 默认 0。
+
+def build_response_usage(*, input_tokens: int = 0, output_tokens: int = 0,
+                          cached_tokens: int = 0, reasoning_tokens: int = 0,
+                          total_tokens: int | None = None) -> dict:
+    """按 spec ResponseUsage 构造 usage 字典；所有 required 字段始终写入。"""
+    in_tok = int(input_tokens or 0)
+    out_tok = int(output_tokens or 0)
+    return {
+        "input_tokens": in_tok,
+        # spec: ResponseUsage.input_tokens_details required
+        "input_tokens_details": {"cached_tokens": int(cached_tokens or 0)},
+        "output_tokens": out_tok,
+        # spec: ResponseUsage.output_tokens_details required
+        "output_tokens_details": {"reasoning_tokens": int(reasoning_tokens or 0)},
+        "total_tokens": int(total_tokens if total_tokens is not None else (in_tok + out_tok)),
+    }
+
+
+def build_chat_usage(*, prompt_tokens: int = 0, completion_tokens: int = 0,
+                     cached_tokens: int = 0, reasoning_tokens: int = 0,
+                     total_tokens: int | None = None) -> dict:
+    """构造 chat 侧 CompletionUsage，details 字段也始终写入。
+
+    spec: CompletionUsage 不强制 details required，但 02-bug-findings #9
+    要求四处统一为 0 也写 details，避免严格客户端因缺字段反序列化失败。
+    """
+    p_tok = int(prompt_tokens or 0)
+    c_tok = int(completion_tokens or 0)
+    return {
+        "prompt_tokens": p_tok,
+        "completion_tokens": c_tok,
+        "total_tokens": int(total_tokens if total_tokens is not None else (p_tok + c_tok)),
+        "prompt_tokens_details": {"cached_tokens": int(cached_tokens or 0)},
+        "completion_tokens_details": {"reasoning_tokens": int(reasoning_tokens or 0)},
+    }
+
+
 def reasoning_bridge_mode() -> str:
     """返回当前 reasoning 桥接模式。未设/非法值均回落 'passthrough'。"""
     try:

@@ -44,6 +44,13 @@ def guard_chat_ingress(body: dict) -> None:
     if not isinstance(body, dict):
         _fail(400, "invalid_request_error", "request body must be a JSON object")
 
+    # spec: CreateChatCompletionRequest.model required
+    # 02-bug-findings #2: missing model would KeyError to 500; convert to 400 here.
+    model = body.get("model")
+    if not model or not isinstance(model, str):
+        _fail(400, "invalid_request_error",
+              "missing required field 'model'", param="model")
+
     n = body.get("n")
     if isinstance(n, int) and n > 1:
         _fail(400, "invalid_request_error",
@@ -72,6 +79,13 @@ def guard_responses_ingress(body: dict, *, store_enabled: bool = True) -> None:
     """
     if not isinstance(body, dict):
         _fail(400, "invalid_request_error", "request body must be a JSON object")
+
+    # spec: CreateResponse.model required
+    # 02-bug-findings #2: cross-variant chat→responses also relies on body["model"]; pre-reject.
+    model = body.get("model")
+    if not model or not isinstance(model, str):
+        _fail(400, "invalid_request_error",
+              "missing required field 'model'", param="model")
 
     # background 字段静默剥除（无论 true/false）：
     # Codex OAuth 上游 /backend-api/codex/responses 不接受 background 参数，

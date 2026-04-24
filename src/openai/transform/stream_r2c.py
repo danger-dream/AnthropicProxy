@@ -179,6 +179,11 @@ class StreamTranslator:
         event_name, data = _parse_event_block(block)
         if event_name is None and data is None:
             return
+        # 02-bug-findings #20: 一旦观察到终态（completed/incomplete/failed/error），
+        # 后续任何事件（合规模型不会发，但兜底防御）都直接短路，避免改写已收尾的 state
+        # 也避免在 close() 之后通过 feed() 注入新 chunk（terminal_emitted 仅由 close 设）
+        if self.state.terminal_status is not None:
+            return
         # responses 事件在 MS-4 首版只处理关键子集；未识别的 event 静默丢弃
         if event_name == "response.output_item.added":
             yield from self._on_output_item_added(data or {})
@@ -376,7 +381,8 @@ def _finish_reason_for_responses(resp: dict, *, fallback: str) -> str:
 
 
 def _usage_resps_to_chat_stream(u: dict) -> dict:
-    """同 chat_to_responses._usage_resps_to_chat，但独立一份避免跨文件 import。"""
+    # 02-bug-findings #9: details fields must always be written.
+    from .common import build_chat_usage
     input_tokens = int(u.get("input_tokens", 0) or 0)
     output_tokens = int(u.get("output_tokens", 0) or 0)
     total = int(u.get("total_tokens", input_tokens + output_tokens) or 0)
@@ -384,13 +390,10 @@ def _usage_resps_to_chat_stream(u: dict) -> dict:
     out_details = u.get("output_tokens_details") or {}
     cached = int(in_details.get("cached_tokens", 0) or 0)
     reasoning = int(out_details.get("reasoning_tokens", 0) or 0)
-    res: dict = {
-        "prompt_tokens": input_tokens,
-        "completion_tokens": output_tokens,
-        "total_tokens": total,
-    }
-    if cached:
-        res["prompt_tokens_details"] = {"cached_tokens": cached}
-    if reasoning:
-        res["completion_tokens_details"] = {"reasoning_tokens": reasoning}
-    return res
+    return build_chat_usage(
+        prompt_tokens=input_tokens,
+        completion_tokens=output_tokens,
+        cached_tokens=cached,
+        reasoning_tokens=reasoning,
+        total_tokens=total,
+    )

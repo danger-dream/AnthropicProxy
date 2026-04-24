@@ -96,6 +96,18 @@ def _messages_to_input_items(messages: list) -> list:
                 "output": _stringify_tool_content(msg.get("content")),
             })
             continue
+        # spec: ChatCompletionRequestFunctionMessage (deprecated legacy)
+        # 02-bug-findings #15: role="function" 老协议原代码会落入 default 分支
+        # 被当 user 处理后发给 responses 上游会 400。应映射为 function_call_output。
+        # legacy 协议没有 tool_call_id 字段，用 name 充当 call_id（与老协议下
+        # assistant.function_call.name 同名占位，允许下游原话联走）。
+        if role == "function":
+            items.append({
+                "type": "function_call_output",
+                "call_id": msg.get("name") or "",
+                "output": _stringify_tool_content(msg.get("content")),
+            })
+            continue
         if role == "assistant":
             # 非官方 reasoning_content（DeepSeek 等 chat 生态）→ reasoning item，
             # 保持与上游产出时同构，避免历史 reasoning 丢失。drop 模式不映射。
@@ -396,6 +408,8 @@ def _status_to_finish_reason(resp: dict, *, has_tool_calls: bool) -> str:
 
 
 def _usage_resps_to_chat(u: dict) -> dict:
+    # 02-bug-findings #9: details fields must always be written.
+    from .common import build_chat_usage
     in_details = u.get("input_tokens_details") or {}
     out_details = u.get("output_tokens_details") or {}
     input_tokens = int(u.get("input_tokens", 0) or 0)
@@ -403,13 +417,10 @@ def _usage_resps_to_chat(u: dict) -> dict:
     cached = int(in_details.get("cached_tokens", 0) or 0)
     reasoning = int(out_details.get("reasoning_tokens", 0) or 0)
     total = int(u.get("total_tokens", input_tokens + output_tokens) or 0)
-    res: dict = {
-        "prompt_tokens": input_tokens,
-        "completion_tokens": output_tokens,
-        "total_tokens": total,
-    }
-    if cached:
-        res["prompt_tokens_details"] = {"cached_tokens": cached}
-    if reasoning:
-        res["completion_tokens_details"] = {"reasoning_tokens": reasoning}
-    return res
+    return build_chat_usage(
+        prompt_tokens=input_tokens,
+        completion_tokens=output_tokens,
+        cached_tokens=cached,
+        reasoning_tokens=reasoning,
+        total_tokens=total,
+    )

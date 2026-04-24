@@ -712,6 +712,8 @@ def _finish_reason_to_status(finish_reason: Optional[str],
 
 
 def _usage_chat_to_resps_stream(u: dict) -> dict:
+    # 02-bug-findings #9: details fields must always be written.
+    from .common import build_response_usage
     prompt_tokens = int(u.get("prompt_tokens", 0) or 0)
     completion_tokens = int(u.get("completion_tokens", 0) or 0)
     total_tokens = int(u.get("total_tokens", prompt_tokens + completion_tokens) or 0)
@@ -719,14 +721,10 @@ def _usage_chat_to_resps_stream(u: dict) -> dict:
     completion_details = u.get("completion_tokens_details") or {}
     cached = int(prompt_details.get("cached_tokens", 0) or 0)
     reasoning = int(completion_details.get("reasoning_tokens", 0) or 0)
-
-    res: dict = {
-        "input_tokens": prompt_tokens,
-        "output_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-    }
-    if cached:
-        res["input_tokens_details"] = {"cached_tokens": cached}
-    if reasoning:
-        res["output_tokens_details"] = {"reasoning_tokens": reasoning}
-    return res
+    return build_response_usage(
+        input_tokens=prompt_tokens,
+        output_tokens=completion_tokens,
+        cached_tokens=cached,
+        reasoning_tokens=reasoning,
+        total_tokens=total_tokens,
+    )

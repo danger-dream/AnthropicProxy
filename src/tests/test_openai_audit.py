@@ -463,18 +463,18 @@ def test_guard_conversation_null_allowed(m):
     """conversation=null / 空 dict：不应触发 guard 拒绝；只有非空 conv id 才拒。"""
     g = m["guard"]
 
-    # ingress guard：null 不拒
-    g.guard_responses_ingress({"conversation": None}, store_enabled=True)  # no raise
-    g.guard_responses_ingress({"conversation": {}}, store_enabled=True)    # no raise
-    g.guard_responses_ingress({"conversation": ""}, store_enabled=True)    # no raise
+    # ingress guard：null 不拒（带 model 满足 #2 校验，焦点在 conversation 字段）
+    g.guard_responses_ingress({"model": "x", "conversation": None}, store_enabled=True)  # no raise
+    g.guard_responses_ingress({"model": "x", "conversation": {}}, store_enabled=True)    # no raise
+    g.guard_responses_ingress({"model": "x", "conversation": ""}, store_enabled=True)    # no raise
     # 显式给值时拒
     try:
-        g.guard_responses_ingress({"conversation": "conv_xyz"}, store_enabled=True)
+        g.guard_responses_ingress({"model": "x", "conversation": "conv_xyz"}, store_enabled=True)
         assert False, "非空 conversation 应被拒"
     except g.GuardError as e:
         assert e.status == 400
 
-    # cross-variant guard 同理
+    # cross-variant guard 同理（cross-variant guard 不强制 model，但加上无副作用）
     g.guard_responses_to_chat({"conversation": None}, store_enabled=True)  # no raise
     try:
         g.guard_responses_to_chat({"conversation": {"id": "x"}}, store_enabled=True)
