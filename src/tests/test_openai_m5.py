@@ -357,7 +357,10 @@ async def test_e2e_first_then_followup(m):
     up_body = json.loads(router.last_request.content)
     msgs = up_body["messages"]
     assert msgs[0] == {"role": "user", "content": "hello"}
-    assert msgs[1] == {"role": "assistant", "content": "ok"}
+    # assistant 回喂 chat 上游时会带上 reasoning_content 空占位
+    # （DeepSeek thinking mode 兼容；其它上游忽略该字段）
+    assert msgs[1] == {"role": "assistant", "content": "ok",
+                       "reasoning_content": ""}
     assert msgs[2] == {"role": "user", "content": "follow up"}
     await mc2.aclose()
 

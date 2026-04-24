@@ -146,13 +146,34 @@ def resolve_current_input_items(body: dict) -> list:
 
 
 def _input_items_to_messages(items: list) -> list:
-    """input items → chat messages[]；function_call items 聚合到前一条 assistant。"""
+    """input items → chat messages[]；function_call items 聚合到前一条 assistant。
+
+    reasoning 处理（passthrough 模式）：
+      - 历史 reasoning item 的 summary_text / reasoning_text 拼接后，
+        写到紧随的 assistant message 的 `reasoning_content` 字段
+      - 所有 assistant 消息都会带上 `reasoning_content`（无内容时为空串）：
+        DeepSeek v4 thinking mode 要求每条 assistant 都带这个非官方字段，
+        其它 chat 上游会忽略该字段，兼容无影响
+      - drop 模式不写 reasoning_content（用户主动关闭桥接时不再增加字段）
+    """
+    from .common import reasoning_passthrough_enabled
+    bridge = reasoning_passthrough_enabled()
+
     messages: list[dict] = []
     pending_assistant: Optional[dict] = None
+    # 收集紧随下一条 assistant 之前的 reasoning 文本；遇到 user/system 跳轮时丢弃
+    pending_reasoning: list[str] = []
+
+    def _pop_reasoning() -> str:
+        text = "\n\n".join(s for s in pending_reasoning if s)
+        pending_reasoning.clear()
+        return text
 
     def _flush():
         nonlocal pending_assistant
         if pending_assistant is not None:
+            if bridge:
+                pending_assistant.setdefault("reasoning_content", _pop_reasoning())
             messages.append(pending_assistant)
             pending_assistant = None
 
@@ -189,8 +210,13 @@ def _input_items_to_messages(items: list) -> list:
                 }
                 if refusal_texts:
                     msg_out["refusal"] = "\n".join(refusal_texts)
+                if bridge:
+                    msg_out["reasoning_content"] = _pop_reasoning()
                 messages.append(msg_out)
             else:
+                # 非 assistant 的 message（user/system/tool）跳轮新上下文，
+                # 丢弃残留的 reasoning（避免给下一次 assistant 带上上轮的思考）
+                pending_reasoning.clear()
                 messages.append({
                     "role": role,
                     "content": _content_responses_to_chat(content_parts),
@@ -217,8 +243,19 @@ def _input_items_to_messages(items: list) -> list:
             })
 
         elif t == "reasoning":
-            # MS-3：历史 reasoning 不回喂 chat 上游（chat 无对应字段；MS-6 扩展）
-            pass
+            # passthrough 模式：聚合 summary_text / reasoning_text 给下一条 assistant 用
+            # drop 模式：全部忽略
+            if bridge:
+                for s in item.get("summary") or []:
+                    if isinstance(s, dict) and s.get("type") == "summary_text":
+                        txt = s.get("text")
+                        if isinstance(txt, str) and txt:
+                            pending_reasoning.append(txt)
+                for c in item.get("content") or []:
+                    if isinstance(c, dict) and c.get("type") == "reasoning_text":
+                        txt = c.get("text")
+                        if isinstance(txt, str) and txt:
+                            pending_reasoning.append(txt)
 
         elif t in (
             "web_search_call", "file_search_call", "computer_call",

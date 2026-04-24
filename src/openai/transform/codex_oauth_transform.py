@@ -217,6 +217,26 @@ def _normalize_codex_tools(body: dict) -> bool:
     return modified
 
 
+def _strip_reasoning_ids(body: dict) -> int:
+    """把 body.input 里 type=reasoning 的项目的 id 字段去掉（保留 summary/content）。
+
+    Codex OAuth 上游  时不能接受带 rs_* id 的 reasoning item，
+    会返回 404 "Item with id ... not found"。官方 Codex CLI 的做法是发
+    无 id 的 reasoning 项，把 summary/content 原样给模型看。
+
+    返回实际修改的条数。
+    """
+    inp = body.get("input")
+    if not isinstance(inp, list):
+        return 0
+    n = 0
+    for it in inp:
+        if isinstance(it, dict) and it.get("type") == "reasoning" and "id" in it:
+            it.pop("id", None)
+            n += 1
+    return n
+
+
 def apply_codex_oauth_transform(
     body: dict,
     *,
@@ -242,6 +262,12 @@ def apply_codex_oauth_transform(
     # 2) store / stream 强制
     body["store"] = False
     body["stream"] = True
+
+    # 2.5) store=false 时，input 中 reasoning items 携带的 rs_* id
+    #      会让上游按从持久化里取的语义查，结果 404
+    #      （Item with id 'rs_...' not found. Items are not persisted when store is set to false）。
+    #      Codex CLI 官方行为是无状态引用，直接剥掉 id 字段，保留 summary/content 给模型看。
+    _strip_reasoning_ids(body)
 
     # 3) 剥不支持字段
     for k in _STRIP_FIELDS_FOR_CODEX:

@@ -177,7 +177,9 @@ def guard_responses_to_chat(body: dict,
     - `previous_response_id`：MS-3 不接 Store，一律拒绝；
       Store 接入后（MS-5 起）仅在 Store 关闭时拒绝
     - `include` 包含 "reasoning.encrypted_content"：chat 上游没有 encrypted
-      概念 → 400（避免客户端误以为拿到了）
+      概念 → 静默从 include 列表中剥除（兼容客户端默认带这个开关的场景；
+      客户端拿到的 reasoning 块不会带 encrypted_content 字段，这与 chat
+      上游能力一致，不强迫客户端去识别上游协议来裁请求）
     - `conversation` / `background`：由 guard_responses_ingress 已拒
     """
     if not isinstance(body, dict):
@@ -225,11 +227,24 @@ def guard_responses_to_chat(body: dict,
               "conversation resource is not supported when routing to chat upstream",
               param="conversation")
 
-    # include：禁用 encrypted_content 的 include
+    # include：reasoning.encrypted_content 在 chat 上游不可得，
+    # 静默从 include 列表中剥除（兼容客户端默认带这个开关的场景），
+    # 不再 400 阻断请求。
     include = body.get("include")
     if isinstance(include, list):
+        stripped: list[str] = []
+        kept: list[Any] = []
         for inc in include:
-            if inc in ("reasoning.encrypted_content",):
-                _fail(400, "invalid_request_error",
-                      f"include '{inc}' is not available when routing to chat upstream",
-                      param="include")
+            if inc == "reasoning.encrypted_content":
+                stripped.append(inc)
+                continue
+            kept.append(inc)
+        if stripped:
+            body["include"] = kept
+            try:
+                import logging
+                logging.getLogger("parrot.openai").info(
+                    "[guard] include items stripped for chat upstream: %s", stripped
+                )
+            except Exception:
+                pass
