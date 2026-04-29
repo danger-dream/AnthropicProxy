@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from ... import affinity, config, cooldown, log_db, oauth_manager, state_db
+from ... import affinity, config, cooldown, log_db, oauth_errors, oauth_manager, state_db
 from ...oauth_ids import account_key as _account_key, split_account_key as _split_ak
 from ...oauth import openai as openai_provider
 from .. import states, ui
@@ -55,6 +55,21 @@ def _run_sync(coro):
         return asyncio.run(coro)
     except Exception as exc:
         return exc
+
+
+def _oauth_error_html(exc, *, provider: str, operation: str, indent: str = "") -> str:
+    """OAuth 错误的用户友好 HTML 文案；禁止把 raw httpx 异常直出到 TG。"""
+    return oauth_errors.format_oauth_error_html(
+        exc, provider=provider, operation=operation, indent=indent,
+    )
+
+
+def _replace_last_with_oauth_error(
+    lines: list[str], exc, *, provider: str, operation: str, indent: str = "  "
+) -> None:
+    lines[-1:] = _oauth_error_html(
+        exc, provider=provider, operation=operation, indent=indent,
+    ).splitlines()
 
 
 # ─── 时间 / 用量格式化 ────────────────────────────────────────────
@@ -611,9 +626,12 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
     ui.answer_cb(cb_id, "刷新中...")
 
+    provider = oauth_manager.provider_of(ak)
     result = _run_sync(oauth_manager.force_refresh(ak))
     if isinstance(result, Exception):
-        ui.send(chat_id, f"❌ 刷新失败: <code>{ui.escape_html(str(result))}</code>")
+        ui.send(chat_id, _oauth_error_html(
+            result, provider=provider, operation="refresh_token",
+        ))
         return
 
     _, email = _split_ak(ak)
@@ -644,8 +662,9 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         ui.answer_cb(cb_id, "刷新 Token 并发送探测请求...")
         tr = _run_sync(oauth_manager.force_refresh(ak))
         if isinstance(tr, Exception):
-            ui.send(chat_id,
-                    f"❌ 刷新 Token 失败: <code>{ui.escape_html(str(tr))}</code>")
+            ui.send(chat_id, _oauth_error_html(
+                tr, provider="openai", operation="refresh_token",
+            ))
             return
         ch = registry.get_channel(f"oauth:{ak}")
         if not isinstance(ch, OpenAIOAuthChannel):
@@ -653,15 +672,22 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             return
         pr = _run_sync(ch.probe_usage())
         if isinstance(pr, Exception):
-            ui.send(chat_id, f"❌ 探测失败: <code>{ui.escape_html(str(pr))}</code>")
+            ui.send(chat_id, _oauth_error_html(
+                pr, provider="openai", operation="probe_usage",
+            ))
             return
         text, kb = _detail_text_and_kb(ak, page=page)
         if pr.get("ok"):
             head = "✅ 已刷新 Token 并更新用量（探测请求成功）"
         else:
             reason = pr.get("reason", "?")
-            head = ("⚠ Token 已刷新，但用量探测未成功: "
-                    f"<code>{ui.escape_html(str(reason))[:200]}</code>")
+            head = (
+                "⚠ Token 已刷新，但用量探测未成功\n"
+                + oauth_errors.format_oauth_error_html(
+                    str(reason), provider="openai", operation="probe_usage",
+                    include_title=False,
+                )
+            )
         if text:
             ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
         return
@@ -669,7 +695,9 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
 
     usage_result = _run_sync(oauth_manager.fetch_usage(ak))
     if isinstance(usage_result, Exception):
-        ui.send(chat_id, f"❌ 获取用量失败: <code>{ui.escape_html(str(usage_result))}</code>")
+        ui.send(chat_id, _oauth_error_html(
+            usage_result, provider="claude", operation="fetch_usage",
+        ))
         return
     state_db.quota_save(ak, oauth_manager.flatten_usage(usage_result), email=email)
 
@@ -797,6 +825,8 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> 
         return
 
     lines: list[str] = ["🔄 <b>批量刷新 OAuth 用量</b>", ""]
+    success_count = 0
+    fail_count = 0
     resp = ui.send(chat_id, "\n".join(lines + ["⌛ 初始化..."]))
     if not resp or not resp.get("ok"):
         ui.send(chat_id, "❌ 无法创建进度消息")
@@ -838,25 +868,37 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> 
         if prov == "openai":
             tr = _run_sync(oauth_manager.force_refresh(ak))
             if isinstance(tr, Exception):
-                lines[-1] = f"  ❌ Token 刷新失败: <code>{ui.escape_html(str(tr))[:120]}</code>"
+                fail_count += 1
+                _replace_last_with_oauth_error(
+                    lines, tr, provider="openai", operation="refresh_token",
+                )
                 lines.append("")
                 _flush()
                 continue
             ch = registry.get_channel(f"oauth:{ak}")
             if not isinstance(ch, OpenAIOAuthChannel):
-                lines[-1] = "  ❌ 渠道未注册（需重启或重新加载）"
+                fail_count += 1
+                _replace_last_with_oauth_error(
+                    lines, "openai channel not registered", provider="openai", operation="probe_usage",
+                )
                 lines.append("")
                 _flush()
                 continue
             pr = _run_sync(ch.probe_usage())
             if isinstance(pr, Exception):
-                lines[-1] = f"  ❌ 探测异常: <code>{ui.escape_html(str(pr))[:120]}</code>"
+                fail_count += 1
+                _replace_last_with_oauth_error(
+                    lines, pr, provider="openai", operation="probe_usage",
+                )
                 lines.append("")
                 _flush()
                 continue
             if not pr.get("ok"):
+                fail_count += 1
                 reason = pr.get("reason", "?")
-                lines[-1] = f"  ❌ 探测失败: <code>{ui.escape_html(str(reason))[:120]}</code>"
+                _replace_last_with_oauth_error(
+                    lines, str(reason), provider="openai", operation="probe_usage",
+                )
                 lines.append("")
                 _flush()
                 continue
@@ -865,7 +907,10 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> 
         else:
             result = _run_sync(oauth_manager.fetch_usage(ak))
             if isinstance(result, Exception):
-                lines[-1] = f"  ❌ 获取失败: <code>{ui.escape_html(str(result))[:120]}</code>"
+                fail_count += 1
+                _replace_last_with_oauth_error(
+                    lines, result, provider="claude", operation="fetch_usage",
+                )
                 lines.append("")
                 _flush()
                 continue
@@ -876,6 +921,7 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> 
                 print(f"[oauth_menu] quota_save failed for {ak}: {exc}")
 
         # ─ 写入进度 + 评估禁用/恢复 ─
+        success_count += 1
         usage_str = _labels_for(usage)
         lines[-1] = f"  ✅ 刷新成功: {usage_str}"
 
@@ -909,7 +955,10 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> 
         lines.append("")
         _flush()
 
-    lines.append("📢 用量刷新完成，本消息 5 分钟后自动销毁。")
+    lines.append(
+        f"📢 用量刷新完成：成功 {success_count} 个，失败 {fail_count} 个。"
+    )
+    lines.append("本消息 5 分钟后自动销毁。")
     _flush()
 
     # ─ 刷新原始 OAuth 列表面板，让用户无需离开再进来 ─
@@ -1030,7 +1079,7 @@ def on_login_code_input(chat_id: int, text: str) -> None:
         )
     except Exception as exc:
         ui.send_result(chat_id,
-                       f"❌ Token 换取失败: <code>{ui.escape_html(str(exc))}</code>",
+                       _oauth_error_html(exc, provider="claude", operation="exchange_code"),
                        back_label="◀ 返回 OAuth 列表", back_callback="menu:oauth")
         return
 
@@ -1252,7 +1301,7 @@ def on_login_openai_code_input(chat_id: int, text: str) -> None:
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ Token 换取失败: <code>{ui.escape_html(str(exc))[:300]}</code>",
+            _oauth_error_html(exc, provider="openai", operation="exchange_code"),
             **_OA_NAV_OPENAI,
         )
         return
@@ -1286,8 +1335,7 @@ def on_set_rt_openai_input(chat_id: int, text: str) -> None:
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 刷新失败，refresh_token 可能无效: "
-            f"<code>{ui.escape_html(str(exc))[:300]}</code>",
+            _oauth_error_html(exc, provider="openai", operation="refresh_token"),
             **_OA_NAV_OPENAI,
         )
         return

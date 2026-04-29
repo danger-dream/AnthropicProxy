@@ -27,7 +27,7 @@ from typing import Any
 
 import httpx
 
-from . import cache_display, config, notifier, state_db
+from . import cache_display, config, notifier, oauth_errors, state_db
 from .oauth import (
     DEFAULT_PROVIDER as _DEFAULT_PROVIDER,
     VALID_PROVIDERS as _VALID_PROVIDERS,
@@ -1151,17 +1151,26 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
                 auto_delete_seconds=180,
             )
         except Exception as exc:
-            out[email] = f"failed:{exc}"
-            try:
-                set_enabled(ak, False, reason="auth_error")
-            except Exception:
-                pass
+            err = oauth_errors.describe_oauth_error(
+                exc, provider=provider_of(ak), operation="refresh_token",
+            )
+            out[email] = f"failed:{err.code}"
+            disabled_line = ""
+            if err.auth_error:
+                try:
+                    set_enabled(ak, False, reason="auth_error")
+                    disabled_line = "\n账号已被自动禁用 (auth_error)。请到「🔐 管理 OAuth」重新登录或粘贴新 JSON。"
+                except Exception:
+                    disabled_line = "\n⚠ 自动禁用写入失败，请查看 systemd 日志。"
+            else:
+                disabled_line = "\n账号未自动禁用；可稍后重试。"
+            print(f"[oauth] proactive refresh failed for {ak}: {oauth_errors.technical_detail(exc)}")
             notifier.notify_event(
                 "oauth_refresh_failed",
                 "⚠ <b>OAuth Token 刷新失败</b>\n"
                 f"账号: <code>{notifier.escape_html(disp)}</code>\n"
-                f"原因: <code>{notifier.escape_html(str(exc))}</code>\n"
-                "账号已被自动禁用 (auth_error)。请到「🔐 管理 OAuth」重新登录或粘贴新 JSON。"
+                + oauth_errors.format_oauth_error_html(err)
+                + disabled_line
             )
     return out
 

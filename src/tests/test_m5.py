@@ -3,7 +3,7 @@
 覆盖：
   - probe_channel_model：API 渠道成功 / 失败 / OAuth 拒绝
   - recovery_run_once：cooldown 恢复（OAuth 被跳过）
-  - proactive_refresh_once：近过期刷新、健康跳过、auth_error 处理
+  - proactive_refresh_once：近过期刷新、健康跳过、auth_error 处理、临时网络失败不误禁用
   - quota_monitor_once：高利用率禁用、恢复、跳过 user/auth_error
 
 运行：./venv/bin/python -m src.tests.test_m5
@@ -269,7 +269,7 @@ async def test_proactive_refresh_triggers_near_expiry(m):
     print("  [PASS] proactive_refresh: near refreshed, ok skipped, off skipped")
 
 
-async def test_proactive_refresh_failure_marks_auth_error(m):
+async def test_proactive_refresh_network_failure_does_not_mark_auth_error(m):
     _reset(m)
     cfg = m["config"]
     collector = NotifyCollector()
@@ -296,14 +296,53 @@ async def test_proactive_refresh_failure_marks_auth_error(m):
     finally:
         _httpx.post = orig_post
 
-    assert outcomes["bad@test.com"].startswith("failed:"), outcomes
+    assert outcomes["bad@test.com"].startswith("failed:claude_oauth_network_error"), outcomes
     bad = next(a for a in m["config"].get()["oauthAccounts"] if a["email"] == "bad@test.com")
+    assert bad["enabled"] is True
+    assert bad["disabled_reason"] is None
+    m["notifier"].wait_drain(2.0)
+    assert any(("刷新失败" in msg and "账号未自动禁用" in msg)
+               for msg in collector.messages), collector.messages
+    print("  [PASS] transient refresh failure → not marked auth_error + notified")
+
+
+async def test_proactive_refresh_401_marks_auth_error(m):
+    _reset(m)
+    cfg = m["config"]
+    collector = NotifyCollector()
+    m["notifier"].set_handler(collector)
+
+    def _setup(c):
+        c.setdefault("oauth", {})["mockMode"] = False
+        c["oauthAccounts"] = [{
+            "email": "expired@test.com",
+            "access_token": "old", "refresh_token": "r",
+            "expired": (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "enabled": True, "disabled_reason": None, "disabled_until": None, "models": [],
+        }]
+    cfg.update(_setup)
+
+    import httpx as _httpx
+    orig_post = _httpx.post
+    def response_401(*a, **kw):
+        req = _httpx.Request("POST", "https://api.anthropic.com/v1/oauth/token")
+        return _httpx.Response(401, request=req, json={"error": "invalid_grant"})
+    _httpx.post = response_401
+    try:
+        outcomes = await m["oauth_manager"].proactive_refresh_once(refresh_threshold_seconds=600)
+    finally:
+        _httpx.post = orig_post
+
+    assert outcomes["expired@test.com"].startswith("failed:claude_token_401"), outcomes
+    bad = next(a for a in m["config"].get()["oauthAccounts"] if a["email"] == "expired@test.com")
     assert bad["enabled"] is False
     assert bad["disabled_reason"] == "auth_error"
     m["notifier"].wait_drain(2.0)
-    assert any(("refresh failed" in msg.lower() or "刷新失败" in msg or "⚠" in msg)
-               for msg in collector.messages), collector.messages
-    print("  [PASS] refresh failure → marked auth_error + notified")
+    joined = "\n".join(collector.messages)
+    assert "Claude 授权已失效" in joined
+    assert "developer.mozilla" not in joined
+    assert "Client error" not in joined
+    print("  [PASS] auth refresh 401 → marked auth_error + friendly notification")
 
 
 # ─── OAuth 配额监控 ──────────────────────────────────────────────
@@ -447,7 +486,8 @@ async def amain():
         test_probe_oauth_skipped,
         test_recovery_run_once,
         test_proactive_refresh_triggers_near_expiry,
-        test_proactive_refresh_failure_marks_auth_error,
+        test_proactive_refresh_network_failure_does_not_mark_auth_error,
+        test_proactive_refresh_401_marks_auth_error,
         test_quota_monitor_disables_high_util,
         test_quota_monitor_resumes_after_reset,
         test_quota_monitor_skips_user_and_auth_error,
