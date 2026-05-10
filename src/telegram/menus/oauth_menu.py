@@ -6,8 +6,10 @@ callback_data 前缀：`oa:...`
   - `oa_login_code`：等待用户粘贴 PKCE 登录页返回的 code#state
   - `oa_set_json` ：等待用户粘贴 OAuth JSON（access_token/refresh_token/...）
 状态机 action（OpenAI）：
-  - `oa_openai_code`：等待用户粘贴 Codex CLI 登录后的回调 URL
-  - `oa_openai_rt`  ：等待用户粘贴 refresh_token 字符串
+  - `oa_openai_code`          ：等待用户粘贴 Codex CLI 登录后的回调 URL
+  - `oa_openai_rt`            ：等待用户粘贴 refresh_token 字符串
+  - `oa_openai_import`        ：等待用户上传/粘贴 Sub2API / CPA 导出内容
+  - `oa_openai_import_confirm`：等待用户确认批量导入
 
 注意：本模块所有 OAuth 远端交互都走 `oauth_manager` / `src.oauth.*`，已经有
 mockMode 保护（`config.oauth.mockMode=true` 或 env DISABLE_OAUTH_NETWORK_CALLS=1）。
@@ -26,6 +28,7 @@ from urllib.parse import parse_qs, urlparse
 from ... import affinity, config, cooldown, log_db, oauth_errors, oauth_manager, state_db
 from ...oauth_ids import account_key as _account_key, split_account_key as _split_ak
 from ...oauth import openai as openai_provider
+from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
 from .. import states, ui
 from . import main as main_menu
 
@@ -160,7 +163,11 @@ def _format_account_block(acc: dict) -> str:
     provider_tag = ""
     if prov == "openai":
         plan = acc.get("plan_type") or ""
-        provider_tag = f" 🅾 OpenAI{' · ' + ui.escape_html(plan) if plan else ''}"
+        sub_exp = acc.get("subscription_expires_at") or ""
+        suffix = f" · {ui.escape_html(plan)}" if plan else ""
+        if sub_exp:
+            suffix += f" · sub 到 {_format_bjt(sub_exp)}"
+        provider_tag = f" 🅾 OpenAI{suffix}"
 
     lines = [f"{icon} <code>{ui.escape_html(email)}</code>{provider_tag}{tag}"]
 
@@ -284,8 +291,62 @@ def _format_usage_block(account_key: str) -> str:
 
 _PAGE_SIZE = 4  # 每页显示账户数
 
+_FILTER_ALL = "all"
+_FILTER_AVAILABLE = "available"
+_FILTER_QUOTA = "quota"
+_FILTER_INVALID = "invalid"
+_FILTER_LABELS = {
+    _FILTER_ALL: "全部",
+    _FILTER_AVAILABLE: "可用",
+    _FILTER_QUOTA: "限额",
+    _FILTER_INVALID: "失效",
+}
 
-def _build_pagination_row(current: int, total_pages: int) -> list[dict]:
+
+def _normalize_filter(value: str | None) -> str:
+    key = (value or "").strip().lower()
+    return key if key in _FILTER_LABELS else _FILTER_ALL
+
+
+def _filter_account(acc: dict, filter_key: str) -> bool:
+    filter_key = _normalize_filter(filter_key)
+    if filter_key == _FILTER_AVAILABLE:
+        return bool(acc.get("enabled", True)) and not acc.get("disabled_reason")
+    if filter_key == _FILTER_QUOTA:
+        return acc.get("disabled_reason") == "quota"
+    if filter_key == _FILTER_INVALID:
+        return acc.get("disabled_reason") == "auth_error"
+    return True
+
+
+def _page_callback(page: int, filter_key: str = _FILTER_ALL) -> str:
+    page = max(1, int(page or 1))
+    filter_key = _normalize_filter(filter_key)
+    if filter_key == _FILTER_ALL:
+        return f"oa:page:{page}"
+    return f"oa:page:{page}:{filter_key}"
+
+
+def _parse_page_filter(payload: str, default_page: int = 1, default_filter: str = _FILTER_ALL) -> tuple[int, str]:
+    raw = (payload or "").strip()
+    filter_key = _normalize_filter(default_filter)
+    if not raw or raw == "noop":
+        return default_page, filter_key
+
+    if ":" in raw:
+        left, _, maybe_filter = raw.rpartition(":")
+        if maybe_filter in _FILTER_LABELS:
+            filter_key = maybe_filter
+            raw = left
+
+    try:
+        page = int(raw)
+    except (TypeError, ValueError):
+        page = default_page
+    return max(1, page), filter_key
+
+
+def _build_pagination_row(current: int, total_pages: int, filter_key: str = _FILTER_ALL) -> list[dict]:
     """构建翻页按钮行。
 
     • 总页数 ≤ 10：⬅ 上一页 / ➡ 下一页
@@ -298,12 +359,12 @@ def _build_pagination_row(current: int, total_pages: int) -> list[dict]:
         # 上一页 / 下一页 样式（首末页按钮保留但显示为禁用态）
         btns: list[dict] = []
         if current > 1:
-            btns.append(ui.btn("⬅ 上一页", f"oa:page:{current - 1}"))
+            btns.append(ui.btn("⬅ 上一页", _page_callback(current - 1, filter_key)))
         else:
             btns.append(ui.btn("◁ 上一页", "oa:page:noop"))
         btns.append(ui.btn(f"{current}/{total_pages}", "oa:page:noop"))
         if current < total_pages:
-            btns.append(ui.btn("➡ 下一页", f"oa:page:{current + 1}"))
+            btns.append(ui.btn("➡ 下一页", _page_callback(current + 1, filter_key)))
         else:
             btns.append(ui.btn("下一页 ▷", "oa:page:noop"))
         return btns
@@ -321,63 +382,82 @@ def _build_pagination_row(current: int, total_pages: int) -> list[dict]:
 
     page_btns: list[dict] = []
     if lo > 1:
-        page_btns.append(ui.btn("1", "oa:page:1"))
+        page_btns.append(ui.btn("1", _page_callback(1, filter_key)))
         if lo > 2:
             page_btns.append(ui.btn("…", "oa:page:noop"))
     for p in range(lo, hi + 1):
         if p == current:
             page_btns.append(ui.btn(f"[{p}]", "oa:page:noop"))
         else:
-            page_btns.append(ui.btn(str(p), f"oa:page:{p}"))
+            page_btns.append(ui.btn(str(p), _page_callback(p, filter_key)))
     if hi < total_pages:
         if hi < total_pages - 1:
             page_btns.append(ui.btn("…", "oa:page:noop"))
-        page_btns.append(ui.btn(str(total_pages), f"oa:page:{total_pages}"))
+        page_btns.append(ui.btn(str(total_pages), _page_callback(total_pages, filter_key)))
     return page_btns
 
 
-def _split_short_page(payload: str, default_page: int = 1) -> tuple[str, int]:
-    """解析带可选页码的 callback payload。
+def _split_short_page_filter(payload: str, default_page: int = 1, default_filter: str = _FILTER_ALL) -> tuple[str, int, str]:
+    """解析带可选页码/过滤条件的 callback payload。
 
-    新格式：<short>:<page>；旧格式：<short>。
-    short 由 ui.register_code 生成，历史上不含冒号；这里仍用 rsplit
-    保守处理，确保旧消息按钮继续可用。
+    新格式：<short>:<page>:<filter>；旧格式：<short>:<page> / <short>。
     """
     raw = (payload or "").strip()
+    filter_key = _normalize_filter(default_filter)
     if ":" not in raw:
-        return raw, default_page
-    short, _, page_s = raw.rpartition(":")
+        return raw, default_page, filter_key
+
+    head = raw
+    maybe_head, _, maybe_filter = raw.rpartition(":")
+    if maybe_filter in _FILTER_LABELS:
+        filter_key = maybe_filter
+        head = maybe_head
+
+    if ":" not in head:
+        return head, default_page, filter_key
+    short, _, page_s = head.rpartition(":")
     try:
         page = int(page_s)
     except ValueError:
-        return raw, default_page
+        return raw, default_page, filter_key
     if page < 1:
         page = default_page
+    return short, page, filter_key
+
+
+def _split_short_page(payload: str, default_page: int = 1) -> tuple[str, int]:
+    short, page, _ = _split_short_page_filter(payload, default_page=default_page)
     return short, page
 
 
-def _callback_payload(short: str, page: int) -> str:
+def _callback_payload(short: str, page: int, filter_key: str = _FILTER_ALL) -> str:
     try:
         p = int(page or 1)
     except (TypeError, ValueError):
         p = 1
-    return f"{short}:{max(1, p)}"
+    filter_key = _normalize_filter(filter_key)
+    if filter_key == _FILTER_ALL:
+        return f"{short}:{max(1, p)}"
+    return f"{short}:{max(1, p)}:{filter_key}"
 
 
-def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
-    accounts = oauth_manager.list_accounts()
+def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str, dict]:
+    accounts_all = oauth_manager.list_accounts()
+    filter_key = _normalize_filter(filter_key)
     # 按访问节流刷新所有账户的 usage（quotaMonitor.enabled=True 时内部跳过）
     account_keys = [
-        _account_key(a) for a in accounts
+        _account_key(a) for a in accounts_all
         if a.get("email") and not a.get("disabled_reason")
     ]
     if account_keys:
         oauth_manager.ensure_quota_fresh_sync(account_keys)
+    total_all = len(accounts_all)
+    normal = sum(1 for a in accounts_all if a.get("enabled", True) and not a.get("disabled_reason"))
+    quota_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "quota")
+    user_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "user")
+    auth_err = sum(1 for a in accounts_all if a.get("disabled_reason") == "auth_error")
+    accounts = [a for a in accounts_all if _filter_account(a, filter_key)]
     total = len(accounts)
-    normal = sum(1 for a in accounts if a.get("enabled", True) and not a.get("disabled_reason"))
-    quota_disabled = sum(1 for a in accounts if a.get("disabled_reason") == "quota")
-    user_disabled = sum(1 for a in accounts if a.get("disabled_reason") == "user")
-    auth_err = sum(1 for a in accounts if a.get("disabled_reason") == "auth_error")
 
     # 冷却统计：按 oauth:email 聚合；一个账号只要有任何模型处于冷却，就计数一次
     from ... import cooldown as _cd
@@ -400,7 +480,7 @@ def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
 
     summary = (
         f"🔐 <b>OAuth 账户管理</b>\n"
-        f"共 {total} 个账户 | 正常 {normal}"
+        f"共 {total_all} 个账户 | 正常 {normal}"
         + (f" | 配额 {quota_disabled}" if quota_disabled else "")
         + (f" | 用户禁用 {user_disabled}" if user_disabled else "")
         + (f" | 认证失败 {auth_err}" if auth_err else "")
@@ -408,9 +488,12 @@ def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
         + (f" | 🔴 永久 {permanent}" if permanent else "")
         + page_info
     )
+    if filter_key != _FILTER_ALL:
+        summary += f"\n当前过滤: <b>{_FILTER_LABELS.get(filter_key, '全部')}</b>"
 
     if not accounts:
-        text = summary + "\n\n暂无账户，点击下方「➕ 新增账户」添加。"
+        empty_hint = "暂无账户，点击下方「➕ 新增账户」添加。" if not accounts_all else "当前过滤条件下暂无账户。"
+        text = summary + f"\n\n{empty_hint}"
     else:
         start = (page - 1) * _PAGE_SIZE
         end = min(start + _PAGE_SIZE, total)
@@ -441,35 +524,45 @@ def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
             short = ui.register_code(ak)
             prov = oauth_manager.provider_of(acc)
             tag = "🅾" if prov == "openai" else ("🅰" if prov == "claude" else "✉")
-            row_btns.append(ui.btn(f"{tag} {email}", f"oa:view:{_callback_payload(short, page)}"))
+            row_btns.append(ui.btn(f"{tag} {email}", f"oa:view:{_callback_payload(short, page, filter_key)}"))
         rows.append(row_btns)
 
     # 翻页
-    pag_row = _build_pagination_row(page, total_pages)
+    pag_row = _build_pagination_row(page, total_pages, filter_key)
     if pag_row:
         rows.append(pag_row)
+
+    # 过滤按钮
+    rows.append([
+        ui.btn(f"全部{'√' if filter_key == _FILTER_ALL else ''}", _page_callback(1, _FILTER_ALL)),
+        ui.btn(f"可用{'√' if filter_key == _FILTER_AVAILABLE else ''}", _page_callback(1, _FILTER_AVAILABLE)),
+        ui.btn(f"限额{'√' if filter_key == _FILTER_QUOTA else ''}", _page_callback(1, _FILTER_QUOTA)),
+        ui.btn(f"失效{'√' if filter_key == _FILTER_INVALID else ''}", _page_callback(1, _FILTER_INVALID)),
+    ])
 
     # 操作按钮（每页都有）
     rows.append([
         ui.btn("➕ 新增账户", "oa:add"),
-        ui.btn("🔄 刷新全部用量", f"oa:refresh_all:{page}"),
+        ui.btn("🔄 刷新全部用量", f"oa:refresh_all:{page}" if filter_key == _FILTER_ALL else f"oa:refresh_all:{page}:{filter_key}"),
     ])
     # 只有存在 OAuth 账号的冷却条目时才显示"清除所有错误"（避免空操作按钮）
     if cd_keys_any:
-        rows.append([ui.btn(f"🧹 清除所有账户错误（{len(cd_keys_any)} 个）", f"oa:clear_all_errors:{page}")])
-    rows.append([ui.btn("🖼 图片生成", "img:show"), ui.btn("◀ 返回主菜单", "menu:main")])
+        clear_cb = f"oa:clear_all_errors:{page}" if filter_key == _FILTER_ALL else f"oa:clear_all_errors:{page}:{filter_key}"
+        rows.append([ui.btn(f"🧹 清除所有账户错误（{len(cd_keys_any)} 个）", clear_cb)])
+    rows.append([ui.btn("🖼 图片生成", "img:show"), ui.btn("🧨 移除失效", "oa:invalid:list")])
+    rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
     return ui.truncate(text), ui.inline_kb(rows)
 
 
-def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1) -> None:
+def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    text, kb = _list_text_and_kb(page=page)
+    text, kb = _list_text_and_kb(page=page, filter_key=filter_key)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
-def send_new(chat_id: int, page: int = 1) -> None:
-    text, kb = _list_text_and_kb(page=page)
+def send_new(chat_id: int, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
+    text, kb = _list_text_and_kb(page=page, filter_key=filter_key)
     ui.send(chat_id, text, reply_markup=kb)
 
 
@@ -531,7 +624,7 @@ def _format_month_stats_block(account_key: str) -> str:
     return "\n".join(lines)
 
 
-def _detail_text_and_kb(account_key: str, page: int = 1) -> tuple[Optional[str], Optional[dict]]:
+def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[Optional[str], Optional[dict]]:
     acc = oauth_manager.get_account(account_key)
     if acc is None:
         return None, None
@@ -546,8 +639,12 @@ def _detail_text_and_kb(account_key: str, page: int = 1) -> tuple[Optional[str],
     provider_line = ""
     if prov == "openai":
         plan = acc.get("plan_type") or "?"
+        sub_exp = acc.get("subscription_expires_at") or ""
+        sub_line = (
+            f" · 订阅到: <code>{_format_bjt(sub_exp)}</code>" if sub_exp else ""
+        )
         provider_line = (
-            f"提供者: <code>🅾 OpenAI (Codex)</code> · 计划: <code>{ui.escape_html(plan)}</code>\n"
+            f"提供者: <code>🅾 OpenAI (Codex)</code> · 计划: <code>{ui.escape_html(plan)}</code>{sub_line}\n"
         )
     elif prov == "claude":
         provider_line = f"提供者: <code>🅰 Anthropic (Claude)</code>\n"
@@ -586,7 +683,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1) -> tuple[Optional[str],
                 text += f"  🟠 <code>{mdl}</code> — 剩 {rem}s"
             text += f" (累计失败 {e['error_count']} 次)\n"
 
-    payload = _callback_payload(short, page)
+    payload = _callback_payload(short, page, filter_key)
     rows = [
         [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}"),
          ui.btn("📊 刷新用量",   f"oa:refresh_usage:{payload}")],
@@ -595,31 +692,31 @@ def _detail_text_and_kb(account_key: str, page: int = 1) -> tuple[Optional[str],
         [ui.btn(f"⚡ 修改并发上限（当前: {max_cc_label}）", f"oa:emax:{payload}")],
         [ui.btn(toggle_label,     f"oa:toggle:{payload}"),
          ui.btn("🗑 删除",         f"oa:delete_ask:{payload}")],
-        [ui.btn("◀ 返回 OAuth 列表", f"oa:page:{max(1, int(page or 1))}")],
+        [ui.btn("◀ 返回 OAuth 列表", _page_callback(max(1, int(page or 1)), filter_key))],
     ]
     return ui.truncate(text), ui.inline_kb(rows)
 
 
-def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效，请返回重试")
-        show(chat_id, message_id, page=page)
+        show(chat_id, message_id, page=page, filter_key=filter_key)
         return
     ui.answer_cb(cb_id)
-    text, kb = _detail_text_and_kb(ak, page=page)
+    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text is None:
         _, email = _split_ak(ak)
         ui.edit(chat_id, message_id,
                 f"⚠ 账户 <code>{ui.escape_html(email)}</code> 已不存在",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", f"oa:page:{max(1, int(page or 1))}")]]))
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", _page_callback(max(1, int(page or 1)), filter_key))]]))
         return
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 刷新 Token ──────────────────────────────────────────────────
 
-def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
@@ -640,7 +737,7 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
         if not isinstance(usage_result, Exception):
             state_db.quota_save(ak, oauth_manager.flatten_usage(usage_result), email=email)
 
-    text, kb = _detail_text_and_kb(ak, page=page)
+    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:
         ui.edit(chat_id, message_id,
                 "✅ Token 已刷新\n\n" + text,
@@ -649,7 +746,7 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
 
 # ─── 刷新用量 ─────────────────────────────────────────────────────
 
-def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
@@ -676,7 +773,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
                 pr, provider="openai", operation="probe_usage",
             ))
             return
-        text, kb = _detail_text_and_kb(ak, page=page)
+        text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
         if pr.get("ok"):
             head = "✅ 已刷新 Token 并更新用量（探测请求成功）"
         else:
@@ -701,40 +798,40 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
     state_db.quota_save(ak, oauth_manager.flatten_usage(usage_result), email=email)
 
-    text, kb = _detail_text_and_kb(ak, page=page)
+    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 清错误 / 清亲和 ─────────────────────────────────────────────
 
-def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
     cooldown.clear(f"oauth:{ak}", model=None)
     ui.answer_cb(cb_id, "已清除该账号的所有模型冷却")
-    text, kb = _detail_text_and_kb(ak, page=page)
+    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
-def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
     affinity.delete_by_channel(f"oauth:{ak}")
     ui.answer_cb(cb_id, "已清亲和")
-    text, kb = _detail_text_and_kb(ak, page=page)
+    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 启用 / 禁用 ──────────────────────────────────────────────────
 
-def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
@@ -742,7 +839,7 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int =
     acc = oauth_manager.get_account(ak)
     if acc is None:
         ui.answer_cb(cb_id, "账户不存在")
-        show(chat_id, message_id, page=page)
+        show(chat_id, message_id, page=page, filter_key=filter_key)
         return
 
     enabled = acc.get("enabled", True) and not acc.get("disabled_reason")
@@ -753,14 +850,14 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int =
         oauth_manager.set_enabled(ak, True)
         ui.answer_cb(cb_id, "已启用")
 
-    text, kb = _detail_text_and_kb(ak, page=page)
+    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 删除（二次确认） ─────────────────────────────────────────────
 
-def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
@@ -774,17 +871,17 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: i
         f"确认删除账户 <code>{ui.escape_html(email)}</code>（{prov_tag}）？\n"
         f"⚠ 该操作将清除此账户的所有统计与亲和绑定数据。",
         reply_markup=ui.inline_kb([[
-            ui.btn("✅ 确认删除", f"oa:delete_exec:{_callback_payload(short, page)}"),
-            ui.btn("❌ 取消",     f"oa:view:{_callback_payload(short, page)}"),
+            ui.btn("✅ 确认删除", f"oa:delete_exec:{_callback_payload(short, page, filter_key)}"),
+            ui.btn("❌ 取消",     f"oa:view:{_callback_payload(short, page, filter_key)}"),
         ]]),
     )
 
 
-def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
-        show(chat_id, message_id, page=page)
+        show(chat_id, message_id, page=page, filter_key=filter_key)
         return
     _, email = _split_ak(ak)
     try:
@@ -795,7 +892,7 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         return
     ui.answer_cb(cb_id, "已删除")
     ui.edit(chat_id, message_id, f"✅ 已删除 <code>{ui.escape_html(email)}</code>")
-    show(chat_id, message_id, page=page)
+    show(chat_id, message_id, page=page, filter_key=filter_key)
 
 
 # ─── 刷新全部用量 ─────────────────────────────────────────────────
@@ -814,7 +911,7 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: 
 #
 # 5 分钟后后台 Timer 删除进度消息（失败静默）。
 
-def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
+def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ui.answer_cb(cb_id, "开始刷新...")
     from ...channel import registry
     from ...channel.openai_oauth_channel import OpenAIOAuthChannel
@@ -963,7 +1060,7 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> 
 
     # ─ 刷新原始 OAuth 列表面板，让用户无需离开再进来 ─
     try:
-        list_text, list_kb = _list_text_and_kb(page=page)
+        list_text, list_kb = _list_text_and_kb(page=page, filter_key=filter_key)
         if list_text:
             ui.edit(chat_id, message_id, list_text, reply_markup=list_kb)
     except Exception:
@@ -985,15 +1082,22 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> 
 # ─── 新增账户：入口 ──────────────────────────────────────────────
 
 def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
-    """第一步：选 provider。"""
+    """新增 OAuth 账户：把常用登录/导入入口扁平化到一级。"""
+    # 这里也是所有新增流程的「取消」落点，进入时清掉等待输入状态，避免后续文本误触发旧流程。
+    states.pop_state(chat_id)
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
         "<b>新增 OAuth 账户</b>\n请选择类型：",
         reply_markup=ui.inline_kb([
-            [ui.btn("🅰 Claude (Anthropic)",   "oa:add:claude")],
-            [ui.btn("🅾 OpenAI (Codex / ChatGPT)", "oa:add:openai")],
+            [ui.btn("🟣 Claude 登录获取 Token", "oa:login")],
+            [ui.btn("📄 Claude 手动设置 JSON", "oa:set_json")],
+            [ui.btn("🅾 OpenAI 登录获取 Token", "oa:login:openai")],
+            [ui.btn("🔑 OpenAI 粘贴 refresh_token", "oa:set_rt:openai")],
+            [ui.btn("📦 OpenAI 导入 Sub2API 文件", "oa:import:sub2api")],
+            [ui.btn("🗂 OpenAI 导入 CPA 文件", "oa:import:cpa")],
             [ui.btn("◀ 返回列表", "menu:oauth")],
+            [ui.btn("🏠 返回主菜单", "menu:main")],
         ]),
     )
 
@@ -1049,28 +1153,27 @@ def on_login_start(chat_id: int, message_id: int, cb_id: str) -> None:
         "登录后页面会显示一个 <b>authorization code</b>（通常形如 <code>abc#state</code>），"
         "请复制并发送给我。\n\n"
         "<i>（登录会话 10 分钟内有效）</i>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:add")]]),
     )
 
 
 def on_login_code_input(chat_id: int, text: str) -> None:
     state = states.pop_state(chat_id)
+    nav = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
     if not state or state.get("action") != "oa_login_code":
-        ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。",
-                       back_label="◀ 返回 OAuth 列表", back_callback="menu:oauth")
+        ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。", **nav)
         return
     data = state.get("data") or {}
 
     raw = (text or "").strip()
     if not raw:
-        ui.send_result(chat_id, "❌ 内容为空。请重新发起登录流程。",
-                       back_label="◀ 返回 OAuth 列表", back_callback="menu:oauth")
+        ui.send_result(chat_id, "❌ 内容为空。请重新发起登录流程。", **nav)
         return
 
     # 页面通常返回 code#state 形式
     code_part = raw.split("#", 1)[0].strip()
     if not code_part:
-        ui.send_result(chat_id, "❌ code 无效，请重新发起登录流程。",
-                       back_label="◀ 返回 OAuth 列表", back_callback="menu:oauth")
+        ui.send_result(chat_id, "❌ code 无效，请重新发起登录流程。", **nav)
         return
 
     try:
@@ -1080,7 +1183,7 @@ def on_login_code_input(chat_id: int, text: str) -> None:
     except Exception as exc:
         ui.send_result(chat_id,
                        _oauth_error_html(exc, provider="claude", operation="exchange_code"),
-                       back_label="◀ 返回 OAuth 列表", back_callback="menu:oauth")
+                       **nav)
         return
 
     # 获取 email（可选）
@@ -1115,7 +1218,7 @@ def on_login_code_input(chat_id: int, text: str) -> None:
     except Exception as exc:
         ui.send_result(chat_id,
                        f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>",
-                       back_label="◀ 返回 OAuth 列表", back_callback="menu:oauth")
+                       **nav)
         return
 
     ui.send_result(
@@ -1135,12 +1238,13 @@ def on_set_json_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.edit(
         chat_id, message_id,
         "请粘贴 OAuth JSON（需包含 <code>email / access_token / refresh_token / expired</code>）：",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:add")]]),
     )
 
 
 def on_set_json_input(chat_id: int, text: str) -> None:
     states.pop_state(chat_id)
-    nav = {"back_label": "◀ 返回 OAuth 列表", "back_callback": "menu:oauth"}
+    nav = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
     try:
         data = json.loads((text or "").strip())
     except Exception as exc:
@@ -1194,7 +1298,7 @@ def on_set_json_input(chat_id: int, text: str) -> None:
 #   4. 拿到 token 后解 id_token 得到 email / chatgpt_account_id / plan_type。
 
 
-_OA_NAV_OPENAI = {"back_label": "◀ 返回 OAuth 列表", "back_callback": "menu:oauth"}
+_OA_NAV_OPENAI = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
 
 
 def _build_openai_login_text_and_kb(url: str) -> tuple[str, dict]:
@@ -1211,7 +1315,7 @@ def _build_openai_login_text_and_kb(url: str) -> tuple[str, dict]:
     )
     kb = ui.inline_kb([
         [ui.btn("🔄 重新生成登录地址", "oa:login:openai:regen")],
-        [ui.btn("❌ 取消", "menu:oauth")],
+        [ui.btn("❌ 取消", "oa:add")],
     ])
     return text, kb
 
@@ -1316,6 +1420,7 @@ def on_set_rt_openai_start(chat_id: int, message_id: int, cb_id: str) -> None:
         chat_id, message_id,
         "请粘贴 <b>refresh_token</b>（纯字符串即可，代理会立即用它刷新一次 "
         "token 并从 id_token 解出 email 等账户信息）：",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:add")]]),
     )
 
 
@@ -1346,31 +1451,19 @@ def on_set_rt_openai_input(chat_id: int, text: str) -> None:
     _finish_openai_add(chat_id, tok, source="rt")
 
 
-def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
-    """共用保存路径：从 id_token 解 email 等 → add_account → 回报。"""
+def _openai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict, dict]:
+    """token response → Parrot oauthAccounts entry。"""
     id_token = tok.get("id_token", "") or ""
     if not id_token:
-        ui.send_result(
-            chat_id,
-            "❌ token 响应缺少 <code>id_token</code>，无法识别账户。"
-            "请检查授权是否带了 <code>openid</code> scope（默认即带）。",
-            **_OA_NAV_OPENAI,
-        )
-        return
+        raise ValueError("token 响应缺少 id_token，无法识别账户")
     try:
         claims = openai_provider.decode_id_token(id_token)
     except Exception as exc:
-        ui.send_result(
-            chat_id,
-            f"❌ id_token 解码失败: <code>{ui.escape_html(str(exc))[:300]}</code>",
-            **_OA_NAV_OPENAI,
-        )
-        return
+        raise ValueError(f"id_token 解码失败: {exc}") from exc
 
     info = openai_provider.extract_user_info(claims)
-    email = info.get("email") or ""
+    email = info.get("email") or tok.get("email") or fallback_email or ""
     if not email:
-        # 兜底唯一名，避免 email 冲突（与 Claude 路径一致）
         email = f"unnamed-openai-{int(datetime.now().timestamp())}@local"
 
     expires_in = int(tok.get("expires_in", 28800))
@@ -1390,36 +1483,466 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
         "disabled_reason": None,
         "disabled_until": None,
         "models": [],
-        # OpenAI 专属 metadata
         "id_token": id_token,
         "chatgpt_account_id": info.get("chatgpt_account_id", ""),
         "organization_id": info.get("organization_id", ""),
-        "plan_type": info.get("plan_type", ""),
+        "plan_type": tok.get("plan_type") or info.get("plan_type", ""),
+        "subscription_expires_at": tok.get("subscription_expires_at", ""),
     }
+    meta = {
+        "email": email,
+        "expired": new_expired,
+        "plan_type": entry.get("plan_type", ""),
+        "subscription_expires_at": entry.get("subscription_expires_at", ""),
+    }
+    return entry, meta
+
+
+def _refresh_openai_rt_to_entry(refresh_token: str, *, email_hint: str = "") -> tuple[dict | None, dict | None, Exception | None]:
+    """refresh_token → entry；失败时返回异常。"""
     try:
+        tok = openai_provider.refresh_sync(refresh_token, email=email_hint or None)
+        if not tok.get("refresh_token"):
+            tok["refresh_token"] = refresh_token
+        entry, meta = _openai_token_to_entry(tok, fallback_email=email_hint)
+        return entry, meta, None
+    except Exception as exc:
+        return None, None, exc
+
+
+def _find_openai_account_by_email(email: str) -> dict | None:
+    email = (email or "").strip()
+    if not email:
+        return None
+    return oauth_manager.get_account(f"openai:{email}")
+
+
+def _upsert_openai_account_entry(entry: dict, *, preserve_existing_settings: bool = True) -> bool:
+    """写入 OpenAI 账号。返回 True 表示替换既有账号，False 表示新增。"""
+    email = entry.get("email")
+    replaced = False
+
+    def mutate(cfg):
+        nonlocal replaced
+        accounts = cfg.setdefault("oauthAccounts", [])
+        for acc in accounts:
+            if acc.get("email") != email or oauth_manager.provider_of(acc) != "openai":
+                continue
+            keep_models = acc.get("models")
+            keep_max = acc.get("maxConcurrent")
+            acc.update(entry)
+            if preserve_existing_settings:
+                if keep_models is not None:
+                    acc["models"] = keep_models
+                if keep_max is not None:
+                    acc["maxConcurrent"] = keep_max
+            replaced = True
+            return
+        accounts.append(entry)
+
+    config.update(mutate)
+    return replaced
+
+
+def _save_openai_entry_with_duplicate_policy(entry: dict) -> tuple[str, str]:
+    """保存 OpenAI 账号；重复账号按 token 有效性决策。
+
+    规则：同 provider + email 已存在时，刷新验证现有 refresh_token：
+      - 现有有效、新 token 有效：保留现有（并写回刷新后的 token），跳过新 token
+      - 现有无效、新 token 有效：用新 token 替换现有账号
+      - 不存在：新增
+    """
+    email = entry.get("email", "")
+    existing = _find_openai_account_by_email(email)
+    if not existing:
         oauth_manager.add_account(entry)
+        return "added", "新增"
+
+    existing_entry, _, existing_err = _refresh_openai_rt_to_entry(
+        existing.get("refresh_token", ""), email_hint=email,
+    )
+    if existing_entry is not None:
+        _upsert_openai_account_entry(existing_entry, preserve_existing_settings=True)
+        return "skipped", "现有 token 有效，已保留现有账号"
+
+    _upsert_openai_account_entry(entry, preserve_existing_settings=True)
+    return "replaced", "现有 token 无效，已用新 token 替换"
+
+
+def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
+    """共用保存路径：从 id_token 解 email 等 → 按重复策略保存 → 回报。"""
+    try:
+        entry, meta = _openai_token_to_entry(tok)
+        action, action_msg = _save_openai_entry_with_duplicate_policy(entry)
     except Exception as exc:
         ui.send_result(
             chat_id,
-            f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>",
+            f"❌ 保存失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
             **_OA_NAV_OPENAI,
         )
         return
 
-    plan_tag = f" · plan: <code>{ui.escape_html(info.get('plan_type') or '?')}</code>"
+    plan = meta.get("plan_type") or "?"
+    plan_tag = f" · plan: <code>{ui.escape_html(plan)}</code>"
+    if meta.get("subscription_expires_at"):
+        plan_tag += f" · sub: <code>{_format_bjt(meta.get('subscription_expires_at'))}</code>"
+    title = {
+        "added": "✅ <b>OpenAI OAuth 账户已添加</b>",
+        "replaced": "✅ <b>OpenAI OAuth 账户已更新</b>",
+        "skipped": "✅ <b>OpenAI OAuth 账户已存在</b>",
+    }.get(action, "✅ <b>OpenAI OAuth 账户已处理</b>")
     ui.send_result(
         chat_id,
-        "✅ <b>OpenAI OAuth 账户已添加</b>\n\n"
-        f"Email: <code>{ui.escape_html(email)}</code>{plan_tag}\n"
-        f"过期: <code>{_format_bjt(new_expired)}</code>\n"
+        f"{title}\n\n"
+        f"Email: <code>{ui.escape_html(meta.get('email') or entry.get('email') or '')}</code>{plan_tag}\n"
+        f"过期: <code>{_format_bjt(meta.get('expired'))}</code>\n"
+        f"处理: <code>{ui.escape_html(action_msg)}</code>\n"
         f"来源: <code>{source}</code>",
         **_OA_NAV_OPENAI,
     )
 
 
+# ─── OpenAI 批量导入（Sub2API / CPA）───────────────────────────────
+
+_OPENAI_IMPORT_LABELS = {
+    "sub2api": "Sub2API",
+    "cpa": "CPA",
+}
+
+
+def on_import_openai_start(chat_id: int, message_id: int, cb_id: str, kind: str) -> None:
+    kind = (kind or "").strip().lower()
+    label = _OPENAI_IMPORT_LABELS.get(kind)
+    if not label:
+        ui.answer_cb(cb_id, "未知导入类型")
+        return
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "oa_openai_import", {"kind": kind})
+    ui.edit(
+        chat_id, message_id,
+        f"<b>导入 {label} 账户</b>\n\n"
+        "请上传 <code>.zip</code> / <code>.json</code> 文件，或直接粘贴 JSON 文本。\n\n"
+        "我会只提取 <code>email</code> 与 <code>refresh_token</code>，随后复用"
+        "「OpenAI 粘贴 refresh_token」逻辑刷新并导入。\n\n"
+        "<i>导入前会先展示识别到的邮箱列表，请确认后再写入配置。</i>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:import_cancel")]]),
+    )
+
+
+def _parse_openai_import_or_report(chat_id: int, kind: str, payload, *, filename: str = "") -> list[dict] | None:
+    try:
+        candidates = parse_openai_import_payload(kind, payload, filename=filename)
+    except OpenAIImportParseError as exc:
+        ui.send_result(
+            chat_id,
+            f"❌ 解析失败: <code>{ui.escape_html(str(exc))[:800]}</code>",
+            back_label="◀ 返回新增账户", back_callback="oa:add",
+        )
+        return None
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            f"❌ 解析失败: <code>{ui.escape_html(str(exc))[:800]}</code>",
+            back_label="◀ 返回新增账户", back_callback="oa:add",
+        )
+        return None
+    return [c.as_state_item() for c in candidates]
+
+
+def _show_openai_import_preview(chat_id: int, kind: str, items: list[dict]) -> None:
+    label = _OPENAI_IMPORT_LABELS.get(kind, kind.upper())
+    states.set_state(chat_id, "oa_openai_import_confirm", {"kind": kind, "items": items})
+    lines = [f"<b>导入 {label} 账户</b>", "", "当前识别到："]
+    max_show = 30
+    for i, item in enumerate(items[:max_show], 1):
+        email = item.get("email") or "?"
+        source = item.get("source") or ""
+        suffix = f" <i>({ui.escape_html(source)})</i>" if source and len(items) <= 10 else ""
+        lines.append(f"{i}. <code>{ui.escape_html(email)}</code>{suffix}")
+    if len(items) > max_show:
+        lines.append(f"... 另有 {len(items) - max_show} 个")
+    lines.extend(["", "是否立即导入？"])
+    ui.send(
+        chat_id,
+        "\n".join(lines),
+        reply_markup=ui.inline_kb([
+            [ui.btn("❌ 取消", "oa:import_cancel"), ui.btn("✅ 导入", "oa:import_exec")],
+        ]),
+    )
+
+
+def on_import_openai_text_input(chat_id: int, text: str) -> None:
+    state = states.get_state(chat_id)
+    data = (state.get("data") or {}) if state else {}
+    kind = data.get("kind", "")
+    if kind not in _OPENAI_IMPORT_LABELS:
+        states.pop_state(chat_id)
+        ui.send_result(chat_id, "❌ 导入会话已失效，请重新开始。", **_OA_NAV_OPENAI)
+        return
+    items = _parse_openai_import_or_report(chat_id, kind, text or "", filename="pasted-json")
+    if items is None:
+        return
+    _show_openai_import_preview(chat_id, kind, items)
+
+
+def on_import_openai_document_input(chat_id: int, msg: dict) -> None:
+    state = states.get_state(chat_id)
+    data = (state.get("data") or {}) if state else {}
+    kind = data.get("kind", "")
+    if kind not in _OPENAI_IMPORT_LABELS:
+        states.pop_state(chat_id)
+        ui.send_result(chat_id, "❌ 导入会话已失效，请重新开始。", **_OA_NAV_OPENAI)
+        return
+    doc = msg.get("document") or {}
+    file_id = doc.get("file_id") or ""
+    filename = doc.get("file_name") or ""
+    if not file_id:
+        ui.send_result(chat_id, "❌ 没有拿到文件 ID，请重新上传。", **_OA_NAV_OPENAI)
+        return
+    try:
+        payload, tg_path = ui.download_file(file_id, max_bytes=10 * 1024 * 1024)
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            f"❌ 文件下载失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
+            **_OA_NAV_OPENAI,
+        )
+        return
+    if not filename:
+        filename = tg_path.rsplit("/", 1)[-1] or "uploaded-file"
+    items = _parse_openai_import_or_report(chat_id, kind, payload, filename=filename)
+    if items is None:
+        return
+    _show_openai_import_preview(chat_id, kind, items)
+
+
+def on_import_openai_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
+    states.pop_state(chat_id)
+    on_add_menu(chat_id, message_id, cb_id)
+
+
+def _format_import_error(exc: Exception | None) -> str:
+    if exc is None:
+        return "未知错误"
+    return str(exc)[:240]
+
+
+def _import_candidate_with_policy(item: dict) -> tuple[str, str, str]:
+    """导入单个候选；返回 (status, email, message)。"""
+    email_hint = str(item.get("email") or "").strip()
+    rt = str(item.get("refresh_token") or "").strip()
+    if not rt:
+        return "failed", email_hint or "?", "缺少 refresh_token"
+
+    entry, meta, import_err = _refresh_openai_rt_to_entry(rt, email_hint=email_hint)
+    if entry is not None:
+        action, msg = _save_openai_entry_with_duplicate_policy(entry)
+        return action, meta.get("email") or entry.get("email") or email_hint, msg
+
+    # 新 token 无效时，若同邮箱已有账号，则验证现有账号；现有有效就继续用现有。
+    existing = _find_openai_account_by_email(email_hint)
+    if existing is not None:
+        existing_entry, _, existing_err = _refresh_openai_rt_to_entry(
+            existing.get("refresh_token", ""), email_hint=email_hint,
+        )
+        if existing_entry is not None:
+            _upsert_openai_account_entry(existing_entry, preserve_existing_settings=True)
+            return "skipped", email_hint, "导入 token 无效，现有 token 有效，已保留现有账号"
+        return "failed", email_hint, (
+            "导入 token 与现有 token 均无效；"
+            f"导入错误: {_format_import_error(import_err)}；现有错误: {_format_import_error(existing_err)}"
+        )
+
+    return "failed", email_hint or "?", _format_import_error(import_err)
+
+
+def on_import_openai_exec(chat_id: int, message_id: int, cb_id: str) -> None:
+    state = states.pop_state(chat_id)
+    if not state or state.get("action") != "oa_openai_import_confirm":
+        ui.answer_cb(cb_id, "导入会话已失效", show_alert=True)
+        return
+    data = state.get("data") or {}
+    kind = data.get("kind", "")
+    label = _OPENAI_IMPORT_LABELS.get(kind, kind.upper())
+    items = list(data.get("items") or [])
+    if not items:
+        ui.answer_cb(cb_id, "没有可导入账号", show_alert=True)
+        return
+
+    ui.answer_cb(cb_id, "开始导入…")
+    ui.edit(chat_id, message_id, f"正在导入 {label} 账户，共 {len(items)} 个，请稍等…")
+
+    buckets = {"added": [], "replaced": [], "skipped": [], "failed": []}
+    for item in items:
+        status, email, msg = _import_candidate_with_policy(item)
+        buckets.setdefault(status, []).append((email, msg))
+
+    lines = [f"<b>导入 {label} 账户完成</b>", ""]
+    if buckets["added"]:
+        lines.append(f"✅ 新增 {len(buckets['added'])} 个")
+        for email, _ in buckets["added"][:20]:
+            lines.append(f"• <code>{ui.escape_html(email)}</code>")
+        if len(buckets["added"]) > 20:
+            lines.append(f"• ... 另有 {len(buckets['added']) - 20} 个")
+        lines.append("")
+    if buckets["replaced"]:
+        lines.append(f"🔁 替换 {len(buckets['replaced'])} 个（现有 token 无效，已用导入 token）")
+        for email, _ in buckets["replaced"][:20]:
+            lines.append(f"• <code>{ui.escape_html(email)}</code>")
+        if len(buckets["replaced"]) > 20:
+            lines.append(f"• ... 另有 {len(buckets['replaced']) - 20} 个")
+        lines.append("")
+    if buckets["skipped"]:
+        lines.append(f"⚠️ 跳过 {len(buckets['skipped'])} 个")
+        for email, msg in buckets["skipped"][:20]:
+            lines.append(f"• <code>{ui.escape_html(email)}</code>：{ui.escape_html(msg)}")
+        if len(buckets["skipped"]) > 20:
+            lines.append(f"• ... 另有 {len(buckets['skipped']) - 20} 个")
+        lines.append("")
+    if buckets["failed"]:
+        lines.append(f"❌ 失败 {len(buckets['failed'])} 个")
+        for email, msg in buckets["failed"][:20]:
+            lines.append(f"• <code>{ui.escape_html(email)}</code>：{ui.escape_html(msg)}")
+        if len(buckets["failed"]) > 20:
+            lines.append(f"• ... 另有 {len(buckets['failed']) - 20} 个")
+        lines.append("")
+    if not any(buckets.values()):
+        lines.append("没有账号被处理。")
+
+    ui.edit(
+        chat_id, message_id,
+        "\n".join(lines).rstrip(),
+        reply_markup=ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]]),
+    )
+
+
+# ─── 移除失效账户 ─────────────────────────────────────────────────
+
+def _invalid_accounts() -> list[dict]:
+    return [
+        a for a in oauth_manager.list_accounts()
+        if a.get("email") and a.get("disabled_reason") == "auth_error"
+    ]
+
+
+def _invalid_select_token(account_key: str) -> str:
+    return ui.register_code(account_key)
+
+
+def _invalid_account_keys() -> list[str]:
+    return [_account_key(a) for a in _invalid_accounts()]
+
+
+def _render_invalid_remove(chat_id: int, message_id: int, *, selected: set[str] | None = None) -> None:
+    selected = set(selected or set())
+    invalid = _invalid_accounts()
+    selected &= {_account_key(a) for a in invalid}
+
+    lines = [
+        "<b>移除失效账户</b>",
+        "",
+        "请在下方选择要移除的失效账户",
+    ]
+    rows: list[list[dict]] = []
+    if not invalid:
+        lines.append("")
+        lines.append("当前没有认证失效账户。")
+    else:
+        for idx, acc in enumerate(invalid, 1):
+            ak = _account_key(acc)
+            email = acc.get("email") or "?"
+            mark = "✅ " if ak in selected else "☐ "
+            lines.append(f"{idx}. <code>{ui.escape_html(email)}</code>")
+            rows.append([ui.btn(f"{mark}{email}", f"oa:invalid:toggle:{_invalid_select_token(ak)}")])
+
+    rows.append([
+        ui.btn("全部移除", "oa:invalid:remove_all"),
+        ui.btn("移除选中", "oa:invalid:remove_selected"),
+    ])
+    rows.append([
+        ui.btn("返回主菜单", "menu:main"),
+        ui.btn("返回账户管理", "menu:oauth"),
+    ])
+    states.set_state(chat_id, "oa_invalid_remove", {"selected": sorted(selected)})
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
+
+
+def on_invalid_remove_start(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    _render_invalid_remove(chat_id, message_id, selected=set())
+
+
+def on_invalid_remove_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    if ak not in set(_invalid_account_keys()):
+        ui.answer_cb(cb_id, "该账户已不在失效列表")
+        _render_invalid_remove(chat_id, message_id, selected=set())
+        return
+    state = states.get_state(chat_id) or {}
+    selected = set((state.get("data") or {}).get("selected") or [])
+    if ak in selected:
+        selected.remove(ak)
+        ui.answer_cb(cb_id, "已取消选择")
+    else:
+        selected.add(ak)
+        ui.answer_cb(cb_id, "已选择")
+    _render_invalid_remove(chat_id, message_id, selected=selected)
+
+
+def _delete_accounts_by_keys(keys: list[str]) -> tuple[int, list[str]]:
+    deleted = 0
+    failed: list[str] = []
+    for ak in keys:
+        acc = oauth_manager.get_account(ak)
+        email = (acc or {}).get("email") or _split_ak(ak)[1]
+        try:
+            oauth_manager.delete_account(ak)
+            deleted += 1
+        except Exception as exc:
+            failed.append(f"{email}: {exc}")
+    return deleted, failed
+
+
+def on_invalid_remove_exec(chat_id: int, message_id: int, cb_id: str, *, all_items: bool) -> None:
+    invalid_keys = _invalid_account_keys()
+    if all_items:
+        targets = invalid_keys
+    else:
+        state = states.get_state(chat_id) or {}
+        selected = set((state.get("data") or {}).get("selected") or [])
+        valid = set(invalid_keys)
+        targets = [ak for ak in invalid_keys if ak in selected and ak in valid]
+
+    if not targets:
+        ui.answer_cb(cb_id, "没有选择可移除的失效账户", show_alert=True)
+        return
+
+    ui.answer_cb(cb_id, "正在移除…")
+    deleted, failed = _delete_accounts_by_keys(targets)
+    states.pop_state(chat_id)
+
+    lines = ["<b>移除失效账户完成</b>", "", f"✅ 已移除 {deleted} 个"]
+    if failed:
+        lines.append(f"❌ 失败 {len(failed)} 个")
+        for item in failed[:20]:
+            lines.append(f"• <code>{ui.escape_html(item)}</code>")
+        if len(failed) > 20:
+            lines.append(f"• ... 另有 {len(failed) - 20} 个")
+    ui.edit(
+        chat_id, message_id,
+        "\n".join(lines),
+        reply_markup=ui.inline_kb([
+            [ui.btn("返回主菜单", "menu:main"), ui.btn("返回账户管理", "menu:oauth")],
+        ]),
+    )
+
+
 # ─── 路由分发 ─────────────────────────────────────────────────────
 
-def on_clear_all_errors(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
+def on_clear_all_errors(chat_id: int, message_id: int, cb_id: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     """清除所有 OAuth 账户的模型冷却（按 oauth: 前缀批量 clear）。"""
     from ... import cooldown as _cd
     cd_keys = sorted({
@@ -1431,7 +1954,7 @@ def on_clear_all_errors(chat_id: int, message_id: int, cb_id: str, page: int = 1
         _cd.clear(ck, model=None)
         cleared += 1
     ui.answer_cb(cb_id, f"已清除 {cleared} 个账户的冷却")
-    show(chat_id, message_id, page=page)
+    show(chat_id, message_id, page=page, filter_key=filter_key)
 
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
@@ -1439,29 +1962,20 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         show(chat_id, message_id, cb_id)
         return True
     if data == "oa:refresh_all" or data.startswith("oa:refresh_all:"):
-        try:
-            page = int(data.rsplit(":", 1)[1]) if ":" in data[len("oa:refresh_all"):] else 1
-        except ValueError:
-            page = 1
-        on_refresh_all(chat_id, message_id, cb_id, page=page)
+        page, filter_key = _parse_page_filter(data[len("oa:refresh_all:"):] if data.startswith("oa:refresh_all:") else "")
+        on_refresh_all(chat_id, message_id, cb_id, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:page:"):
-        page_str = data.split(":", 2)[2]
-        if page_str == "noop":
+        payload = data.split(":", 2)[2]
+        if payload == "noop":
             ui.answer_cb(cb_id, "当前页")
             return True
-        try:
-            page = int(page_str)
-        except ValueError:
-            page = 1
-        show(chat_id, message_id, cb_id, page=page)
+        page, filter_key = _parse_page_filter(payload)
+        show(chat_id, message_id, cb_id, page=page, filter_key=filter_key)
         return True
     if data == "oa:clear_all_errors" or data.startswith("oa:clear_all_errors:"):
-        try:
-            page = int(data.rsplit(":", 1)[1]) if ":" in data[len("oa:clear_all_errors"):] else 1
-        except ValueError:
-            page = 1
-        on_clear_all_errors(chat_id, message_id, cb_id, page=page)
+        page, filter_key = _parse_page_filter(data[len("oa:clear_all_errors:"):] if data.startswith("oa:clear_all_errors:") else "")
+        on_clear_all_errors(chat_id, message_id, cb_id, page=page, filter_key=filter_key)
         return True
     if data == "oa:add":
         on_add_menu(chat_id, message_id, cb_id)
@@ -1487,42 +2001,63 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "oa:set_rt:openai":
         on_set_rt_openai_start(chat_id, message_id, cb_id)
         return True
+    if data.startswith("oa:import:"):
+        on_import_openai_start(chat_id, message_id, cb_id, data.rsplit(":", 1)[-1])
+        return True
+    if data == "oa:import_cancel":
+        on_import_openai_cancel(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:import_exec":
+        on_import_openai_exec(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:invalid:list":
+        on_invalid_remove_start(chat_id, message_id, cb_id)
+        return True
+    if data.startswith("oa:invalid:toggle:"):
+        on_invalid_remove_toggle(chat_id, message_id, cb_id, data.split(":", 3)[3])
+        return True
+    if data == "oa:invalid:remove_all":
+        on_invalid_remove_exec(chat_id, message_id, cb_id, all_items=True)
+        return True
+    if data == "oa:invalid:remove_selected":
+        on_invalid_remove_exec(chat_id, message_id, cb_id, all_items=False)
+        return True
 
     if data.startswith("oa:view:"):
-        short, page = _split_short_page(data.split(":", 2)[2])
-        on_view(chat_id, message_id, cb_id, short, page=page)
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_view(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:refresh_token:"):
-        short, page = _split_short_page(data.split(":", 2)[2])
-        on_refresh_token(chat_id, message_id, cb_id, short, page=page)
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_refresh_token(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:refresh_usage:"):
-        short, page = _split_short_page(data.split(":", 2)[2])
-        on_refresh_usage(chat_id, message_id, cb_id, short, page=page)
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_refresh_usage(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:clear_errors:"):
-        short, page = _split_short_page(data.split(":", 2)[2])
-        on_clear_errors(chat_id, message_id, cb_id, short, page=page)
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_clear_errors(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:clear_affinity:"):
-        short, page = _split_short_page(data.split(":", 2)[2])
-        on_clear_affinity(chat_id, message_id, cb_id, short, page=page)
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_clear_affinity(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:toggle:"):
-        short, page = _split_short_page(data.split(":", 2)[2])
-        on_toggle(chat_id, message_id, cb_id, short, page=page)
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_toggle(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:delete_ask:"):
-        short, page = _split_short_page(data.split(":", 2)[2])
-        on_delete_ask(chat_id, message_id, cb_id, short, page=page)
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_delete_ask(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:delete_exec:"):
-        short, page = _split_short_page(data.split(":", 2)[2])
-        on_delete_exec(chat_id, message_id, cb_id, short, page=page)
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_delete_exec(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:emax:"):
-        short, page = _split_short_page(data.split(":", 2)[2])
-        on_edit_max_concurrent(chat_id, message_id, cb_id, short, page=page)
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_edit_max_concurrent(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     return False
 
@@ -1540,28 +2075,38 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
     if action == "oa_openai_rt":
         on_set_rt_openai_input(chat_id, text)
         return True
+    if action == "oa_openai_import":
+        on_import_openai_text_input(chat_id, text)
+        return True
     if action == "oa_emax":
         on_edit_max_concurrent_input(chat_id, text)
         return True
     return False
 
 
+def handle_document_state(chat_id: int, action: str, msg: dict) -> bool:
+    if action == "oa_openai_import":
+        on_import_openai_document_input(chat_id, msg)
+        return True
+    return False
+
+
 # ─── 并发上限编辑 ─────────────────────────────────────────────────
 
-def on_edit_max_concurrent(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+def on_edit_max_concurrent(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
     ui.answer_cb(cb_id)
-    states.set_state(chat_id, "oa_emax", {"account_key": ak, "short": short, "page": page})
+    states.set_state(chat_id, "oa_emax", {"account_key": ak, "short": short, "page": page, "filter_key": _normalize_filter(filter_key)})
     ui.edit(
         chat_id, message_id,
         "请输入该 OAuth 账户的并发上限（整数 ≥0）：\n"
         "• <code>0</code> = 使用全局默认（「⚙ 系统设置 → ⚡ 并发限制」里配的 defaultMaxConcurrent）\n"
         "• 正整数 = 该账户同时允许最多 N 个在途请求，超出则排队\n\n"
         "例：<code>3</code>",
-        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", f"oa:view:{_callback_payload(short, page)}")]]),
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", f"oa:view:{_callback_payload(short, page, filter_key)}")]]),
     )
 
 
@@ -1571,6 +2116,7 @@ def on_edit_max_concurrent_input(chat_id: int, text: str) -> None:
     ak = data.get("account_key")
     short = data.get("short", "")
     page = int(data.get("page") or 1)
+    filter_key = _normalize_filter(data.get("filter_key"))
     if not ak:
         ui.send(chat_id, "❌ 状态已失效，请重新进入编辑")
         states.pop_state(chat_id)
@@ -1591,6 +2137,6 @@ def on_edit_max_concurrent_input(chat_id: int, text: str) -> None:
     label = "默认" if v == 0 else str(v)
     ui.send_result(
         chat_id, f"✅ 并发上限已更新为 <code>{label}</code>",
-        extra_rows=[[ui.btn("◀ 返回账户详情", f"oa:view:{_callback_payload(short, page)}")]],
+        extra_rows=[[ui.btn("◀ 返回账户详情", f"oa:view:{_callback_payload(short, page, filter_key)}")]],
         back_label="🏠 主菜单", back_callback="menu:main",
     )

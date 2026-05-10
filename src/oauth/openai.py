@@ -40,11 +40,15 @@ SCOPES_AUTHORIZE = "openid profile email offline_access"
 # 刷新时 scope 不能带 offline_access（sub2api 经验，带了会被拒）
 SCOPES_REFRESH = "openid profile email"
 
-# 固定的 Codex CLI User-Agent。未来若观察到被针对可加开关。
-USER_AGENT = "codex_cli_rs/0.104.0"
+# 固定的 Codex CLI User-Agent。与 sub2api 最新 Codex 上游请求指纹保持一致。
+USER_AGENT = "codex_cli_rs/0.125.0"
 
 # 运行期请求超时（换 token / 刷 token）。
-_TOKEN_HTTP_TIMEOUT = 15.0
+_TOKEN_HTTP_TIMEOUT = 120.0
+
+# ChatGPT backend-api accounts/check：用于在 token 刷新后补全最新 plan / 订阅过期时间。
+ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+_ACCOUNTS_CHECK_TIMEOUT = 15.0
 
 
 # ─── mock 开关（与 oauth_manager.mock_mode_enabled 同语义） ────────
@@ -143,6 +147,7 @@ def _post_token_form(data: dict) -> dict:
         data=data,
         headers={
             "content-type": "application/x-www-form-urlencoded",
+            "accept": "application/json",
             "user-agent": USER_AGENT,
         },
         timeout=_TOKEN_HTTP_TIMEOUT,
@@ -151,18 +156,158 @@ def _post_token_form(data: dict) -> dict:
     return resp.json()
 
 
+
+def _extract_org_id_from_token(token: str | None) -> str:
+    """从 access_token/id_token payload 里提取 OpenAI poid/org id（不验签）。"""
+    if not token:
+        return ""
+    try:
+        claims = decode_id_token(token)
+    except Exception:
+        return ""
+    openai_auth = claims.get("https://api.openai.com/auth") or {}
+    if not isinstance(openai_auth, dict):
+        return ""
+    return str(openai_auth.get("poid") or "")
+
+
+def _extract_plan_type(account: dict) -> str:
+    acct = account.get("account")
+    if isinstance(acct, dict):
+        plan = acct.get("plan_type")
+        if isinstance(plan, str) and plan:
+            return plan
+    ent = account.get("entitlement")
+    if isinstance(ent, dict):
+        plan = ent.get("subscription_plan")
+        if isinstance(plan, str) and plan:
+            return plan
+    return ""
+
+
+def _extract_subscription_expires_at(account: dict) -> str:
+    ent = account.get("entitlement")
+    if isinstance(ent, dict):
+        expires_at = ent.get("expires_at")
+        if isinstance(expires_at, str):
+            return expires_at
+    return ""
+
+
+def _extract_email_from_account(account: dict) -> str:
+    acct = account.get("account")
+    if isinstance(acct, dict):
+        email = acct.get("email")
+        if isinstance(email, str) and email:
+            return email
+    user = account.get("user")
+    if isinstance(user, dict):
+        email = user.get("email")
+        if isinstance(email, str) and email:
+            return email
+    return ""
+
+
+def _account_check_candidate(account: dict) -> dict:
+    return {
+        "plan_type": _extract_plan_type(account),
+        "subscription_expires_at": _extract_subscription_expires_at(account),
+        "email": _extract_email_from_account(account),
+    }
+
+
+def fetch_accounts_check_sync(access_token: str, *, org_id: str | None = None) -> dict | None:
+    """调用 ChatGPT accounts/check 补全 plan / subscription 信息。
+
+    这是 best-effort 辅助能力：失败、结构不符合预期、无 plan 时均返回 None，
+    调用方继续使用 id_token 里的信息，不影响 token 刷新主流程。
+    """
+    if not access_token or _mock_mode_enabled():
+        return None
+    org_id = str(org_id or _extract_org_id_from_token(access_token) or "")
+    try:
+        resp = httpx.get(
+            ACCOUNTS_CHECK_URL,
+            headers={
+                "authorization": f"Bearer {access_token}",
+                "origin": "https://chatgpt.com",
+                "referer": "https://chatgpt.com/",
+                "accept": "application/json",
+                "user-agent": USER_AGENT,
+            },
+            timeout=_ACCOUNTS_CHECK_TIMEOUT,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:
+        return None
+
+    accounts = payload.get("accounts") if isinstance(payload, dict) else None
+    if not isinstance(accounts, dict):
+        return None
+
+    if org_id:
+        raw = accounts.get(org_id)
+        if isinstance(raw, dict):
+            info = _account_check_candidate(raw)
+            if info.get("plan_type"):
+                return info
+
+    default_c: dict | None = None
+    paid_c: dict | None = None
+    any_c: dict | None = None
+    for raw in accounts.values():
+        if not isinstance(raw, dict):
+            continue
+        info = _account_check_candidate(raw)
+        if not info.get("plan_type"):
+            continue
+        if any_c is None:
+            any_c = info
+        acct = raw.get("account")
+        if isinstance(acct, dict) and acct.get("is_default") is True:
+            default_c = info
+        if str(info.get("plan_type") or "").lower() != "free" and paid_c is None:
+            paid_c = info
+
+    return default_c or paid_c or any_c
+
+
+def enrich_token_response_sync(data: dict) -> dict:
+    """用 accounts/check 补全 token 响应中的 plan / subscription 信息。"""
+    if not isinstance(data, dict) or not data.get("access_token"):
+        return data
+
+    org_id = ""
+    if data.get("id_token"):
+        try:
+            info = extract_user_info(decode_id_token(data["id_token"]))
+            org_id = str(info.get("organization_id") or "")
+        except Exception:
+            org_id = ""
+    info = fetch_accounts_check_sync(data.get("access_token", ""), org_id=org_id)
+    if not info:
+        return data
+
+    enriched = dict(data)
+    for key in ("plan_type", "subscription_expires_at", "email"):
+        val = info.get(key)
+        if val:
+            enriched[key] = val
+    return enriched
+
 def exchange_code_sync(code: str, code_verifier: str,
                        *, redirect_uri: str | None = None) -> dict:
     """同步版：换 token。mockMode 下返回假 token 响应。"""
     if _mock_mode_enabled():
         return _mock_token_response()
-    return _post_token_form({
+    return enrich_token_response_sync(_post_token_form({
         "grant_type": "authorization_code",
         "client_id": CLIENT_ID,
         "code": code,
         "redirect_uri": redirect_uri or REDIRECT_URI,
         "code_verifier": code_verifier,
-    })
+    }))
 
 
 async def exchange_code(code: str, code_verifier: str,
@@ -179,12 +324,12 @@ def refresh_sync(refresh_token: str, *, email: str | None = None) -> dict:
     """
     if _mock_mode_enabled():
         return _mock_token_response(email)
-    return _post_token_form({
+    return enrich_token_response_sync(_post_token_form({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
         "scope": SCOPES_REFRESH,
-    })
+    }))
 
 
 async def refresh(refresh_token: str, *, email: str | None = None) -> dict:

@@ -225,6 +225,40 @@ def delete_message(chat_id: int, message_id: int) -> Optional[dict]:
     return api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
 
 
+def download_file(file_id: str, *, max_bytes: int = 10 * 1024 * 1024) -> tuple[bytes, str]:
+    """下载 Telegram 文件到内存，返回 (content, file_path)。"""
+    if not _bot_token:
+        raise RuntimeError("telegram bot token is not configured")
+    meta = api("getFile", {"file_id": file_id})
+    if not isinstance(meta, dict) or not meta.get("ok"):
+        raise RuntimeError("getFile failed")
+    result = meta.get("result") or {}
+    file_path = str(result.get("file_path") or "")
+    if not file_path:
+        raise RuntimeError("getFile returned empty file_path")
+    file_size = result.get("file_size")
+    try:
+        if file_size is not None and int(file_size) > max_bytes:
+            raise RuntimeError(f"file too large: {int(file_size)} bytes")
+    except ValueError:
+        pass
+
+    url = f"https://api.telegram.org/file/bot{_bot_token}/{file_path}"
+    session = _get_session()
+    try:
+        resp = session.get(url)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status = getattr(exc.response, "status_code", "?")
+        raise RuntimeError(f"download file failed: HTTP {status}") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"download file failed: {type(exc).__name__}") from exc
+    content = resp.content
+    if len(content) > max_bytes:
+        raise RuntimeError(f"file too large: {len(content)} bytes")
+    return content, file_path
+
+
 def send_photo(chat_id: int, path: str, caption: str = "") -> Optional[dict]:
     """发送本地图片文件。用于图片日志的「查看图片」按钮。"""
     if not _bot_token:

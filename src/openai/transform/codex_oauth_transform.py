@@ -10,7 +10,8 @@
   - `stream=true` 强制（OAuth 上游仅支持流式 SSE）
   - 删除 Responses API 里上游不支持的字段：max_output_tokens /
     max_completion_tokens / temperature / top_p / frequency_penalty /
-    presence_penalty / prompt_cache_retention
+    presence_penalty / prompt_cache_retention / user / metadata /
+    safety_identifier / stream_options
   - 模型名：**直接透传 resolved_model**（不做任何别名映射）。
     账号层 `supports_model` 已经用账号 `models` + `defaultModels` 做了白名单
     校验，进到这里的都是合法模型名；上游无论叫 gpt-5.1 / gpt-5.5 / 下个月出的
@@ -22,10 +23,9 @@
   - `input[]` 里的 role=system 消息提取到 `instructions`（上游 input 不接受
     system role）
 
-工具调用续链（item_reference / call_* → fc*）这里**暂不搬**——它是 sub2api
-为 function call 恢复 call_id 上下文做的兼容层，需要 state_store 保存。Commit 2
-目标是跑通单轮请求；续链支持放后续。对应未续链场景，sub2api 也会正常删除
-item_reference，等效于我们这里的实现。
+工具调用续链现在按 sub2api 的 OAuth transform 做最小兼容：过滤 store=false
+上游无法解析的 reasoning/item_reference/id，规范化 call_id 与 tool_choice，避免
+ChatGPT internal Codex endpoint 把本地响应 ID 当成持久化引用去查。
 
 历史：早期版本（v0.4.x ~ v0.5.x）从 sub2api 移植了一张 _CODEX_MODEL_MAP 翻译表，
 把各种别名（gpt-5 / gpt-5-codex / gpt-5.3-xhigh 等）映射到上游规范名，
@@ -39,6 +39,7 @@ item_reference，等效于我们这里的实现。
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -56,6 +57,13 @@ _STRIP_FIELDS_FOR_CODEX = (
     "presence_penalty",
     # 新版 Responses API 的缓存 TTL；Codex endpoint 拒绝 "Unsupported parameter"
     "prompt_cache_retention",
+    # ChatGPT internal Codex endpoint 不接受这些 Responses API 通用字段
+    "user",
+    "metadata",
+    "safety_identifier",
+    "stream_options",
+    # OAuth Codex 强制 store=false，不能把 Responses 持久化引用直传给上游。
+    "previous_response_id",
 )
 
 
@@ -217,24 +225,279 @@ def _normalize_codex_tools(body: dict) -> bool:
     return modified
 
 
-def _strip_reasoning_ids(body: dict) -> int:
-    """把 body.input 里 type=reasoning 的项目的 id 字段去掉（保留 summary/content）。
+def _first_non_empty_string(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
-    Codex OAuth 上游  时不能接受带 rs_* id 的 reasoning item，
-    会返回 404 "Item with id ... not found"。官方 Codex CLI 的做法是发
-    无 id 的 reasoning 项，把 summary/content 原样给模型看。
 
-    返回实际修改的条数。
+def _codex_tools_contain_type(raw_tools: Any, tool_type: str) -> bool:
+    if not isinstance(raw_tools, list) or not tool_type:
+        return False
+    for raw in raw_tools:
+        if isinstance(raw, dict) and str(raw.get("type") or "").strip() == tool_type:
+            return True
+    return False
+
+
+def _codex_tools_contain_function_name(raw_tools: Any, name: str) -> bool:
+    if not isinstance(raw_tools, list) or not name:
+        return False
+    for raw in raw_tools:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("type") or "").strip() != "function":
+            continue
+        tool_name = _first_non_empty_string(raw.get("name"))
+        fn = raw.get("function")
+        if not tool_name and isinstance(fn, dict):
+            tool_name = _first_non_empty_string(fn.get("name"))
+        if tool_name == name:
+            return True
+    return False
+
+
+def _normalize_codex_tool_choice(body: dict) -> bool:
+    """把 tool_choice 规范化成 Codex endpoint 接受的结构。
+
+    function 类型统一为 {type:function, name:<name>}；若指向不存在的工具，
+    降级为 "auto"，避免上游 400。
     """
+    choice = body.get("tool_choice")
+    if not isinstance(choice, dict):
+        return False
+    choice_type = _first_non_empty_string(choice.get("type"))
+    if not choice_type:
+        return False
+    if choice_type == "function":
+        fn = choice.get("function")
+        name = _first_non_empty_string(choice.get("name"))
+        if not name and isinstance(fn, dict):
+            name = _first_non_empty_string(fn.get("name"))
+        if not name or not _codex_tools_contain_function_name(body.get("tools"), name):
+            body["tool_choice"] = "auto"
+            return True
+        modified = False
+        if choice.get("name") != name:
+            choice["name"] = name
+            modified = True
+        if "function" in choice:
+            choice.pop("function", None)
+            modified = True
+        return modified
+    if _codex_tools_contain_type(body.get("tools"), choice_type):
+        return False
+    body["tool_choice"] = "auto"
+    return True
+
+
+_CODEX_TOOL_CALL_TYPES = {
+    "function_call",
+    "tool_call",
+    "local_shell_call",
+    "tool_search_call",
+    "custom_tool_call",
+    "mcp_tool_call",
+    "function_call_output",
+    "mcp_tool_call_output",
+    "custom_tool_call_output",
+    "tool_search_output",
+}
+
+_CODEX_INPUT_ITEM_TYPES_REQUIRING_NAME = {
+    "function_call",
+    "custom_tool_call",
+    "mcp_tool_call",
+}
+
+
+def _is_codex_tool_call_item_type(item_type: str) -> bool:
+    return item_type in _CODEX_TOOL_CALL_TYPES
+
+
+def _codex_input_item_requires_name(item_type: str) -> bool:
+    return item_type in _CODEX_INPUT_ITEM_TYPES_REQUIRING_NAME
+
+
+def _has_tools_signal(body: dict) -> bool:
+    tools = body.get("tools")
+    return isinstance(tools, list) and len(tools) > 0
+
+
+def _has_tool_choice_signal(body: dict) -> bool:
+    choice = body.get("tool_choice")
+    if choice is None:
+        return False
+    if isinstance(choice, str):
+        return choice.strip() not in ("", "auto", "none")
+    return isinstance(choice, dict) and bool(choice)
+
+
+def _needs_tool_continuation(body: dict) -> bool:
+    if _first_non_empty_string(body.get("previous_response_id")):
+        return True
+    if _has_tools_signal(body) or _has_tool_choice_signal(body):
+        return True
     inp = body.get("input")
     if not isinstance(inp, list):
-        return 0
-    n = 0
-    for it in inp:
-        if isinstance(it, dict) and it.get("type") == "reasoning" and "id" in it:
-            it.pop("id", None)
-            n += 1
-    return n
+        return False
+    for item in inp:
+        if not isinstance(item, dict):
+            continue
+        typ = str(item.get("type") or "")
+        if _is_codex_tool_call_item_type(typ) or typ == "item_reference":
+            return True
+    return False
+
+
+def _fix_call_id_prefix(call_id: str) -> str:
+    if not call_id or call_id.startswith("fc"):
+        return call_id
+    if call_id.startswith("call_"):
+        return "fc" + call_id[len("call_"):]
+    return "fc_" + call_id
+
+
+def _normalize_codex_tool_role_messages(input_items: list[Any]) -> tuple[list[Any], bool]:
+    """把 role=tool 的 message 规范成 function_call_output。"""
+    modified = False
+    out: list[Any] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        role = str(item.get("role") or "").strip()
+        if role != "tool":
+            out.append(item)
+            continue
+        call_id = _first_non_empty_string(item.get("call_id"), item.get("tool_call_id"), item.get("id"))
+        if not call_id:
+            fallback = dict(item)
+            fallback["role"] = "user"
+            fallback.pop("tool_call_id", None)
+            fallback.pop("call_id", None)
+            out.append(fallback)
+            modified = True
+            continue
+        normalized = {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": _content_to_plain_text(item.get("content", "")),
+        }
+        name = _first_non_empty_string(item.get("name"), item.get("tool_name"))
+        if name:
+            normalized["name"] = name
+        out.append(normalized)
+        modified = True
+    return out, modified
+
+
+def _stringify_codex_content_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return str(value)
+
+
+def _normalize_codex_message_content_text(input_items: list[Any]) -> tuple[list[Any], bool]:
+    """Codex endpoint 要求 content parts 的 text 是字符串。"""
+    modified = False
+    out: list[Any] = []
+    for item in input_items:
+        if not isinstance(item, dict) or not isinstance(item.get("content"), list):
+            out.append(item)
+            continue
+        new_item = item
+        new_parts = list(item["content"])
+        item_modified = False
+        for idx, part in enumerate(new_parts):
+            if not isinstance(part, dict) or "text" not in part or isinstance(part.get("text"), str):
+                continue
+            new_part = dict(part)
+            new_part["text"] = _stringify_codex_content_text(part.get("text"))
+            new_parts[idx] = new_part
+            item_modified = True
+        if item_modified:
+            new_item = dict(item)
+            new_item["content"] = new_parts
+            modified = True
+        out.append(new_item)
+    return out, modified
+
+
+def _filter_codex_input(input_items: list[Any], *, preserve_references: bool) -> list[Any]:
+    filtered: list[Any] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            filtered.append(item)
+            continue
+        typ = str(item.get("type") or "")
+
+        # store=false 时 reasoning / rs_* 引用无法从上游持久化存储读取；直接丢弃。
+        if typ == "reasoning":
+            continue
+
+        if typ == "item_reference":
+            if not preserve_references:
+                continue
+            ref = dict(item)
+            ref_id = _first_non_empty_string(ref.get("id"))
+            if ref_id.startswith("call_"):
+                ref["id"] = _fix_call_id_prefix(ref_id)
+            filtered.append(ref)
+            continue
+
+        new_item = dict(item)
+
+        if _is_codex_tool_call_item_type(typ):
+            call_id = _first_non_empty_string(new_item.get("call_id"))
+            if not call_id:
+                call_id = _first_non_empty_string(new_item.get("id"))
+                if call_id:
+                    new_item["call_id"] = call_id
+            if call_id:
+                fixed = _fix_call_id_prefix(call_id)
+                if fixed != call_id:
+                    new_item["call_id"] = fixed
+        else:
+            new_item.pop("call_id", None)
+
+        if _codex_input_item_requires_name(typ) and not _first_non_empty_string(new_item.get("name")):
+            name = _first_non_empty_string(new_item.get("tool_name"))
+            fn = new_item.get("function")
+            if not name and isinstance(fn, dict):
+                name = _first_non_empty_string(fn.get("name"))
+            new_item["name"] = name or "tool"
+
+        if not preserve_references:
+            new_item.pop("id", None)
+
+        filtered.append(new_item)
+    return filtered
+
+
+def _normalize_codex_input(body: dict) -> bool:
+    inp = body.get("input")
+    if not isinstance(inp, list):
+        return False
+    modified = False
+    normalized, changed = _normalize_codex_tool_role_messages(inp)
+    modified = modified or changed
+    normalized, changed = _normalize_codex_message_content_text(normalized)
+    modified = modified or changed
+    filtered = _filter_codex_input(
+        normalized,
+        preserve_references=_needs_tool_continuation(body),
+    )
+    if filtered != inp:
+        modified = True
+    body["input"] = filtered
+    return modified
 
 
 def apply_codex_oauth_transform(
@@ -263,12 +526,6 @@ def apply_codex_oauth_transform(
     body["store"] = False
     body["stream"] = True
 
-    # 2.5) store=false 时，input 中 reasoning items 携带的 rs_* id
-    #      会让上游按从持久化里取的语义查，结果 404
-    #      （Item with id 'rs_...' not found. Items are not persisted when store is set to false）。
-    #      Codex CLI 官方行为是无状态引用，直接剥掉 id 字段，保留 summary/content 给模型看。
-    _strip_reasoning_ids(body)
-
     # 3) 剥不支持字段
     for k in _STRIP_FIELDS_FOR_CODEX:
         body.pop(k, None)
@@ -281,6 +538,7 @@ def apply_codex_oauth_transform(
     #      是 chat（由 chat_to_responses 翻译后一般已扁平，但防御性再跑一遍）
     #      还是 responses（下游可能直接用 ChatCompletions 格式）都要兜底。
     _normalize_codex_tools(body)
+    _normalize_codex_tool_choice(body)
 
     # 5) input 字符串 → 数组；再把 input 里的 system 消息提到 instructions
     _coerce_input_to_list(body)
@@ -291,6 +549,9 @@ def apply_codex_oauth_transform(
             body["instructions"] = sys_text
         else:
             body["instructions"] = f"{orig}\n\n{sys_text}"
+
+    # 5.5) store=false 兼容：过滤 reasoning/item_reference/id，规范化 call_id。
+    _normalize_codex_input(body)
 
     # 6) instructions 兜底（sub2api 行为：空 → 一行 fallback）
     if _is_empty_str(body.get("instructions")):

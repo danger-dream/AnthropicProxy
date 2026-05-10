@@ -292,6 +292,9 @@ def _handle_message(msg: dict) -> None:
     print(f"[tg] state for {chat_id}: {_summarize_state(state)}")        # DEBUG
     if state:
         action = state.get("action", "")
+        if msg.get("document") and oauth_menu.handle_document_state(chat_id, action, msg):
+            print(f"[tg] handled document by oauth_menu (action={action})")
+            return
         if apikey_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by apikey_menu (action={action})")  # DEBUG
             return

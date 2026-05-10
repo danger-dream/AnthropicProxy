@@ -148,6 +148,15 @@ def test_list_empty_and_populated(m):
     assert "oa:add" in flat
     assert "oa:refresh_all:1" in flat
     assert "menu:main" in flat
+    assert "oa:page:1" in flat
+    assert "oa:page:1:available" in flat
+    assert "oa:page:1:quota" in flat
+    assert "oa:page:1:invalid" in flat
+    texts = [b["text"] for row in kb for b in row if "text" in b]
+    assert "全部√" in texts
+    assert "可用" in texts
+    assert "限额" in texts
+    assert "失效" in texts
 
     # 添加两个账户后再渲染
     _add_fake_account(m, "user1@x.com")
@@ -449,6 +458,124 @@ def test_oauth_detail_preserves_list_page(m):
     print("  [PASS] oauth detail preserves page + legacy oa:view compatible")
 
 
+def test_oauth_filter_preserved_through_detail(m):
+    _setup(m)
+    _add_fake_account(m, "ok1@x.com")
+    _add_fake_account(m, "ok2@x.com")
+    _add_fake_account(m, "quota@x.com", enabled=False, disabled_reason="quota")
+    _add_fake_account(m, "bad@x.com", enabled=False, disabled_reason="auth_error")
+    rec = _install_recorder(m)
+
+    handled = m["oauth_menu"].handle_callback(42, 100, "cb-filter", "oa:page:1:invalid")
+    assert handled
+    page = rec.last("editMessageText")
+    assert page and "当前过滤" in page["text"] and "失效" in page["text"]
+    assert "bad@x.com" in page["text"]
+    assert "ok1@x.com" not in page["text"]
+    texts = [b["text"] for row in page["reply_markup"]["inline_keyboard"] for b in row if "text" in b]
+    assert "失效√" in texts
+
+    flat = [
+        b["callback_data"]
+        for row in page["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    view_cb = next(x for x in flat if x.startswith("oa:view:"))
+    assert view_cb.endswith(":1:invalid")
+
+    rec.clear()
+    handled = m["oauth_menu"].handle_callback(42, 100, "cb-view", view_cb)
+    assert handled
+    detail = rec.last("editMessageText")
+    flat2 = [
+        b["callback_data"]
+        for row in detail["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "oa:page:1:invalid" in flat2
+
+    rec.clear()
+    handled = m["oauth_menu"].handle_callback(42, 100, "cb-back", "oa:page:1:invalid")
+    assert handled
+    back = rec.last("editMessageText")
+    assert back and "bad@x.com" in back["text"] and "ok1@x.com" not in back["text"]
+    print("  [PASS] oauth filter preserved through detail")
+
+
+def test_invalid_remove_select_and_delete(m):
+    _setup(m)
+    _add_fake_account(m, "ok@x.com")
+    _add_fake_account(m, "bad1@x.com", enabled=False, disabled_reason="auth_error")
+    _add_fake_account(m, "bad2@x.com", enabled=False, disabled_reason="auth_error")
+    rec = _install_recorder(m)
+
+    handled = m["oauth_menu"].handle_callback(42, 100, "cb-invalid", "oa:invalid:list")
+    assert handled
+    panel = rec.last("editMessageText")
+    assert panel and "移除失效账户" in panel["text"]
+    assert "bad1@x.com" in panel["text"] and "bad2@x.com" in panel["text"]
+    flat = [
+        b["callback_data"]
+        for row in panel["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "oa:invalid:remove_all" in flat
+    assert "oa:invalid:remove_selected" in flat
+    toggle = next(x for x in flat if x.startswith("oa:invalid:toggle:"))
+
+    rec.clear()
+    handled = m["oauth_menu"].handle_callback(42, 100, "cb-toggle", toggle)
+    assert handled
+    panel2 = rec.last("editMessageText")
+    texts = [b["text"] for row in panel2["reply_markup"]["inline_keyboard"] for b in row if "text" in b]
+    assert any(t.startswith("✅ ") for t in texts)
+
+    rec.clear()
+    handled = m["oauth_menu"].handle_callback(42, 100, "cb-remove", "oa:invalid:remove_selected")
+    assert handled
+    result = rec.last("editMessageText")
+    assert result and "已移除 1 个" in result["text"]
+    emails = {a["email"] for a in m["oauth_manager"].list_accounts()}
+    assert len({"bad1@x.com", "bad2@x.com"} & emails) == 1
+    assert "ok@x.com" in emails
+    print("  [PASS] invalid account remove select/delete")
+
+
+def test_add_menu_cancel_buttons(m):
+    _setup(m)
+    rec = _install_recorder(m)
+
+    m["oauth_menu"].on_add_menu(42, 100, "cb")
+    add = rec.last("editMessageText")
+    flat = [b["callback_data"] for row in add["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "menu:main" in flat
+
+    rec.clear()
+    m["oauth_menu"].on_login_start(42, 100, "cb")
+    claude_login = rec.last("editMessageText")
+    flat = [b["callback_data"] for row in claude_login["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "oa:add" in flat
+
+    rec.clear()
+    m["oauth_menu"].on_set_json_start(42, 100, "cb")
+    claude_json = rec.last("editMessageText")
+    flat = [b["callback_data"] for row in claude_json["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "oa:add" in flat
+
+    rec.clear()
+    m["oauth_menu"].on_login_openai_start(42, 100, "cb")
+    openai_login = rec.last("editMessageText")
+    flat = [b["callback_data"] for row in openai_login["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "oa:add" in flat
+
+    rec.clear()
+    m["oauth_menu"].on_set_rt_openai_start(42, 100, "cb")
+    openai_rt = rec.last("editMessageText")
+    flat = [b["callback_data"] for row in openai_rt["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "oa:add" in flat
+    print("  [PASS] add menu/cancel buttons")
+
+
 def test_router_dispatch(m):
     """通过 bot._handle_callback 间接验证路由在一起能跑通（admin 身份）。"""
     _setup(m)
@@ -496,6 +623,9 @@ def main():
         test_set_json_valid,
         test_set_json_missing_fields,
         test_oauth_detail_preserves_list_page,
+        test_oauth_filter_preserved_through_detail,
+        test_invalid_remove_select_and_delete,
+        test_add_menu_cancel_buttons,
         test_router_dispatch,
     ]
 

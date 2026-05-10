@@ -97,13 +97,18 @@ def test_transform_basic(m):
         "prompt_cache_retention": "1h",
         "stream": False,
         "store": True,
+        "user": "u",
+        "metadata": {"x": 1},
+        "safety_identifier": "sid",
+        "stream_options": {"include_usage": True},
     }
     out = t.apply_codex_oauth_transform(body)
     assert out["model"] == "gpt-5"                 # 直接透传（不再做别名映射）
     assert out["store"] is False                   # 强制
     assert out["stream"] is True                   # 强制
     for k in ("temperature", "top_p", "max_output_tokens",
-              "frequency_penalty", "presence_penalty", "prompt_cache_retention"):
+              "frequency_penalty", "presence_penalty", "prompt_cache_retention",
+              "user", "metadata", "safety_identifier", "stream_options"):
         assert k not in out, f"{k} should be stripped"
     assert out["input"] == [{"type": "message", "role": "user", "content": "hi"}]
     assert out["instructions"] == "You are a helpful coding assistant."
@@ -176,13 +181,77 @@ def test_transform_legacy_functions(m):
     names = sorted(t.get("name") for t in out["tools"])
     assert names == ["f1", "f2"], f"got top-level names: {names}"
     assert all(t.get("type") == "function" for t in out["tools"])
-    assert out["tool_choice"] == {"type": "function", "function": {"name": "f1"}}
+    assert out["tool_choice"] == {"type": "function", "name": "f1"}
     # string function_call (auto)
     out2 = t.apply_codex_oauth_transform({
         "model": "gpt-5.1", "input": [], "function_call": "auto",
     })
     assert out2["tool_choice"] == "auto"
     print("  [PASS] transform: legacy functions/function_call → tools/tool_choice (flat name)")
+
+
+def test_transform_tool_choice_and_input_refs(m):
+    """OAuth Codex transform: tool_choice / item refs / call ids 按 sub2api 兼容。"""
+    t = m["transform"]
+    body = {
+        "model": "gpt-5.1",
+        "input": [
+            {"type": "message", "role": "user", "id": "msg_1", "call_id": "bad",
+             "content": [{"type": "input_text", "text": {"hello": "world"}}]},
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {"type": "item_reference", "id": "call_1"},
+            {"type": "function_call", "id": "call_1", "name": "lookup", "arguments": "{}"},
+            {"type": "message", "role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ],
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+    }
+    out = t.apply_codex_oauth_transform(body)
+    assert out["tool_choice"] == {"type": "function", "name": "lookup"}
+    items = out["input"]
+    types = [i.get("type") for i in items if isinstance(i, dict)]
+    assert "reasoning" not in types
+    assert any(i.get("type") == "item_reference" and i.get("id") == "fc1" for i in items)
+    fc = next(i for i in items if i.get("type") == "function_call")
+    assert fc["call_id"] == "fc1"
+    fco = next(i for i in items if i.get("type") == "function_call_output")
+    assert fco["call_id"] == "fc1" and fco["output"] == "ok"
+    msg = next(i for i in items if i.get("type") == "message")
+    assert msg["content"][0]["text"] == '{"hello":"world"}'
+
+    # 无工具续链信号时，普通非 tool item 的 id/call_id 要剥掉，避免 store=false 引用持久化 ID。
+    out2 = t.apply_codex_oauth_transform({
+        "model": "gpt-5.1",
+        "input": [{"type": "message", "role": "user", "id": "msg_2", "call_id": "bad", "content": "hi"}],
+    })
+    assert "id" not in out2["input"][0] and "call_id" not in out2["input"][0]
+
+    # tool_choice 指向不存在的工具时降级 auto。
+    out3 = t.apply_codex_oauth_transform({
+        "model": "gpt-5.1", "input": [],
+        "tools": [{"type": "function", "name": "exists"}],
+        "tool_choice": {"type": "function", "name": "missing"},
+    })
+    assert out3["tool_choice"] == "auto"
+
+    # sub2api 对齐：tool_search_output 是工具续链 item，call_id 应保留并规范化。
+    out4 = t.apply_codex_oauth_transform({
+        "model": "gpt-5.1",
+        "input": [{"type": "tool_search_output", "call_id": "call_search_1", "output": "ok"}],
+    })
+    assert out4["input"][0]["call_id"] == "fcsearch_1"
+
+    # sub2api 对齐：local_shell_call / tool_search_call 不主动补 name。
+    out5 = t.apply_codex_oauth_transform({
+        "model": "gpt-5.1",
+        "input": [
+            {"type": "local_shell_call", "call_id": "call_shell_1"},
+            {"type": "tool_search_call", "call_id": "call_search_2"},
+        ],
+    })
+    assert "name" not in out5["input"][0]
+    assert "name" not in out5["input"][1]
+    print("  [PASS] transform: tool_choice + item_reference/call_id/id normalization")
 
 
 def test_transform_normalizes_chat_style_tools(m):
@@ -341,6 +410,7 @@ def test_channel_responses_ingress(m):
     assert h["chatgpt-account-id"] == "acct-123"
     assert h["openai-beta"] == "responses=experimental"
     assert h["originator"] == "codex_cli_rs"
+    assert h["version"] == "0.125.0"
     assert h["accept"] == "text/event-stream"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["authorization"].startswith("Bearer ")
@@ -379,6 +449,22 @@ def test_channel_chat_ingress_translator(m):
     assert payload["stream"] is True
     assert payload["store"] is False
     print("  [PASS] channel: chat ingress → translator_ctx + input converted")
+
+
+def test_channel_previous_response_id_rejected(m):
+    """OAuth Codex HTTP SSE route store=false：previous_response_id 不允许直透。"""
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("o@openai.test"))
+    try:
+        asyncio.run(ch.build_upstream_request(
+            {"model": "gpt-5.1", "input": "continue", "previous_response_id": "resp_1"},
+            "gpt-5.1", ingress_protocol="responses",
+        ))
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "previous_response_id" in str(exc) and "store=false" in str(exc), str(exc)
+    print("  [PASS] channel: previous_response_id rejected on OAuth store=false route")
 
 
 def test_channel_anthropic_ingress_rejected(m):
@@ -432,6 +518,23 @@ def test_registry_dispatches_by_provider(m):
     assert claude.protocol == "anthropic"
     assert openai.protocol == "openai-responses"
     print("  [PASS] registry: dispatches OAuth by provider field")
+
+
+def test_openai_oauth_channel_max_concurrent(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    m["config"].update(lambda c: c.setdefault("concurrency", {}).__setitem__("defaultMaxConcurrent", 0))
+    _add_openai_acc(m, email="limited@openai.test")
+    om.update_max_concurrent("openai:limited@openai.test", 2)
+
+    m["registry"].rebuild_from_config()
+    ch = m["registry"].get_channel("oauth:openai:limited@openai.test")
+    assert isinstance(ch, m["OpenAIOAuthChannel"]), type(ch).__name__
+    assert ch.max_concurrent == 2
+
+    from src import concurrency
+    assert concurrency._get_channel_max("oauth:openai:limited@openai.test") == 2
+    print("  [PASS] OpenAI OAuth channel honors maxConcurrent")
 
 
 def test_session_id_isolation_with_prompt_cache_key(m):
@@ -548,6 +651,7 @@ def main():
         test_transform_extracts_system,
         test_transform_system_appended_to_existing_instructions,
         test_transform_legacy_functions,
+        test_transform_tool_choice_and_input_refs,
         test_transform_normalizes_chat_style_tools,
         test_channel_model_passthrough,
         test_transform_model_passthrough,
@@ -555,9 +659,11 @@ def main():
         test_channel_default_models_fallback,
         test_channel_responses_ingress,
         test_channel_chat_ingress_translator,
+        test_channel_previous_response_id_rejected,
         test_channel_anthropic_ingress_rejected,
         test_channel_missing_chatgpt_account_id,
         test_registry_dispatches_by_provider,
+        test_openai_oauth_channel_max_concurrent,
         test_session_id_isolation_with_prompt_cache_key,
         test_session_id_isolation_disabled,
         test_force_codex_cli_switch,

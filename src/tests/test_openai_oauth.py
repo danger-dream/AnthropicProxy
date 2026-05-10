@@ -174,6 +174,50 @@ def test_normalize_reverse_case(m):
     print("  [PASS] normalize_codex_snapshot reverse (primary=5h)")
 
 
+def test_accounts_check_extracts_plan_and_subscription(m):
+    """accounts/check: org 精确匹配并提取 plan_type / subscription_expires_at。"""
+    p = m["openai_provider"]
+    old_get = p.httpx.get
+
+    class Resp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {
+                "accounts": {
+                    "org-free": {
+                        "account": {"plan_type": "free", "is_default": True, "email": "free@example.com"},
+                        "entitlement": {"expires_at": ""},
+                    },
+                    "org-pro": {
+                        "account": {"plan_type": "pro", "is_default": False, "email": "pro@example.com"},
+                        "entitlement": {"subscription_plan": "pro", "expires_at": "2026-06-01T00:00:00+00:00"},
+                    },
+                }
+            }
+
+    def fake_get(url, *, headers=None, timeout=None):
+        assert url == p.ACCOUNTS_CHECK_URL
+        assert headers["authorization"] == "Bearer at"
+        assert headers["accept"] == "application/json"
+        return Resp()
+
+    old_disable_env = _ap_os.environ.pop("DISABLE_OAUTH_NETWORK_CALLS", None)
+    try:
+        p.httpx.get = fake_get
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", False))
+        info = p.fetch_accounts_check_sync("at", org_id="org-pro")
+        assert info["plan_type"] == "pro", info
+        assert info["subscription_expires_at"] == "2026-06-01T00:00:00+00:00", info
+        assert info["email"] == "pro@example.com", info
+    finally:
+        if old_disable_env is not None:
+            _ap_os.environ["DISABLE_OAUTH_NETWORK_CALLS"] = old_disable_env
+        p.httpx.get = old_get
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", True))
+    print("  [PASS] accounts/check: extracts plan + subscription_expires_at")
+
+
 # ─── state_db schema 迁移 ────────────────────────────────────────
 
 def test_state_db_openai_cols_migration(m):
@@ -202,11 +246,13 @@ def test_add_account_openai_provider(m):
         "id_token": "header.payload.sig",
         "chatgpt_account_id": "acct-123",
         "plan_type": "pro",
+        "subscription_expires_at": "2026-06-01T00:00:00+00:00",
     })
     acc = om.get_account("foo@openai.test")
     assert acc["provider"] == "openai"
     assert acc["chatgpt_account_id"] == "acct-123"
     assert acc["plan_type"] == "pro"
+    assert acc["subscription_expires_at"] == "2026-06-01T00:00:00+00:00"
     assert acc["id_token"] == "header.payload.sig"
     assert om.provider_of("foo@openai.test") == "openai"
     print("  [PASS] add_account(provider=openai) saves openai-specific fields")
@@ -474,6 +520,7 @@ def main():
         test_decode_id_token_invalid,
         test_parse_rate_limit_headers,
         test_normalize_reverse_case,
+        test_accounts_check_extracts_plan_and_subscription,
         test_state_db_openai_cols_migration,
         test_add_account_openai_provider,
         test_add_account_claude_default_provider,

@@ -282,17 +282,24 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
         # OpenAI: 刷新响应若带 id_token 同步更新；解码拿出最新 metadata
         # （plan_type / chatgpt_account_id / organization_id 都可能随账户升级
         # 或换组织而变）。email 理论上不变，不覆盖以免生成孤儿 entry。
-        if provider == "openai" and data.get("id_token"):
-            new_fields["id_token"] = data["id_token"]
-            try:
-                claims = openai_provider.decode_id_token(data["id_token"])
-                info = openai_provider.extract_user_info(claims)
-                for k in ("chatgpt_account_id", "organization_id", "plan_type"):
-                    v = info.get(k)
-                    if v:   # 空值不覆盖已有字段
-                        new_fields[k] = v
-            except Exception as exc:
-                print(f"[oauth] openai refresh: id_token decode failed for {email}: {exc}")
+        # refresh_sync 还会 best-effort 调 accounts/check，返回 plan_type /
+        # subscription_expires_at；这些字段即使 id_token 解析失败也可以写回。
+        if provider == "openai":
+            if data.get("id_token"):
+                new_fields["id_token"] = data["id_token"]
+                try:
+                    claims = openai_provider.decode_id_token(data["id_token"])
+                    info = openai_provider.extract_user_info(claims)
+                    for k in ("chatgpt_account_id", "organization_id", "plan_type"):
+                        v = info.get(k)
+                        if v:   # 空值不覆盖已有字段
+                            new_fields[k] = v
+                except Exception as exc:
+                    print(f"[oauth] openai refresh: id_token decode failed for {email}: {exc}")
+            if data.get("plan_type"):
+                new_fields["plan_type"] = data["plan_type"]
+            if data.get("subscription_expires_at"):
+                new_fields["subscription_expires_at"] = data["subscription_expires_at"]
 
         _save_token_fields(account_key, new_fields)
         return new_fields["access_token"]
@@ -845,7 +852,7 @@ def add_account(entry: dict) -> None:
 
     支持可选字段：
       - provider: "claude" (默认) / "openai"
-      - id_token / chatgpt_account_id / organization_id / plan_type  (OpenAI 专属)
+      - id_token / chatgpt_account_id / organization_id / plan_type / subscription_expires_at  (OpenAI 专属)
     """
     required = ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
@@ -887,6 +894,7 @@ def add_account(entry: dict) -> None:
             normalized["chatgpt_account_id"] = entry.get("chatgpt_account_id", "") or ""
             normalized["organization_id"] = entry.get("organization_id", "") or ""
             normalized["plan_type"] = entry.get("plan_type", "") or ""
+            normalized["subscription_expires_at"] = entry.get("subscription_expires_at", "") or ""
         accounts.append(normalized)
 
     config.update(mutate)

@@ -21,6 +21,7 @@ from src.tests import _isolation
 _isolation.isolate()
 
 import asyncio
+import itertools
 import json
 import os
 import sys
@@ -151,6 +152,9 @@ def _install_channels(m, channels):
         reg._channels = {ch.key: ch for ch in channels}
 
 
+_REQUEST_SEQ = itertools.count()
+
+
 async def _call_proxy(m, router: MockRouter, body: dict, api_key="k1", client_ip="1.1.1.1"):
     """模拟 server.py /v1/messages 的核心调用链。"""
     # 注入 mock client
@@ -158,7 +162,7 @@ async def _call_proxy(m, router: MockRouter, body: dict, api_key="k1", client_ip
     mock_client = httpx.AsyncClient(transport=transport, timeout=10.0)
     m["upstream"].set_client(mock_client)
 
-    request_id = f"req-{int(time.time()*1000)}"
+    request_id = f"req-{int(time.time()*1000)}-{next(_REQUEST_SEQ)}"
     start = time.time()
 
     await asyncio.to_thread(

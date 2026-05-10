@@ -58,7 +58,8 @@ def _isolate_session_id(api_key_name: str, raw: str) -> str:
 # ─── 常量 ────────────────────────────────────────────────────────
 
 CODEX_UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
-CODEX_CLI_USER_AGENT = "codex_cli_rs/0.104.0"
+CODEX_CLI_VERSION = "0.125.0"
+CODEX_CLI_USER_AGENT = f"codex_cli_rs/{CODEX_CLI_VERSION}"
 
 
 class OpenAIOAuthChannel(Channel):
@@ -81,6 +82,10 @@ class OpenAIOAuthChannel(Channel):
         self.display_name = self.email
         self.enabled = bool(account.get("enabled", True))
         self.disabled_reason = account.get("disabled_reason")
+        try:
+            self.max_concurrent = int(account.get("maxConcurrent", 0) or 0)
+        except (TypeError, ValueError):
+            self.max_concurrent = 0
 
         # Codex 请求必备 meta（缺失也允许注册，build 时再校验）
         self.chatgpt_account_id = str(account.get("chatgpt_account_id") or "")
@@ -142,6 +147,17 @@ class OpenAIOAuthChannel(Channel):
             )
 
         # Step A: 准备 Responses shape
+        # OAuth HTTP SSE 上游被强制 store=false，不能让 previous_response_id
+        # 直接穿透到 chatgpt.com，否则上游会按持久化响应查找并 404。
+        # Parrot 当前的本地 previous_response_id store 只在跨变体翻译路径展开，
+        # 本 Codex OAuth 同协议路径先明确拒绝，避免隐式丢上下文。
+        if ingress_protocol == "responses" and str(requested_body.get("previous_response_id") or "").strip():
+            raise ValueError(
+                "previous_response_id is not supported on OpenAI OAuth Codex route "
+                "because upstream is forced to store=false; use prompt_cache_key/session_id "
+                "or route this request to an OpenAI API channel."
+            )
+
         if ingress_protocol == "responses":
             payload = common.filter_responses_passthrough(requested_body)
             translator_ctx = None      # 同协议透传，无需响应反向
@@ -314,6 +330,7 @@ class OpenAIOAuthChannel(Channel):
             "chatgpt-account-id": self.chatgpt_account_id,
             "openai-beta": "responses=experimental",
             "originator": "codex_cli_rs",
+            "version": CODEX_CLI_VERSION,
             "accept": "text/event-stream",
             "content-type": "application/json",
         }
