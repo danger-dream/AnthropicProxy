@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from ... import affinity, concurrency, config, cooldown, log_db, oauth_manager, scorer, state_db
+from ... import affinity, concurrency, config, cooldown, load_balancing, log_db, oauth_manager, scorer, state_db
 from ...oauth_ids import account_key as _account_key
 from ...channel import registry
 from .. import ui
@@ -379,7 +379,7 @@ def _concurrency_block(cc_cfg: dict) -> list[str]:
 def _compose() -> tuple[str, dict]:
     cfg = config.get()
     uptime = _fmt_uptime(time.time() - _SERVICE_START_TS)
-    mode = cfg.get("channelSelection", "smart")
+    mode = load_balancing.display_mode(cfg.get("channelSelection", "smart"))
 
     overview = _channel_overview()
     today = _today_snapshot_by_family()

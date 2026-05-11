@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from . import affinity, concurrency, config, cooldown, fingerprint, scorer
+from . import affinity, concurrency, config, cooldown, fingerprint, load_balancing, scorer
 from .channel import registry
 from .channel.base import Channel
 
@@ -73,10 +73,9 @@ def _filter_candidates(requested_model: str,
 
 def _apply_affinity(candidates: list[tuple[Channel, str]],
                     fp_query: Optional[str],
-                    cfg: dict,
                     client_key: Optional[str] = None,
                     ) -> tuple[list[tuple[Channel, str]], bool]:
-    """尝试把亲和绑定的渠道顶到首位，必要时打破绑定。
+    """尝试把亲和绑定的渠道顶到首位。
 
     优先使用 fingerprint 亲和（精确会话级别）。
     若 fp_query 为 None 或未命中，回退到 client-level soft affinity。
@@ -109,34 +108,14 @@ def _apply_affinity(candidates: list[tuple[Channel, str]],
         # 绑定目标当前不在候选（禁用/冷却/删除），保留绑定让下次恢复时命中
         return candidates, False
 
-    # 打破检查：绑定 vs 最优 分数（最优 = 候选集中最低分）
-    threshold = float(cfg.get("affinity", {}).get("threshold", 3.0))
-    best_score = _best_score(candidates)
-    bound_score = scorer.get_score(bound["channel_key"], bound["model"])
-
-    # baseline 兜底：best_score=0 是边缘场景（默认分通常 3000，不会归零）；
-    # 给 1.0 的下限避免乘 0 导致永远不打破。
-    baseline = max(best_score, 1.0)
-    if bound_score > baseline * threshold:
-        if source == "fp" and fp_query:
-            affinity.delete(fp_query)
-        elif source == "client" and client_key:
-            affinity.client_delete(client_key)
-        return candidates, False
-
-    # 命中：把绑定目标顶到首位
+    # 命中：只要绑定目标当前仍在候选列表里，就把它顶到首位。
+    # 负载均衡算法负责“亲和不可用时选谁接班”；亲和负责“原渠道还能用就继续用”。
     if bound_idx != 0:
         candidates = list(candidates)
         candidates.insert(0, candidates.pop(bound_idx))
     if source == "fp" and fp_query:
         affinity.touch(fp_query)
     return candidates, True
-
-
-def _best_score(candidates: list[tuple[Channel, str]]) -> float:
-    """评分越低越好；返回候选集中最低分（最优）。"""
-    scores = [scorer.get_score(ch.key, m) for ch, m in candidates]
-    return min(scores) if scores else 0.0
 
 
 # ─── 主入口 ───────────────────────────────────────────────────────
@@ -172,9 +151,12 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
     if mode == "smart":
         candidates = scorer.sort_by_score(candidates)
         saturated = scorer.sort_by_score(saturated)
+    elif mode == "priority":
+        candidates = load_balancing.sort_candidates_by_priority(candidates, cfg)
+        saturated = load_balancing.sort_candidates_by_priority(saturated, cfg)
     # "order" 模式：按注册表原始顺序（config 中定义的顺序）
 
-    candidates, affinity_hit = _apply_affinity(candidates, fp_query, cfg,
+    candidates, affinity_hit = _apply_affinity(candidates, fp_query,
                                                client_key=client_key)
 
     return ScheduleResult(candidates, fp_query, affinity_hit,

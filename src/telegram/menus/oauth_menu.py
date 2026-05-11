@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from ... import affinity, config, cooldown, log_db, oauth_errors, oauth_manager, state_db
+from ... import affinity, config, cooldown, load_balancing, log_db, oauth_errors, oauth_manager, state_db
 from ...oauth_ids import account_key as _account_key, split_account_key as _split_ak
 from ...oauth import openai as openai_provider
 from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
@@ -550,7 +550,7 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
         clear_cb = f"oa:clear_all_errors:{page}" if filter_key == _FILTER_ALL else f"oa:clear_all_errors:{page}:{filter_key}"
         rows.append([ui.btn(f"🧹 清除所有账户错误（{len(cd_keys_any)} 个）", clear_cb)])
     rows.append([ui.btn("🖼 图片生成", "img:show"), ui.btn("🧨 移除失效", "oa:invalid:list")])
-    rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
+    rows.append([ui.btn("🧩 OAuth 默认模型", "odm:show"), ui.btn("◀ 返回主菜单", "menu:main")])
     return ui.truncate(text), ui.inline_kb(rows)
 
 
@@ -891,7 +891,10 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         ui.send(chat_id, f"❌ 删除失败: <code>{ui.escape_html(str(exc))}</code>")
         return
     ui.answer_cb(cb_id, "已删除")
-    ui.edit(chat_id, message_id, f"✅ 已删除 <code>{ui.escape_html(email)}</code>")
+    extra = ""
+    if load_balancing.is_initialized():
+        extra = "\n已从负载均衡优先级队列中移除。"
+    ui.edit(chat_id, message_id, f"✅ 已删除 <code>{ui.escape_html(email)}</code>{extra}")
     show(chat_id, message_id, page=page, filter_key=filter_key)
 
 
@@ -1221,11 +1224,15 @@ def on_login_code_input(chat_id: int, text: str) -> None:
                        **nav)
         return
 
+    lb_hint = (
+        "\n\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
+        if load_balancing.is_initialized() else ""
+    )
     ui.send_result(
         chat_id,
         "✅ <b>OAuth 账户已添加</b>\n\n"
         f"Email: <code>{ui.escape_html(email)}</code>\n"
-        f"过期: <code>{_format_bjt(new_expired)}</code>",
+        f"过期: <code>{_format_bjt(new_expired)}</code>{lb_hint}",
         back_label="◀ 返回 OAuth 列表", back_callback="menu:oauth",
     )
 
@@ -1284,7 +1291,11 @@ def on_set_json_input(chat_id: int, text: str) -> None:
                        **nav)
         return
 
-    ui.send_result(chat_id, f"✅ 已添加 <code>{ui.escape_html(data['email'])}</code>", **nav)
+    lb_hint = (
+        "\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
+        if load_balancing.is_initialized() else ""
+    )
+    ui.send_result(chat_id, f"✅ 已添加 <code>{ui.escape_html(data['email'])}</code>{lb_hint}", **nav)
 
 
 # ─── OpenAI PKCE 登录 ──────────────────────────────────────────────
@@ -1591,13 +1602,17 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
         "replaced": "✅ <b>OpenAI OAuth 账户已更新</b>",
         "skipped": "✅ <b>OpenAI OAuth 账户已存在</b>",
     }.get(action, "✅ <b>OpenAI OAuth 账户已处理</b>")
+    lb_hint = (
+        "\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
+        if action == "added" and load_balancing.is_initialized() else ""
+    )
     ui.send_result(
         chat_id,
         f"{title}\n\n"
         f"Email: <code>{ui.escape_html(meta.get('email') or entry.get('email') or '')}</code>{plan_tag}\n"
         f"过期: <code>{_format_bjt(meta.get('expired'))}</code>\n"
         f"处理: <code>{ui.escape_html(action_msg)}</code>\n"
-        f"来源: <code>{source}</code>",
+        f"来源: <code>{source}</code>{lb_hint}",
         **_OA_NAV_OPENAI,
     )
 

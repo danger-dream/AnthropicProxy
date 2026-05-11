@@ -27,7 +27,7 @@ from typing import Any
 
 import httpx
 
-from . import cache_display, config, notifier, oauth_errors, state_db
+from . import cache_display, config, load_balancing, notifier, oauth_errors, state_db
 from .oauth import (
     DEFAULT_PROVIDER as _DEFAULT_PROVIDER,
     VALID_PROVIDERS as _VALID_PROVIDERS,
@@ -898,6 +898,10 @@ def add_account(entry: dict) -> None:
         accounts.append(normalized)
 
     config.update(mutate)
+    load_balancing.sync_channel_added(
+        f"oauth:{_account_key(provider, email)}",
+        "openai" if provider == "openai" else "anthropic",
+    )
 
 
 def delete_account(account_key: str) -> None:
@@ -921,6 +925,7 @@ def delete_account(account_key: str) -> None:
 
     # state.db 级联清理
     ch_key = f"oauth:{account_key}"
+    load_balancing.sync_channel_removed(ch_key)
     state_db.perf_delete(ch_key)
     state_db.error_delete(ch_key)
     state_db.affinity_delete_by_channel(ch_key)

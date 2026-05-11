@@ -72,8 +72,8 @@
   // ─── 会话亲和 ───
   "affinity": {
     "ttlMinutes": 30,                // 30 分钟无新请求即释放绑定
-    "threshold": 3.0,                // 绑定渠道分数 > 最优分数 × 3 则打破
-    "cleanupIntervalSeconds": 300
+    "cleanupIntervalSeconds": 300,
+    "clientTtlMinutes": 120          // client-level soft affinity TTL
   },
 
   // ─── 评分参数 ───
@@ -142,6 +142,16 @@
   // 用于开发期避免风控；生产部署时置为 false
   "oauth": {
     "mockMode": false
+  },
+
+  // ─── 调度算法 / 负载均衡 ───
+  "channelSelection": "smart",      // "smart" | "order" | "priority"
+  "loadBalancing": {
+    "initialized": false,
+    "priorityOrders": {
+      "anthropic": [],               // priority 模式下 Anthropic 家族渠道 key 顺序
+      "openai": []                   // priority 模式下 OpenAI 家族渠道 key 顺序
+    }
   },
 
   // ─── 路径 ───

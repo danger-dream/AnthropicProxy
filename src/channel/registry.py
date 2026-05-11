@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
-from .. import config, state_db
+from .. import config, load_balancing, state_db
 from ..oauth import normalize_provider as _normalize_provider
 from .api_channel import ApiChannel
 from .base import Channel
@@ -224,6 +224,10 @@ def add_api_channel(entry: dict) -> dict:
             normalized["apiPath"] = split_path
         channels.append(normalized)
     config.update(_mutate)
+    load_balancing.sync_channel_added(
+        f"api:{name}",
+        load_balancing.family_for_protocol(protocol),
+    )
     rebuild_from_config()
     return {"name": name}
 
@@ -332,6 +336,11 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
 
     # 若改了名，做级联迁移（scorer/cooldown/affinity 内部各自负责把 state.db 同步改名）
     new_name = patch.get("name", name)
+    new_entry = next(
+        (c for c in config.get().get("channels", []) if c.get("name") == new_name),
+        {},
+    )
+    new_family = load_balancing.family_for_protocol(new_entry.get("protocol", "anthropic"))
     if new_name != name:
         from .. import scorer, affinity, cooldown
         new_key = f"api:{new_name}"
@@ -341,6 +350,12 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
         affinity.client_rename_channel(old_key, new_key)
         from .. import concurrency
         concurrency.rename_channel(old_key, new_key)
+        # 维护用户优先级表；family 用更新后的 protocol 推导
+        load_balancing.sync_channel_renamed(old_key, new_key, new_family)
+    elif "protocol" in patch:
+        # 协议家族变化时，从旧 family 移除并追加到新 family 队尾。
+        load_balancing.sync_channel_removed(old_key)
+        load_balancing.sync_channel_added(old_key, new_family)
 
     rebuild_from_config()
     return {"name": new_name}
@@ -367,6 +382,7 @@ def delete_api_channel(name: str) -> bool:
     cooldown.clear(key)
     affinity.delete_by_channel(key)
     affinity.client_delete_by_channel(key)
+    load_balancing.sync_channel_removed(key)
     from .. import concurrency
     concurrency.forget_channel(key)
     rebuild_from_config()

@@ -249,8 +249,9 @@ def test_bot_commands_and_callbacks(m):
     assert "欢迎使用" in msg["text"]
     kb = msg.get("reply_markup", {}).get("inline_keyboard", [])
     btns = [b["callback_data"] for row in kb for b in row if "callback_data" in b]
-    assert "menu:apikey" in btns
+    assert "menu:apikey" not in btns
     assert "menu:oauth" in btns
+    assert "menu:loadbalancing" in btns
 
     # callback menu:apikey → 编辑消息显示 API Key 列表
     rec.clear()
@@ -267,6 +268,12 @@ def test_bot_commands_and_callbacks(m):
     })
     ans = rec.last("answerCallbackQuery")
     assert ans and ("未知操作" in (ans.get("text") or "") or "尚未实现" in (ans.get("text") or ""))
+
+    # /status 已从菜单移除，但保留兼容提示
+    rec.clear()
+    bot._handle_message({"chat": {"id": 42}, "text": "/status"})
+    status_msg = rec.last("sendMessage")
+    assert status_msg and "状态总览已从菜单移除" in status_msg["text"]
 
     # /menu 命令
     rec.clear()

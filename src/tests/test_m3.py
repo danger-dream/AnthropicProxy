@@ -4,7 +4,7 @@
   - fingerprint 对称性（N 到达 vs N-1 完成）
   - scorer 滑动窗口边界 / 陈旧衰减
   - cooldown 阶梯 / 永久拉黑 / 成功清零
-  - affinity TTL / 命中 / 打破
+  - affinity TTL / 命中 / 不按评分打破
   - scheduler 筛选 + 亲和 + 评分 端到端
 
 运行：
@@ -500,14 +500,13 @@ def test_scheduler_end_to_end(m):
         - 筛选：enabled + supports_model + 不在 cooldown
         - 亲和：把绑定渠道顶到首位
         - 评分：最低分在首位（无亲和时）
-        - 亲和打破：绑定渠道分数 > 最优 × threshold 时打破
+        - 亲和优先：绑定渠道只要仍在候选中就优先，不按评分打破
     """
     _reset_all_state(m)
     cfg = m["config"]
     sch = m["scheduler"]
 
     def _set(c):
-        c.setdefault("affinity", {})["threshold"] = 3.0
         c.setdefault("scoring", {})["explorationRate"] = 0.0  # 关闭探索，测试确定性
         c["scoring"]["recentWindow"] = 10
         c["scoring"]["staleMinutes"] = 99999
@@ -544,9 +543,9 @@ def test_scheduler_end_to_end(m):
         f"{[c[0].key for c in result.candidates]}"
     assert result.affinity_hit is False
 
-    # 场景 2：亲和绑定到 B（分数差距未超 3×）→ 应 B 在前
-    # 调整让 B 分数约为 A 的 2 倍（未超 3）
-    # 此刻 A:(100+100)*1=200, B:(500+500)*1=1000 → B/A=5，会打破
+    # 场景 2：亲和绑定到 B → 应 B 在前
+    # 调整让 A/B 分数接近，方便观察亲和置顶
+    # 此刻 A:(100+100)*1=200, B:(500+500)*1=1000
     # 我们把 A 的成功率降到 0.5（penalty 会让 A 涨分）
     for _ in range(5):
         sc.record_failure("api:chA", "gpt-5", connect_ms=100)
@@ -556,7 +555,7 @@ def test_scheduler_end_to_end(m):
 
     # 现在 A 成功率 5/10=0.5 → penalty=1+(0.5)*8=5 → A_score = 200*5=1000
     # B 成功率 5/5=1.0 → B_score=1000*1=1000
-    # B/A ≈ 1.0，不打破
+    # B/A ≈ 1.0
 
     # 绑定到 B
     fp_q = m["fingerprint"].fingerprint_query("k1", "1.1.1.1", body["messages"])
@@ -568,7 +567,7 @@ def test_scheduler_end_to_end(m):
     assert result.candidates[0][0].key == "api:chB", \
         f"bound channel should be first: got {[c[0].key for c in result.candidates]}"
 
-    # 场景 3：亲和打破（使 B 分数远高于 A）
+    # 场景 3：亲和目标即使分数变差，只要仍可用，仍然优先
     # 让 B 连续失败几次，分数变很高
     for _ in range(10):
         sc.record_failure("api:chB", "gpt-5", connect_ms=2000)
@@ -580,14 +579,10 @@ def test_scheduler_end_to_end(m):
     assert m["affinity"].get(fp_q) is not None
 
     result = sch.schedule(body, api_key_name="k1", client_ip="1.1.1.1")
-    # 此时 B/A 可能已 > 3 → 打破 → 回到评分排序，A 应在前
-    if b_score > a_score * 3:
-        assert not result.affinity_hit, "should break affinity when B >> A"
-        assert result.candidates[0][0].key == "api:chA"
-        assert m["affinity"].get(fp_q) is None, "affinity should be deleted"
-        print(f"    [ok] affinity broken as expected")
-    else:
-        print(f"    (affinity not broken this run, ratio={b_score/a_score:.2f})")
+    # 即使 B/A > 3，也不打破；负载均衡只负责亲和不可用时选接班渠道。
+    assert result.affinity_hit, "affinity should still win while bound channel is available"
+    assert result.candidates[0][0].key == "api:chB"
+    assert m["affinity"].get(fp_q) is not None, "affinity should be kept"
 
     # 场景 4：cooldown 过滤
     m["cooldown"].record_error("api:chA", "gpt-5", "oops")

@@ -1,15 +1,8 @@
-"""主菜单与 /start 欢迎页。
-
-布局（2 列 4 行）：
-  [📊 状态总览]  [📋 最近日志]
-  [📈 统计汇总]  [🔀 渠道管理]
-  [🔐 管理 OAuth] [🔑 管理 API Key]
-  [⚙ 系统设置]   [❓ 帮助]
-"""
+"""主菜单与 /start 欢迎页。"""
 
 from __future__ import annotations
 
-from ... import __version__, affinity, concurrency, config, log_db, oauth_manager, public_ip, state_db
+from ... import __version__, affinity, concurrency, config, load_balancing, log_db, oauth_manager, public_ip, state_db
 from ...oauth_ids import account_key as _account_key
 from ...channel import registry
 from .. import ui
@@ -17,14 +10,12 @@ from .. import ui
 
 def _kb() -> dict:
     return ui.inline_kb([
-        [ui.btn("📊 状态总览", "menu:status"),
-         ui.btn("📋 最近日志", "menu:logs")],
         [ui.btn("📈 统计汇总", "menu:stats"),
-         ui.btn("🔀 渠道管理", "menu:channel")],
+         ui.btn("📋 最近日志", "menu:logs")],
         [ui.btn("🔐 管理 OAuth", "menu:oauth"),
-         ui.btn("🔑 管理 API Key", "menu:apikey")],
+         ui.btn("🔀 管理渠道", "menu:channel")],
         [ui.btn("🔁 模型映射", "map:show"),
-         ui.btn("🧩 OAuth 默认", "odm:show")],
+         ui.btn("⚖️ 负载均衡", "menu:loadbalancing")],
         [ui.btn("⚙ 系统设置", "menu:settings"),
          ui.btn("❓ 帮助", "menu:help")],
     ])
@@ -64,7 +55,7 @@ def _first_run_banner() -> str:
         "请按以下步骤快速启用服务：\n"
         "1️⃣ 「🔐 管理 OAuth」→ 登录获取 Token\n"
         "    或「🔀 渠道管理」→ 添加第三方 API 渠道\n"
-        "2️⃣ 「🔑 管理 API Key」→ 创建下游调用用的 Key\n"
+        "2️⃣ 发送 /keys → 创建下游调用用的 API Key\n"
         "3️⃣ 下游客户端配置代理 URL 即可使用\n"
     )
 
@@ -95,7 +86,7 @@ def _overview() -> str:
     listen = cfg.get("listen") or {}
     port = listen.get("port", 18082)
     cch = cfg.get("cchMode", "disabled")
-    mode = cfg.get("channelSelection", "smart")
+    mode = load_balancing.display_mode(cfg.get("channelSelection", "smart"))
 
     # 配额预警高亮（≥80%）
     quota_hot = _quota_hot_count(80.0)
@@ -232,7 +223,7 @@ def welcome(chat_id: int) -> None:
         "<b>快速开始：</b>\n"
         "1️⃣ 「🔐 管理 OAuth」→「➕ 新增账户」添加 Claude OAuth\n"
         "2️⃣ 「🔀 渠道管理」→「➕ 添加渠道」接入第三方云平台\n"
-        "3️⃣ 「🔑 管理 API Key」创建代理 Key 供下游使用\n\n"
+        "3️⃣ 发送 /keys 创建代理 Key 供下游使用\n\n"
         "👇 点击下方任意菜单进入管理面板。"
     )
     ui.send(chat_id, text, reply_markup=_kb())

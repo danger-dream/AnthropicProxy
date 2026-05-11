@@ -99,7 +99,6 @@ def fingerprint_write(api_key_name: str, client_ip: str, messages: list, assista
 async def _apply_affinity(
     candidates: list[tuple[Channel, str]],
     fp_query: str | None,
-    cfg: dict,
 ) -> tuple[list[tuple[Channel, str]], bool]:
     """
     返回重排后的 candidates 与 affinity_hit 标志。
@@ -123,17 +122,8 @@ async def _apply_affinity(
         # 等待渠道恢复时再命中
         return candidates, False
 
-    # 打破检查：绑定 vs 最优 分数
-    best_score = scorer.get_score(candidates[0][0].key, candidates[0][1])
-    bound_score = scorer.get_score(bound["channel_key"], bound["model"])
-    threshold = cfg["affinity"]["threshold"]
-
-    if bound_score > best_score * threshold:
-        # 太差，打破绑定
-        affinity.delete(fp_query)
-        return candidates, False
-
-    # 命中：把绑定渠道顶到首位
+    # 命中：只要绑定目标仍可用，就把绑定渠道顶到首位。
+    # 负载均衡算法只负责亲和不可用时选择接班渠道。
     if idx != 0:
         candidates.insert(0, candidates.pop(idx))
     affinity.touch(fp_query)
@@ -246,9 +236,11 @@ def schedule(body: dict, api_key_name: str, client_ip: str) -> ScheduleResult:
     mode = (cfg.get("channelSelection") or "smart").lower()
     if mode == "smart":
         candidates = scorer.sort_by_score(candidates)
+    elif mode == "priority":
+        candidates = load_balancing.sort_candidates_by_priority(candidates, cfg)
     # "order" 模式：按 registry 注册顺序（即 config 中定义顺序）
 
-    candidates, affinity_hit = _apply_affinity(candidates, fp_query, cfg)
+    candidates, affinity_hit = _apply_affinity(candidates, fp_query)
     return ScheduleResult(candidates, fp_query, affinity_hit)
 ```
 
@@ -267,7 +259,8 @@ server.py 调用方后续单独记 `log_db.update_pending(request_id, affinity_h
 | `scoring.staleFullDecayMinutes` | 30 | 完全回归默认分 |
 | `scoring.explorationRate` | 0.2 | 探索率 |
 | `affinity.ttlMinutes` | 30 | 亲和 TTL |
-| `affinity.threshold` | 3.0 | 打破绑定的分数倍数 |
+| `channelSelection` | smart | `smart` / `order` / `priority` |
+| `loadBalancing.priorityOrders.*` | [] | priority 模式下的用户优先级队列 |
 | `errorWindows` | [1,3,5,10,15,0] | 错误阶梯（分钟） |
 
 ## 6.7 TG Bot 可干预的点
@@ -275,4 +268,4 @@ server.py 调用方后续单独记 `log_db.update_pending(request_id, affinity_h
 - **清空亲和绑定**：`affinity.delete_all()` 或 `affinity.delete_by_channel(key)`
 - **清除错误**：`cooldown.clear(channel_key, model=None)`
 - **重置性能统计**（不暴露于 UI，但作为 CLI 工具保留）：`scorer.clear_stats(...)`
-- **切换 channelSelection**：`order` / `smart` （写入 config.channelSelection）
+- **负载均衡**：`smart` / `order` / `priority`（写入 `config.channelSelection`）；priority 队列写入 `loadBalancing.priorityOrders`

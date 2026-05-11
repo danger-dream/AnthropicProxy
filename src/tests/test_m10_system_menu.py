@@ -4,9 +4,9 @@
   - 主设置页渲染（7 大项）
   - 超时 / 错误阶梯 输入：合法 / 非法
   - 评分参数：4 字段各自修改（范围校验）
-  - 亲和参数：2 字段
+  - 亲和参数：TTL 字段
   - CCH：disabled/dynamic/static 切换 + static 值编辑（hex 校验）
-  - channelSelection：smart/order 切换
+  - channelSelection 旧入口兼容：smart/order/priority 切换
   - 首包黑名单：加/删默认 + 加渠道专属
   - 整路径路由 + /settings 命令
 """
@@ -30,10 +30,11 @@ def _import_modules():
         sys.path.insert(0, root)
     from src import config, state_db
     from src.telegram import bot, states, ui
-    from src.telegram.menus import system_menu
+    from src.telegram.menus import load_balancing_menu, system_menu
     return {
         "config": config, "state_db": state_db,
         "bot": bot, "states": states, "ui": ui,
+        "load_balancing_menu": load_balancing_menu,
         "system_menu": system_menu,
     }
 
@@ -69,13 +70,13 @@ def test_main_page(m):
     m["system_menu"].show(42, 100, "cb")
     edit = rec.last("editMessageText")
     text = edit["text"]
-    # 主页应含所有项
-    for s in ("超时", "错误阶梯", "评分", "亲和", "CCH", "渠道选择", "黑名单"):
+    # 主页应含所有项；渠道选择已迁移为负载均衡入口
+    for s in ("超时", "错误阶梯", "评分", "亲和", "CCH", "调度", "黑名单"):
         assert s in text, s
     btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"]
             for b in row if "callback_data" in b]
     expected = {"sys:show:timeouts", "sys:show:errwin", "sys:show:scoring",
-                "sys:show:affinity", "sys:show:cch", "sys:show:chsel",
+                "sys:show:affinity", "sys:show:cch", "menu:loadbalancing",
                 "sys:show:blacklist", "menu:main"}
     for e in expected:
         assert e in btns, f"missing btn {e}"
@@ -172,9 +173,6 @@ def test_affinity_fields(m):
     sm._on_affinity_input(42, "sys_affinity:ttlMinutes", "45")
     assert m["config"].get()["affinity"]["ttlMinutes"] == 45
 
-    sm._edit_affinity(42, 100, "cb", "threshold")
-    sm._on_affinity_input(42, "sys_affinity:threshold", "2.5")
-    assert m["config"].get()["affinity"]["threshold"] == 2.5
     print("  [PASS] affinity fields")
 
 
@@ -222,8 +220,12 @@ def test_chsel_switch(m):
     sm._on_chsel_set(42, 100, "cb", "smart")
     assert m["config"].get()["channelSelection"] == "smart"
 
+    sm._on_chsel_set(42, 100, "cb", "priority")
+    assert m["config"].get()["channelSelection"] == "priority"
+    assert m["config"].get()["loadBalancing"]["initialized"] is True
+
     sm._on_chsel_set(42, 100, "cb", "bogus")
-    assert m["config"].get()["channelSelection"] == "smart"
+    assert m["config"].get()["channelSelection"] == "priority"
     print("  [PASS] channelSelection switch")
 
 

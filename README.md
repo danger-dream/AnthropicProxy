@@ -331,19 +331,11 @@ JSON 请求体：
 发 `/start` 进入主菜单：
 
 ```
-[📊 状态总览]   [📋 最近日志]
-[📈 统计汇总]   [🔀 渠道管理]
-[🔐 管理 OAuth] [🔑 管理 API Key]
-[🔁 模型映射]  [⚙ 系统设置]  [❓ 帮助]
+[📈 统计汇总]   [📋 最近日志]
+[🔐 管理 OAuth] [🔀 管理渠道]
+[🔁 模型映射]   [⚖️ 负载均衡]
+[⚙ 系统设置]   [❓ 帮助]
 ```
-
-### 📊 状态总览（两家族分段）
-- 运行时长 · 选路模式 · 亲和绑定数
-- 🅰 Anthropic / 🅾 OpenAI 各一行渠道统计（可用 / 冷却 / 永久 / 禁用）
-- 今日请求按家族分组展示（成功率 / 首字延迟 / 总耗时 / TPS）
-- ⚡ 最快渠道按家族各 Top 5
-- 📈 配额预警（≥80%）带家族前缀
-- ⚠ 问题渠道清单
 
 ### 📈 统计汇总（4×4 时间×维度 + 两家族）
 - 时间：今天 / 3 天 / 7 天 / 本月
@@ -367,8 +359,8 @@ JSON 请求体：
 - 底部批量：🔄 刷新全部用量 / 🧹 清除所有账户错误（有冷却才显示）
 - 图片生成入口：OAuth 列表底部提供「🖼 图片生成」，用于配置图片模型、缓存、图片专用账号禁用列表和最近图片日志。
 
-### 🔑 管理 API Key
-列表直接显示完整 Key（单击即复制）；每个 Key 可设模型白名单（多选勾选）；删除二次确认。图片生成 / 编辑权限由 `allowImages` 单独控制，默认关闭，需要在 Key 详情页点击「🖼 允许图片接口」后才能调用 `/v1/images/generate` / `/v1/images/edit`。
+### 🔑 API Key
+发送 `/keys` 管理下游代理 Key。列表直接显示完整 Key（单击即复制）；每个 Key 可设模型白名单（多选勾选）；删除二次确认。图片生成 / 编辑权限由 `allowImages` 单独控制，默认关闭，需要在 Key 详情页点击「🖼 允许图片接口」后才能调用 `/v1/images/generate` / `/v1/images/edit`。
 
 ### 🖼 图片生成
 从「🔐 管理 OAuth」列表底部进入，用于管理 Parrot 图片接口的运行参数与日志：
@@ -377,6 +369,12 @@ JSON 请求体：
 - 图片缓存开关、缓存路径、保留天数、缓存空间上限。
 - 图片调用统计、账号 Top 5、最近调用列表。
 - 当缓存开启且图片文件仍存在时，最近成功调用会显示「看图 #id」按钮，管理员可直接把缓存图片发回 Telegram 查看。
+
+### ⚖️ 负载均衡
+- `smart` 智能调度：按滑动窗口评分 + 探索率排序
+- `order` 顺序调度：按 config 渠道定义顺序依次尝试
+- `priority` 优先级调度：按用户在 TG 菜单保存的 Anthropic / OpenAI 协议队列依次尝试
+- 亲和优先于负载均衡：绑定目标仍可用就继续用；不可用时才由当前算法选接班渠道。
 
 ### 🔁 模型映射 & 默认模型
 
@@ -389,7 +387,7 @@ JSON 请求体：
 白名单校验和 `/v1/models` 列表**采用映射后的真实名**——API Key 只需授权真模型即可，别名自动跟随。
 
 ### ⚙ 系统设置
-超时 / 错误阶梯（含阶梯推进最小间隔、永久最小累计两项爆发保护）/ 评分参数 / 亲和参数 / CCH 模式 / 渠道选择模式 / 配额监控 / 通知设置 / 首包黑名单 / ⚡ 渠道并发限制。**所有设置均热加载，无需重启。**
+超时 / 错误阶梯（含阶梯推进最小间隔、永久最小累计两项爆发保护）/ 评分参数 / 亲和参数 / CCH 模式 / 配额监控 / 通知设置 / 首包黑名单 / ⚡ 渠道并发限制。**所有设置均热加载，无需重启。**
 
 ---
 
@@ -452,7 +450,7 @@ JSON 请求体：
   "oauthGraceCount": 3,
   "cooldownLadderMinIntervalSeconds": 30,     // 阶梯推进最小间隔；防秒级重试把渠道打穿
   "cooldownPermanentMinAgeSeconds": 300,      // 永久冷却最小累计；防爆发式失败误判为永久
-  "affinity":      { "ttlMinutes": 30, "threshold": 3.0, "cleanupIntervalSeconds": 300, "clientTtlMinutes": 120 },
+  "affinity":      { "ttlMinutes": 30, "cleanupIntervalSeconds": 300, "clientTtlMinutes": 120 },
   "scoring":       { "emaAlpha": 0.25, "recentWindow": 50, "defaultScore": 3000, "errorPenaltyFactor": 8, "staleMinutes": 15, "staleFullDecayMinutes": 30, "explorationRate": 0.2 },
   "quotaMonitor":  { "enabled": false, "intervalSeconds": 60, "disableThresholdPercent": 95, "resumeThresholdPercent": 95 },
   "accessRefreshThrottleSeconds": 180,
@@ -475,6 +473,8 @@ JSON 请求体：
     }
   },
   "notifications": { "enabled": true, "events": { ... } },
+  "channelSelection": "smart",
+  "loadBalancing": { "initialized": false, "priorityOrders": { "anthropic": [], "openai": [] } },
   "cchMode": "disabled",
   "telegram": { "botToken": "...", "adminIds": [123] }
 }

@@ -71,7 +71,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cooldownPermanentMinAgeSeconds": 300,
     "affinity": {
         "ttlMinutes": 30,
-        "threshold": 3.0,
         "cleanupIntervalSeconds": 300,
         "clientTtlMinutes": 120,
     },
@@ -181,7 +180,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
             },
         },
     },
-    "channelSelection": "smart",  # "smart" | "order"
+    "channelSelection": "smart",  # "smart" | "order" | "priority"
+    "loadBalancing": {
+        "initialized": False,
+        "priorityOrders": {
+            "anthropic": [],
+            "openai": [],
+        },
+    },
     "logDir": "logs",
     "stateDbPath": "state.db",
     # OpenAI 支持相关默认值（只在 /v1/chat/completions、/v1/responses 入口或 openai-* 渠道上生效）

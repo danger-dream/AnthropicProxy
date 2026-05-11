@@ -74,7 +74,7 @@
 - **单元测试**：
   - fingerprint 对称性：query(N) == write(N-1)
   - 评分：陈旧衰减、滑动窗口边界
-  - 亲和打破：threshold 逻辑
+  - 亲和命中：绑定渠道仍可用时置顶
 
 **验收**：
 - 单元测试全过
@@ -205,7 +205,7 @@
   - 亲和参数
   - CCH 模式
   - 首包黑名单（default / byChannel）
-  - channel 选择模式（smart / order）
+  - 负载均衡入口（smart / order / priority）
 
 **验收**：
 - 改完任一设置 → 下一次请求立即生效（热加载）

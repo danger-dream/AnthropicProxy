@@ -351,7 +351,7 @@ async def proactive_refresh_loop():
 → scheduler 筛选出 [oauth:a@g.com, oauth:b@g.com, api:智谱...]（都支持该模型）
 → 计算指纹 H
 → 查 affinity[H] → 命中 oauth:a@g.com, opus-4-7
-  → 打破检查（score a vs 最优）通过 → a 顶到首位
+  → a 当前仍可用 → a 顶到首位
 → failover 顺序尝试 a → b → 智谱
   → a 返回 401（token 过期被 Anthropic 拒）
   → force_refresh(a) → 重新入队 a

@@ -21,8 +21,9 @@ from typing import Optional
 
 from . import states, ui
 from .menus import (
-    apikey_menu, channel_menu, help_menu, image_menu, logs_menu, mapping_menu,
-    oauth_defaults_menu, oauth_menu, stats_menu, status_menu, system_menu,
+    apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
+    logs_menu, mapping_menu, oauth_defaults_menu, oauth_menu, stats_menu,
+    status_menu, system_menu,
 )
 from .menus import main as main_menu
 
@@ -88,15 +89,14 @@ def start() -> None:
     ui.set_my_commands([
         {"command": "start",    "description": "打开管理面板"},
         {"command": "menu",     "description": "打开管理面板"},
-        {"command": "status",   "description": "状态总览"},
         {"command": "stats",    "description": "统计汇总"},
         {"command": "logs",     "description": "最近日志"},
         {"command": "channels", "description": "渠道管理"},
         {"command": "oauth",    "description": "管理 OAuth 账户"},
         {"command": "keys",     "description": "管理 API Key"},
-        {"command": "settings", "description": "系统设置"},
         {"command": "mapping",  "description": "模型映射 / 默认模型"},
-        {"command": "oauth_defaults", "description": "OAuth 默认模型"},
+        {"command": "loadbalancing", "description": "负载均衡"},
+        {"command": "settings", "description": "系统设置"},
         {"command": "help",     "description": "帮助"},
     ])
 
@@ -250,6 +250,10 @@ def _handle_callback(cb: dict) -> None:
     if stats_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
+    # 负载均衡菜单
+    if load_balancing_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
+
     # 日志菜单
     if logs_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
@@ -307,6 +311,9 @@ def _handle_message(msg: dict) -> None:
         if channel_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by channel_menu (action={action})")
             return
+        if load_balancing_menu.handle_text_state(chat_id, action, text):
+            print(f"[tg] handled by load_balancing_menu (action={action})")
+            return
         if system_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by system_menu (action={action})")
             return
@@ -325,7 +332,7 @@ def _handle_message(msg: dict) -> None:
     if text.startswith("/menu"):
         main_menu.on_menu_command(chat_id); return
     if text.startswith("/status"):
-        status_menu.send_new(chat_id); return
+        ui.send(chat_id, "状态总览已从菜单移除。发送 /menu 打开管理面板。"); return
     if text.startswith("/stats"):
         stats_menu.send_new(chat_id); return
     if text.startswith("/logs"):
@@ -340,6 +347,8 @@ def _handle_message(msg: dict) -> None:
         system_menu.send_new(chat_id); return
     if text.startswith("/mapping"):
         mapping_menu.send_new(chat_id); return
+    if text.startswith("/loadbalancing"):
+        load_balancing_menu.send_new(chat_id); return
     if text.startswith("/oauth_defaults"):
         oauth_defaults_menu.send_new(chat_id); return
     if text.startswith("/help"):

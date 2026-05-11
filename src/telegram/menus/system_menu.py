@@ -10,7 +10,7 @@ import json
 import re
 from typing import Any
 
-from ... import concurrency, config
+from ... import concurrency, config, load_balancing
 from .. import states, ui
 from . import main as main_menu
 
@@ -33,11 +33,11 @@ def _main_text_and_kb() -> tuple[str, dict]:
         f"错误阶梯: <code>{','.join(str(x) for x in (cfg.get('errorWindows') or []))}</code>\n"
         f"评分: α={sc.get('emaAlpha', 0.25)} · 窗口={sc.get('recentWindow', 50)} · "
         f"惩罚={sc.get('errorPenaltyFactor', 8)} · 探索={sc.get('explorationRate', 0.2)}\n"
-        f"亲和: TTL={aff.get('ttlMinutes', 30)}min · 打破阈值={aff.get('threshold', 3.0)}x\n"
+        f"亲和: TTL={aff.get('ttlMinutes', 30)}min\n"
         f"CCH: <code>{cfg.get('cchMode', 'disabled')}</code>"
         + (f" (<code>{cfg.get('cchStaticValue', '00000')}</code>)" if cfg.get('cchMode') == 'static' else "")
         + "\n"
-        f"渠道选择: <code>{cfg.get('channelSelection', 'smart')}</code>\n"
+        f"调度: <code>{load_balancing.display_mode(cfg.get('channelSelection', 'smart'))}</code>\n"
         f"配额监控: <code>{'开' if qm.get('enabled') else '关'}</code>"
         f" · 间隔 {qm.get('intervalSeconds', 60)}s · 阈值 {qm.get('disableThresholdPercent', 95)}%\n"
     )
@@ -52,7 +52,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
         [ui.btn("🎯 评分参数", "sys:show:scoring"),
          ui.btn("🔗 亲和参数", "sys:show:affinity")],
         [ui.btn("🎭 CCH 模式", "sys:show:cch"),
-         ui.btn("🚦 选择模式", "sys:show:chsel")],
+         ui.btn("⚖️ 负载均衡", "menu:loadbalancing")],
         [ui.btn("📈 配额监控", "sys:show:quota"),
          ui.btn("🔔 通知设置", "sys:show:notif")],
         [ui.btn("🛡 首包黑名单", "sys:show:blacklist"),
@@ -347,7 +347,6 @@ def _on_scoring_input(chat_id: int, action: str, text: str) -> None:
 
 _AFFINITY_FIELDS = {
     "ttlMinutes": ("绑定 TTL（分钟）", "int",   (1, 1440)),
-    "threshold":  ("打破倍数",          "float", (1.0, 20.0)),
 }
 
 
@@ -482,12 +481,18 @@ def _show_chsel(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def _on_chsel_set(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
-    if mode not in ("smart", "order"):
+    from . import load_balancing_menu
+    if mode not in ("smart", "order", "priority"):
         ui.answer_cb(cb_id, "无效模式")
         return
-    config.update(lambda c: c.__setitem__("channelSelection", mode))
-    ui.answer_cb(cb_id, f"已切换到 {mode}")
-    _show_chsel(chat_id, message_id, "-")
+    try:
+        load_balancing.set_mode(mode)
+    except Exception as exc:
+        ui.answer_cb(cb_id, "切换失败")
+        ui.send(chat_id, f"❌ 切换失败: <code>{ui.escape_html(str(exc))}</code>")
+        return
+    ui.answer_cb(cb_id, f"已切换到 {load_balancing.display_mode(mode)}")
+    load_balancing_menu.show(chat_id, message_id)
 
 
 # ─── OAuth 配额监控 ──────────────────────────────────────────────
@@ -822,9 +827,15 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("sys:cch_set:"):
         _on_cch_set(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data == "sys:edit:cch_static": _edit_cch_static(chat_id, message_id, cb_id); return True
-    if data == "sys:show:chsel":     _show_chsel(chat_id, message_id, cb_id); return True
+    # 旧入口保留为跳转，渠道选择模式已迁移到「负载均衡」。
+    if data == "sys:show:chsel":
+        ui.answer_cb(cb_id, "已迁移到负载均衡")
+        from . import load_balancing_menu
+        load_balancing_menu.show(chat_id, message_id)
+        return True
     if data.startswith("sys:chsel_set:"):
-        _on_chsel_set(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+        ui.answer_cb(cb_id, "已迁移到负载均衡")
+        return True
 
     # OAuth 配额监控
     if data == "sys:show:quota":          _show_quota(chat_id, message_id, cb_id); return True

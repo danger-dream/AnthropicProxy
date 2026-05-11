@@ -25,7 +25,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from ... import affinity, config, cooldown, log_db, probe, scorer, state_db
+from ... import affinity, config, cooldown, load_balancing, log_db, probe, scorer, state_db
 from ...channel import api_channel, registry
 from ...channel.url_utils import (
     detect_suffix_protocol,
@@ -492,7 +492,10 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> Non
     ok = registry.delete_api_channel(name)
     if ok:
         ui.answer_cb(cb_id, "已删除")
-        ui.edit(chat_id, message_id, f"✅ 已删除 <code>{ui.escape_html(name)}</code>")
+        extra = ""
+        if load_balancing.is_initialized():
+            extra = "\n已从负载均衡优先级队列中移除。"
+        ui.edit(chat_id, message_id, f"✅ 已删除 <code>{ui.escape_html(name)}</code>{extra}")
         show(chat_id, message_id)
     else:
         ui.answer_cb(cb_id, "删除失败")
@@ -1018,12 +1021,16 @@ def wiz_skip_test(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.send(chat_id, f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>")
         return
     states.pop_state(chat_id)
+    lb_hint = (
+        "\n\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
+        if load_balancing.is_initialized() else ""
+    )
     ui.edit(
         chat_id, message_id,
         f"✅ <b>渠道已保存（跳过测试）</b>\n\n"
         f"名称: <code>{ui.escape_html(data['name'])}</code>\n"
         f"协议: <code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n"
-        "所有模型标记为「可用」，后台 probe 会持续验证真实可用性。",
+        f"所有模型标记为「可用」，后台 probe 会持续验证真实可用性。{lb_hint}",
         reply_markup=ui.inline_kb([
             [ui.btn("◀ 返回渠道列表", "menu:channel"),
              ui.btn("🏠 主菜单", "menu:main")],
@@ -1080,6 +1087,8 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
     )
     if fail_names:
         summary += f"不可用（已加入冷却） ({len(fail_names)}): {fail_display}"
+    if load_balancing.is_initialized():
+        summary += "\n\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
     # edit 同一消息显示结果 + 导航；用户点击按钮返回列表，避免双消息
     ui.edit(chat_id, message_id, summary, reply_markup=ui.inline_kb([
         [ui.btn("◀ 返回渠道列表", "menu:channel"),
