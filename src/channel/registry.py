@@ -246,6 +246,11 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
     - patch 同时指定 baseUrl + apiPath 时以显式值为准。
     """
     old_key = f"api:{name}"
+    old_entry = next(
+        (c for c in config.get().get("channels", []) if c.get("name") == name),
+        {},
+    )
+    old_family = load_balancing.family_for_protocol(old_entry.get("protocol", "anthropic"))
 
     def _mutate(cfg):
         channels = cfg.get("channels", [])
@@ -352,8 +357,9 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
         concurrency.rename_channel(old_key, new_key)
         # 维护用户优先级表；family 用更新后的 protocol 推导
         load_balancing.sync_channel_renamed(old_key, new_key, new_family)
-    elif "protocol" in patch:
-        # 协议家族变化时，从旧 family 移除并追加到新 family 队尾。
+    elif "protocol" in patch and old_family != new_family:
+        # 只有协议 family 实际变化时，才从旧 family 移除并追加到新 family 队尾。
+        # 菜单保存时可能把当前 protocol 原样带回，不能因此打乱用户优先级。
         load_balancing.sync_channel_removed(old_key)
         load_balancing.sync_channel_added(old_key, new_family)
 

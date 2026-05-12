@@ -31,6 +31,7 @@ from src import (
     public_ip, scheduler, scorer, state_db, upstream,
 )
 from src.channel import registry
+from src.client_ip import get_client_ip
 from datetime import datetime, timezone
 from src.telegram import bot as tgbot
 from src.transform.cc_mimicry import DEVICE_ID
@@ -392,7 +393,7 @@ async def proxy_images_edit(request: Request):
 async def proxy_messages(request: Request):
     start_time = time.time()
     request_id = str(uuid.uuid4())
-    client_ip = request.client.host if request.client else "?"
+    client_ip = get_client_ip(request)
 
     # 1. API Key 验证
     key_name, allowed_models, err = auth.validate(request.headers)

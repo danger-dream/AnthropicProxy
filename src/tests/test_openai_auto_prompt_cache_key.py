@@ -37,13 +37,94 @@ def _setup(m):
 
 def test_auto_prompt_cache_key_generated_when_missing(m):
     _setup(m)
-    body = {"model": "gpt-5.5", "input": "hi"}
+    body = {"model": "gpt-5.5"}
 
     key = m["handler"]._maybe_apply_auto_prompt_cache_key(body, fp_query=None)
 
     assert key is not None
     assert key.startswith("parrot:auto:v1:")
+    assert not key.startswith("parrot:auto:v1:stable:")
     assert body["prompt_cache_key"] == key
+
+
+def test_auto_prompt_cache_key_stable_fallback_chat(m):
+    _setup(m)
+    body1 = {"model": "gpt-5.5", "messages": [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "bootstrap user"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "real task"},
+    ]}
+    body2 = {"model": "gpt-5.5", "messages": [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "bootstrap user"},
+        {"role": "assistant", "content": "a1 changed should not affect anchor"},
+        {"role": "user", "content": "real task"},
+        {"role": "assistant", "content": "later"},
+        {"role": "user", "content": "next"},
+    ]}
+
+    key1 = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        body1, fp_query=None, api_key_name="alice", client_ip="1.2.3.4",
+        model="gpt-5.5", ingress_protocol="chat",
+    )
+    key2 = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        body2, fp_query=None, api_key_name="alice", client_ip="1.2.3.4",
+        model="gpt-5.5", ingress_protocol="chat",
+    )
+
+    assert key1 == key2
+    assert key1.startswith("parrot:auto:v1:stable:")
+
+
+def test_auto_prompt_cache_key_does_not_lock_on_single_bootstrap_user(m):
+    _setup(m)
+    body1 = {"model": "gpt-5.5", "messages": [
+        {"role": "system", "content": "same system"},
+        {"role": "user", "content": "same bootstrap user"},
+    ]}
+    body2 = {"model": "gpt-5.5", "messages": [
+        {"role": "system", "content": "same system"},
+        {"role": "user", "content": "same bootstrap user"},
+    ]}
+
+    key1 = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        body1, fp_query=None, api_key_name="alice", client_ip="1.2.3.4",
+        model="gpt-5.5", ingress_protocol="chat",
+    )
+    key2 = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        body2, fp_query=None, api_key_name="alice", client_ip="1.2.3.4",
+        model="gpt-5.5", ingress_protocol="chat",
+    )
+
+    assert key1 != key2
+    assert not key1.startswith("parrot:auto:v1:stable:")
+    assert not key2.startswith("parrot:auto:v1:stable:")
+
+
+def test_auto_prompt_cache_key_stable_fallback_isolated_by_client_ip(m):
+    _setup(m)
+    body1 = {"model": "gpt-5.5", "messages": [
+        {"role": "user", "content": "bootstrap"},
+        {"role": "assistant", "content": "a"},
+        {"role": "user", "content": "real task"},
+    ]}
+    body2 = {"model": "gpt-5.5", "messages": [
+        {"role": "user", "content": "bootstrap"},
+        {"role": "assistant", "content": "a"},
+        {"role": "user", "content": "real task"},
+    ]}
+
+    key1 = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        body1, fp_query=None, api_key_name="alice", client_ip="1.2.3.4",
+        model="gpt-5.5", ingress_protocol="chat",
+    )
+    key2 = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        body2, fp_query=None, api_key_name="alice", client_ip="5.6.7.8",
+        model="gpt-5.5", ingress_protocol="chat",
+    )
+
+    assert key1 != key2
 
 
 def test_auto_prompt_cache_key_respects_downstream_value(m):
@@ -98,3 +179,135 @@ def test_auto_prompt_cache_key_can_be_disabled(m):
 
     assert key is None
     assert "prompt_cache_key" not in body
+
+
+def test_responses_stable_fallback_includes_input_system(m):
+    _setup(m)
+    body1 = {"model": "gpt-5.5", "input": [
+        {"type": "message", "role": "system", "content": "system A"},
+        {"type": "message", "role": "user", "content": "bootstrap"},
+        {"type": "message", "role": "assistant", "content": "ack"},
+        {"type": "message", "role": "user", "content": "real task"},
+    ]}
+    body2 = {"model": "gpt-5.5", "input": [
+        {"type": "message", "role": "system", "content": "system B"},
+        {"type": "message", "role": "user", "content": "bootstrap"},
+        {"type": "message", "role": "assistant", "content": "ack"},
+        {"type": "message", "role": "user", "content": "real task"},
+    ]}
+
+    key1 = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        body1, fp_query=None, api_key_name="alice", client_ip="1.2.3.4",
+        model="gpt-5.5", ingress_protocol="responses",
+    )
+    key2 = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        body2, fp_query=None, api_key_name="alice", client_ip="1.2.3.4",
+        model="gpt-5.5", ingress_protocol="responses",
+    )
+
+    assert key1 != key2
+    assert key1.startswith("parrot:auto:v1:stable:")
+    assert key2.startswith("parrot:auto:v1:stable:")
+
+
+def test_openai_prompt_total_legacy_input_includes_cached(m):
+    from src import cache_display
+
+    row = {
+        "upstream_protocol": "openai-responses",
+        "input_tokens": 28010,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 26112,
+    }
+    assert cache_display.prompt_total_from_row(row) == 28010
+    assert "93.2%" in cache_display.cache_read_phrase_from_row(row)
+
+
+def test_get_client_ip_prefers_cdn_headers(m):
+    from src.client_ip import get_client_ip
+
+    class H:
+        def __init__(self, data):
+            self._d = {k.lower(): v for k, v in data.items()}
+        def get(self, k, default=None):
+            return self._d.get(k.lower(), default)
+        def items(self):
+            return self._d.items()
+
+    class C:
+        host = "10.0.0.9"
+
+    class R:
+        headers = H({
+            "X-Forwarded-For": "203.0.113.10, 10.0.0.1",
+            "CF-Connecting-IP": "198.51.100.8",
+        })
+        client = C()
+
+    assert get_client_ip(R()) == "198.51.100.8"
+
+
+def test_get_client_ip_fallback_x_forwarded_for_then_socket(m):
+    from src.client_ip import get_client_ip
+
+    class H:
+        def __init__(self, data):
+            self._d = {k.lower(): v for k, v in data.items()}
+        def get(self, k, default=None):
+            return self._d.get(k.lower(), default)
+        def items(self):
+            return self._d.items()
+
+    class C:
+        host = "10.0.0.9"
+
+    class R1:
+        headers = H({"X-Forwarded-For": "203.0.113.10, 10.0.0.1"})
+        client = C()
+
+    class R2:
+        headers = H({})
+        client = C()
+
+    assert get_client_ip(R1()) == "203.0.113.10"
+    assert get_client_ip(R2()) == "10.0.0.9"
+
+
+# ─── main ────────────────────────────────────────────────────────
+
+def main() -> int:
+    m = _import_modules()
+    tests = [
+        test_auto_prompt_cache_key_generated_when_missing,
+        test_auto_prompt_cache_key_stable_fallback_chat,
+        test_auto_prompt_cache_key_does_not_lock_on_single_bootstrap_user,
+        test_auto_prompt_cache_key_stable_fallback_isolated_by_client_ip,
+        test_auto_prompt_cache_key_respects_downstream_value,
+        test_auto_prompt_cache_key_reuses_affinity_chain_value,
+        test_affinity_upsert_preserves_prompt_cache_key_when_omitted,
+        test_auto_prompt_cache_key_can_be_disabled,
+        test_responses_stable_fallback_includes_input_system,
+        test_openai_prompt_total_legacy_input_includes_cached,
+        test_get_client_ip_prefers_cdn_headers,
+        test_get_client_ip_fallback_x_forwarded_for_then_socket,
+    ]
+    passed = 0
+    print("── OpenAI auto prompt_cache_key ────────────")
+    for t in tests:
+        try:
+            t(m)
+            passed += 1
+            print(f"  [PASS] {t.__name__}")
+        except AssertionError as e:
+            print(f"  [FAIL] {t.__name__}: {e}")
+            import traceback; traceback.print_exc()
+        except Exception as e:
+            print(f"  [ERR ] {t.__name__}: {e}")
+            import traceback; traceback.print_exc()
+    print(f"\nRESULT: {passed} / {len(tests)} passed")
+    return 0 if passed == len(tests) else 1
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())

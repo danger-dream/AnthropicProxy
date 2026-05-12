@@ -234,7 +234,12 @@ def sync_channel_removed(channel_key: str) -> bool:
 
 
 def sync_channel_renamed(old_key: str, new_key: str, family: str) -> bool:
-    """API 渠道改名时维护优先级表。"""
+    """API 渠道改名时维护优先级表。
+
+    `family` 是改名后的目标 family。若用户同时改名 + 改协议，旧 family
+    里必须删除旧 key（以及可能残留的新 key），不能把 new_key 留在跨
+    family 的 priorityOrders 里。
+    """
     if not old_key or not new_key or old_key == new_key:
         return False
     cfg = config.get()
@@ -250,7 +255,12 @@ def sync_channel_renamed(old_key: str, new_key: str, family: str) -> bool:
             new_arr: list[str] = []
             seen: set[str] = set()
             for key in arr:
-                k = new_key if key == old_key else key
+                if fam == family:
+                    k = new_key if key == old_key else key
+                elif key in (old_key, new_key):
+                    continue
+                else:
+                    k = key
                 if k not in seen:
                     new_arr.append(k)
                     seen.add(k)

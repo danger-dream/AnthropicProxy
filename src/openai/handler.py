@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import secrets
 import time
@@ -35,6 +36,7 @@ from .. import (
     affinity, auth, config, errors, failover, fingerprint, log_db, model_mapping,
     notifier, scheduler,
 )
+from ..client_ip import get_client_ip
 from ..channel import registry
 from .transform.guard import GuardError, guard_chat_ingress, guard_responses_ingress
 from .transform.responses_to_chat import resolve_current_input_items
@@ -93,18 +95,152 @@ def _auto_prompt_cache_enabled() -> bool:
     return bool(auto.get("enabled", True))
 
 
-def _new_auto_prompt_cache_key() -> str:
+def _auto_prompt_cache_prefix() -> str:
     auto = _auto_prompt_cache_cfg()
-    prefix = str(auto.get("prefix") or "parrot:auto:v1").strip() or "parrot:auto:v1"
-    # 不含用户内容/会话内容；仅作为 OpenAI 上游 prompt cache 路由 hint。
-    return f"{prefix}:{secrets.token_hex(16)}"
+    return str(auto.get("prefix") or "parrot:auto:v1").strip() or "parrot:auto:v1"
 
 
-def _maybe_apply_auto_prompt_cache_key(body: dict, *, fp_query: str | None) -> str | None:
+def _new_auto_prompt_cache_key() -> str:
+    # 随机兜底：仅在无法构造稳定会话 anchor 时使用。
+    return f"{_auto_prompt_cache_prefix()}:{secrets.token_hex(16)}"
+
+
+def _canon_anchor_value(value: Any) -> Any:
+    """为稳定 prompt_cache_key anchor 做轻量归一化。
+
+    保留会话开头的稳定内容，但只参与 hash，不把原文放进 key。
+    """
+    if isinstance(value, dict):
+        return {str(k): _canon_anchor_value(value[k]) for k in sorted(value.keys(), key=str)}
+    if isinstance(value, list):
+        return [_canon_anchor_value(v) for v in value]
+    return value
+
+
+def _chat_anchor_messages(messages: Any) -> list[Any]:
+    """取 chat 稳定 anchor。
+
+    不能只取 system/developer + 第一条 user：OpenClaw 这类客户端的
+    bootstrap user 可能在所有新会话里完全相同，会把不同会话锁到同一个
+    prompt_cache_key。这里要求至少两条 user message，再取开头连续
+    system/developer + 前两条 user；不足两条 user 时返回空，让调用方走
+    随机 key + fingerprint 亲和链。
+    """
+    if not isinstance(messages, list):
+        return []
+    prefix: list[Any] = []
+    users: list[Any] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if not users and role in ("system", "developer"):
+            prefix.append(msg)
+            continue
+        if role == "user":
+            users.append(msg)
+            if len(users) >= 2:
+                break
+    if len(users) < 2:
+        return []
+    return prefix + users[:2]
+
+
+def _responses_input_anchor_items(items: Any) -> list[Any]:
+    """取 responses input 内的稳定 anchor。
+
+    真实 OpenClaw/Codex 请求常把 system 放在 input[0]，而不是顶层
+    instructions。这里和 chat 入口对齐：开头连续 system/developer + 前两条
+    user；不足两条 user 时返回空，避免固定 bootstrap 首条 user 跨会话锁死。
+    """
+    if not isinstance(items, list):
+        return []
+    prefix: list[Any] = []
+    users: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        typ = item.get("type")
+        is_message = (typ in (None, "message")) and role is not None
+        if not users and is_message and role in ("system", "developer"):
+            prefix.append(item)
+            continue
+        if is_message and role == "user":
+            users.append(item)
+            if len(users) >= 2:
+                break
+    if len(users) < 2:
+        return []
+    return prefix + users[:2]
+
+
+def _responses_anchor_items(body: dict) -> list[Any]:
+    """取 responses 稳定 anchor：instructions + input 开头 system/developer + 前两条 user。
+
+    同 chat 一样，至少需要两条 user message 才启用稳定 key，避免固定
+    bootstrap 首条 user 导致跨会话锁定。
+    """
+    items = resolve_current_input_items(body)
+    input_anchors = _responses_input_anchor_items(items)
+    if not input_anchors:
+        return []
+    anchors: list[Any] = []
+    if body.get("instructions"):
+        anchors.append({"instructions": body.get("instructions")})
+    anchors.extend(input_anchors)
+    return anchors
+
+
+def _stable_prompt_cache_key(
+    body: dict,
+    *,
+    api_key_name: str,
+    client_ip: str,
+    model: str,
+    ingress_protocol: str,
+) -> str | None:
+    """基于会话 anchor 生成稳定 prompt_cache_key。
+
+    用于 fingerprint 亲和链未命中时的 fallback，避免同一长会话中途因为
+    临时 fp miss 生成新随机 key，进而打断 OpenAI prompt cache/session_id。
+    """
+    anchors: list[Any] = []
+    if ingress_protocol == "chat":
+        anchors = _chat_anchor_messages(body.get("messages") or [])
+    elif ingress_protocol == "responses":
+        anchors = _responses_anchor_items(body)
+
+    anchors = [a for a in anchors if a]
+    if not anchors:
+        return None
+
+    material = {
+        "v": 1,
+        "api_key_name": api_key_name or "",
+        "client_ip": client_ip or "",
+        "model": model or "",
+        "ingress_protocol": ingress_protocol or "",
+        "anchors": _canon_anchor_value(anchors),
+    }
+    raw = json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return f"{_auto_prompt_cache_prefix()}:stable:{digest}"
+
+
+def _maybe_apply_auto_prompt_cache_key(
+    body: dict,
+    *,
+    fp_query: str | None,
+    api_key_name: str = "",
+    client_ip: str = "",
+    model: str = "",
+    ingress_protocol: str = "chat",
+) -> str | None:
     """OpenAI 协议专用：下游未传 prompt_cache_key 时自动补一个。
 
-    优先从亲和链的 fp_query 继承已绑定 key；没有则生成新 key，成功响应
-    后由 failover 绑定到 fp_write，从下一轮开始链式复用。
+    优先级：下游显式值 → fingerprint 亲和链值 → 稳定 anchor key → 随机兜底。
+    成功响应后由 failover 把最终 key 绑定到 fp_write。
     """
     if not isinstance(body, dict):
         return None
@@ -125,6 +261,14 @@ def _maybe_apply_auto_prompt_cache_key(body: dict, *, fp_query: str | None) -> s
             if val:
                 key = val
     if not key:
+        key = _stable_prompt_cache_key(
+            body,
+            api_key_name=api_key_name,
+            client_ip=client_ip,
+            model=model,
+            ingress_protocol=ingress_protocol,
+        )
+    if not key:
         key = _new_auto_prompt_cache_key()
     body["prompt_cache_key"] = key
     return key
@@ -141,7 +285,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
 
     start_time = time.time()
     request_id = str(uuid.uuid4())
-    client_ip = request.client.host if request.client else "?"
+    client_ip = get_client_ip(request)
 
     # 1. auth
     key_name, allowed_models, err = auth.validate(request.headers)
@@ -222,7 +366,14 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
 
     # 5.1 OpenAI 专用 prompt cache 路由 hint：下游没传时基于亲和链自动补。
     #     Anthropic/其他协议不走本 handler，不受影响。
-    _maybe_apply_auto_prompt_cache_key(body, fp_query=fp_query)
+    _maybe_apply_auto_prompt_cache_key(
+        body,
+        fp_query=fp_query,
+        api_key_name=key_name or "",
+        client_ip=client_ip,
+        model=model,
+        ingress_protocol=ingress_protocol,
+    )
 
     # 6. pending 日志；剥掉下划线前缀的内部 metadata（_api_key_name 等）后再落盘
     req_headers = _sanitize_headers(dict(request.headers))

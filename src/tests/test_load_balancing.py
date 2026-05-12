@@ -7,6 +7,7 @@ _ap_sys.path.insert(0, _ap_os.path.dirname(_ap_os.path.dirname(_ap_os.path.dirna
 from src.tests import _isolation
 _isolation.isolate()
 
+import asyncio
 import json
 import os
 import sys
@@ -16,13 +17,14 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import affinity, config, load_balancing, scheduler, state_db
+    from src import affinity, concurrency, config, load_balancing, scheduler, state_db
     from src.channel import registry
     from src.openai.channel.registration import register_factories
     from src.telegram import states, ui
     from src.telegram.menus import load_balancing_menu
     return {
         "affinity": affinity,
+        "concurrency": concurrency,
         "config": config,
         "load_balancing": load_balancing,
         "scheduler": scheduler,
@@ -72,6 +74,7 @@ def _setup(m):
     m["affinity"]._client_initialized = False
     m["affinity"].init()
     m["affinity"].client_init()
+    m["concurrency"]._slots.clear()
 
 
 def _add_api(m, name, model="m", protocol="anthropic"):
@@ -194,6 +197,60 @@ def test_add_delete_sync_priority(m):
     print("  [PASS] add/delete/rename sync priorityOrders")
 
 
+def test_protocol_patch_without_family_change_keeps_priority(m):
+    _setup(m)
+    _add_api(m, "a")
+    _add_api(m, "b")
+    m["load_balancing"].save_family_order("anthropic", ["api:b", "api:a"])
+
+    # 菜单保存编辑时可能把当前 protocol 原样带回；family 未变时不能把渠道挪到队尾。
+    m["registry"].update_api_channel("b", {
+        "protocol": "anthropic",
+        "baseUrl": "https://example.org",
+    })
+    order = m["config"].get()["loadBalancing"]["priorityOrders"]["anthropic"]
+    assert order == ["api:b", "api:a"]
+    print("  [PASS] unchanged protocol patch keeps priority position")
+
+
+def test_rename_and_protocol_change_cleans_old_family(m):
+    _setup(m)
+    _add_api(m, "x", protocol="anthropic")
+    _add_api(m, "y", protocol="anthropic")
+    m["load_balancing"].initialize_priority_orders()
+
+    m["registry"].update_api_channel("x", {
+        "name": "z",
+        "protocol": "openai-chat",
+        "baseUrl": "https://example.org",
+        "apiPath": "/v1/chat/completions",
+    })
+    orders = m["config"].get()["loadBalancing"]["priorityOrders"]
+    assert orders["anthropic"] == ["api:y"]
+    assert orders["openai"] == ["api:z"]
+    print("  [PASS] rename + protocol change cleans cross-family priorityOrders")
+
+
+def test_priority_sorts_available_and_saturated_separately(m):
+    _setup(m)
+    _add_api(m, "a")
+    _add_api(m, "b")
+    m["registry"].update_api_channel("a", {"maxConcurrent": 1})
+    m["load_balancing"].save_family_order("anthropic", ["api:a", "api:b"])
+    m["config"].update(lambda c: c.__setitem__("channelSelection", "priority"))
+
+    # 当前策略：priority 分别排序 available / saturated；高优先级满并发时，
+    # 低优先级空闲渠道先进入 candidates，高优先级作为 saturated 排队备选。
+    assert asyncio.run(m["concurrency"].try_acquire("api:a")) is True
+    try:
+        res = m["scheduler"].schedule({"model": "m", "messages": [{"role": "user", "content": "hi"}]}, "k", "1.1.1.1")
+        assert [ch.key for ch, _ in res.candidates] == ["api:b"]
+        assert [ch.key for ch, _ in res.saturated] == ["api:a"]
+    finally:
+        m["concurrency"].release("api:a")
+    print("  [PASS] saturated high-priority channel stays queued while available lower priority runs")
+
+
 def main():
     m = _import_modules()
     orig_cfg = json.loads(json.dumps(m["config"].get()))
@@ -202,6 +259,9 @@ def main():
         test_normalize_and_init,
         test_button_rows_and_preview,
         test_add_delete_sync_priority,
+        test_protocol_patch_without_family_change_keeps_priority,
+        test_rename_and_protocol_change_cleans_old_family,
+        test_priority_sorts_available_and_saturated_separately,
     ]
     passed = 0
     try:
