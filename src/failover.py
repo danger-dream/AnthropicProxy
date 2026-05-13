@@ -1382,6 +1382,113 @@ async def _consume_stream_as_non_stream(
 
 # ─── 流式 ────────────────────────────────────────────────────────
 
+
+async def _read_until_first_downstream_chunk(
+    aiter,
+    ch: Channel,
+    dynamic_map: Optional[dict],
+    tracker,
+    builder,
+    deadline_ts: float,
+    idle_timeout: int,
+    *,
+    protocol: str,
+    first_chunk: bytes,
+    stream_translator=None,
+) -> tuple[list[bytes], Optional[dict]]:
+    """Buffer upstream SSE until the first actual downstream bytes.
+
+    The failover lock boundary is not "first upstream Responses event". Responses
+    metadata/control events (created/in_progress/keepalive) and translator-dropped
+    events (for example response.output_item.added for a chat-translated message)
+    are still pre-first-byte. If an upstream error appears before this function
+    has produced downstream bytes, the caller can still fail over invisibly.
+
+    Returns (downstream_chunks, error_event). downstream_chunks are already in
+    the downstream protocol shape. For same-protocol Responses streams, metadata
+    events are buffered and replayed only after a real visible event proves this
+    attempt should be used.
+    """
+    pending = b""
+    buffered_same_protocol_events: list[bytes] = []
+
+    def feed_downstream_event(event_bytes: bytes) -> list[bytes]:
+        if stream_translator is not None:
+            return list(stream_translator.feed(event_bytes))
+        return [event_bytes]
+
+    async def feed_restored(restored: bytes) -> tuple[list[bytes], Optional[dict]]:
+        nonlocal pending
+        tracker.feed(restored)
+        builder.feed(restored)
+        pending += restored
+        pending, events = upstream.split_sse_events(pending)
+        downstream_chunks: list[bytes] = []
+        downstream_started = False
+        for block in events:
+            event_name, data = upstream.parse_sse_event_bytes(block)
+            event_bytes = block + b"\n\n"
+            if upstream.is_stream_error_event(event_name, data):
+                error_obj = dict(data or {})
+                error_obj["_event_name"] = event_name or ""
+                return [], error_obj
+
+            visible_event = upstream.is_downstream_visible_event(event_name, data, protocol)
+            if not downstream_started and not visible_event:
+                if stream_translator is None:
+                    # Same-protocol Responses clients should eventually receive
+                    # metadata, but sending it now would lock the channel before
+                    # any meaningful content. Hold it until a visible event arrives.
+                    buffered_same_protocol_events.append(event_bytes)
+                else:
+                    # Translator state may need metadata; if a translator ever emits
+                    # bytes for it, those bytes are by definition the downstream boundary.
+                    outs = feed_downstream_event(event_bytes)
+                    if outs:
+                        downstream_started = True
+                        downstream_chunks.extend(outs)
+                continue
+
+            outs = feed_downstream_event(event_bytes)
+            if outs:
+                if not downstream_started and stream_translator is None and buffered_same_protocol_events:
+                    downstream_chunks.extend(buffered_same_protocol_events)
+                    buffered_same_protocol_events.clear()
+                downstream_started = True
+                downstream_chunks.extend(outs)
+
+        if downstream_started:
+            if pending:
+                # Partial trailing bytes only happen when a chunk contains the
+                # start of a following SSE block after the first downstream event.
+                # It is now safe to pass through/feed them; subsequent reads will
+                # continue from the network iterator.
+                if stream_translator is not None:
+                    downstream_chunks.extend(stream_translator.feed(pending))
+                else:
+                    downstream_chunks.append(pending)
+                pending = b""
+            return downstream_chunks, None
+        return [], None
+
+    restored_first = await ch.restore_response(first_chunk, dynamic_map=dynamic_map)
+    downstream_chunks, err = await feed_restored(restored_first)
+    if downstream_chunks or err is not None:
+        return downstream_chunks, err
+
+    while True:
+        remaining = _remaining_ms(deadline_ts)
+        if remaining <= 0:
+            raise asyncio.TimeoutError("upstream total timeout before first downstream chunk")
+        wait_sec = min(idle_timeout, max(1, remaining / 1000))
+        chunk = await asyncio.wait_for(aiter.__anext__(), timeout=wait_sec)
+        if not chunk:
+            continue
+        restored = await ch.restore_response(chunk, dynamic_map=dynamic_map)
+        downstream_chunks, err = await feed_restored(restored)
+        if downstream_chunks or err is not None:
+            return downstream_chunks, err
+
 async def _consume_stream(
     ctx, upstream_resp: httpx.Response, ch: Channel, resolved_model: str,
     dynamic_map: Optional[dict],
@@ -1438,26 +1545,72 @@ async def _consume_stream(
         )
 
     # 2. 首包还原 + 安全检查
-    first_chunk_restored = await ch.restore_response(first_chunk, dynamic_map=dynamic_map)
-
     toolkit = _toolkit_for(ch)
+    tracker = toolkit["stream_tracker"]()
+    builder = toolkit["stream_builder"]()
+    ch_proto = getattr(ch, "protocol", "anthropic")
+    # 跨变体：上游字节 → translator.feed → 下游字节；同协议 translator=None 原样 yield
+    stream_translator = _make_stream_translator(translator_ctx)
 
-    # 2a) 首个 SSE event 是 error？（按 ch.protocol 选解析器 + 识别器）
-    first_event = toolkit["first_event_parser"](first_chunk_restored)
-    if first_event and (
-        first_event.get("type") == "error"
-        or isinstance(first_event.get("error"), dict)
-        or first_event.get("_event_name") == "error"
-    ):
-        await _safe_exit(ctx)
-        return AttemptResult(
-            outcome="upstream_error_json",
-            connect_ms=connect_ms, first_byte_ms=first_byte_ms,
-            error_detail=json.dumps(first_event.get("error", first_event), ensure_ascii=False)[:2000],
-        )
+    if ch_proto == "openai-responses":
+        # Responses stream starts with metadata/control events (created,
+        # in_progress, keepalive). Do not treat those as the irreversible first
+        # downstream byte. Buffer/feed events until the first actual downstream
+        # bytes. Errors before that boundary are still retryable.
+        try:
+            first_downstream_chunks, pre_visible_error = await _read_until_first_downstream_chunk(
+                aiter, ch, dynamic_map, tracker, builder, deadline_ts, idle_timeout,
+                protocol=ch_proto, first_chunk=first_chunk, stream_translator=stream_translator,
+            )
+        except asyncio.TimeoutError:
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="first_byte_timeout", connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=f"first downstream chunk timeout > {idle_timeout}s",
+            )
+        except StopAsyncIteration:
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="closed_before_first_byte", connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail="upstream closed stream before first downstream chunk",
+            )
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TimeoutException) as exc:
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="transport_error", connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=f"first downstream chunk transport: {exc}",
+            )
+        if pre_visible_error:
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="upstream_error_json",
+                connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=json.dumps(pre_visible_error.get("error", pre_visible_error), ensure_ascii=False)[:2000],
+            )
+    else:
+        first_chunk_restored = await ch.restore_response(first_chunk, dynamic_map=dynamic_map)
+        first_event = toolkit["first_event_parser"](first_chunk_restored)
+        if first_event and (
+            first_event.get("type") == "error"
+            or isinstance(first_event.get("error"), dict)
+            or first_event.get("_event_name") == "error"
+        ):
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="upstream_error_json",
+                connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=json.dumps(first_event.get("error", first_event), ensure_ascii=False)[:2000],
+            )
+        tracker.feed(first_chunk_restored)
+        builder.feed(first_chunk_restored)
+        if stream_translator is not None:
+            first_downstream_chunks = list(stream_translator.feed(first_chunk_restored))
+        else:
+            first_downstream_chunks = [first_chunk_restored]
 
-    # 2b) 黑名单
-    bl_hit = blacklist.match(first_chunk_restored, ch.key)
+    # 2b) 黑名单：对真正会发给下游的第一段内容检查，而不是 metadata。
+    bl_target = b"".join(first_downstream_chunks)
+    bl_hit = blacklist.match(bl_target, ch.key)
     if bl_hit:
         await _safe_exit(ctx)
         return AttemptResult(
@@ -1468,12 +1621,6 @@ async def _consume_stream(
 
     # 3. 通过检查 → 开始向下游发 ★
     resp_headers = _pick_upstream_headers(upstream_resp)
-    tracker = toolkit["stream_tracker"]()
-    builder = toolkit["stream_builder"]()
-    tracker.feed(first_chunk_restored)
-    builder.feed(first_chunk_restored)
-    # 跨变体：上游字节 → translator.feed → 下游字节；同协议 translator=None 原样 yield
-    stream_translator = _make_stream_translator(translator_ctx)
     upstream_status = upstream_resp.status_code
 
     state: dict = {"total_ms": None, "finalized": False}
@@ -1587,8 +1734,16 @@ async def _consume_stream(
         tracker.saw_stream_end=True 表示上游已送达收尾事件
         （anthropic message_stop / chat [DONE] or finish_reason / responses completed 等）。
         这种情况服务端视角已成功完成，client 只是没收完最后几帧就断，归 success。
+
+        tracker.saw_stream_error=True 表示上游 stream 内已给出终态错误
+        （event:error / response.failed / chat error chunk）。这种情况下若下游收到
+        error 帧后立刻断开，不能再把 DB 误标成 "client disconnected"。
         """
         if state["finalized"]:
+            return
+        if getattr(tracker, "saw_stream_error", False):
+            msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
+            await _emit_error_and_finalize("api_error", msg, outcome="stream_upstream_error")
             return
         if getattr(tracker, "saw_stream_end", False):
             await _finalize_success()
@@ -1610,12 +1765,18 @@ async def _consume_stream(
         if state["finalized"]:
             return
         try:
-            # 首包
-            if stream_translator is not None:
-                for out in stream_translator.feed(first_chunk_restored):
-                    yield out
-            else:
-                yield first_chunk_restored
+            # 首个实际下游 chunk 已在返回 StreamingResponse 前确定，确保
+            # failover 锁定点等于“下游真的会收到字节”。
+            for out in first_downstream_chunks:
+                yield out
+
+            if getattr(tracker, "saw_stream_error", False):
+                msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
+                await _emit_error_and_finalize(
+                    "api_error", msg,
+                    outcome="stream_upstream_error",
+                )
+                return
 
             # 后续 chunk，带 idle / total 超时
             while True:
@@ -1675,6 +1836,18 @@ async def _consume_stream(
                         yield out
                 else:
                     yield restored
+
+                # 上游在 stream 中途给出终态错误（Responses event:error /
+                # response.failed，或 Chat/Anthropic error chunk）时，下游通常会在
+                # 收到错误帧后立即断开。这里先把上游原始错误帧转发出去，再落库真实
+                # 错误并结束，避免被 finally/CancelledError 误标成 client disconnected。
+                if getattr(tracker, "saw_stream_error", False):
+                    msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
+                    await _emit_error_and_finalize(
+                        "api_error", msg,
+                        outcome="stream_upstream_error",
+                    )
+                    return
 
             # 上游已正常收尾 → 先落库成功，再 yield 翻译器收尾帧。
             # 若放到后面，客户端在 yield 期间断开会让 CancelledError 抢先触发

@@ -70,6 +70,88 @@ def _zero_usage() -> dict:
     return {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0}
 
 
+def _format_stream_error_info(payload: Any, fallback: str = "upstream stream error") -> tuple[Optional[str], str]:
+    """Return (error_type_or_code, readable_message) for terminal SSE errors.
+
+    Different upstream protocols wrap stream errors differently:
+    - Anthropic: {"type":"error", "error":{"type":..., "message":...}}
+    - OpenAI chat: {"error":{"type":..., "message":...}}
+    - OpenAI responses event:error: {"type":"error", "error":{...}} or
+      {"type":"error", "error_type":..., "message":...}
+    - OpenAI responses failed: {"response":{"error":{...}}}
+
+    Keep this helper deliberately small and dependency-free; it feeds log_db only.
+    """
+    err = payload
+    if isinstance(payload, dict):
+        if isinstance(payload.get("error"), dict):
+            err = payload["error"]
+        elif isinstance(payload.get("response"), dict) and isinstance(payload["response"].get("error"), dict):
+            err = payload["response"]["error"]
+
+    if isinstance(err, dict):
+        code = (
+            err.get("code")
+            or err.get("type")
+            or err.get("error_type")
+            or err.get("status")
+        )
+        message = err.get("message") or err.get("reason") or fallback
+        if code and str(code) not in str(message):
+            return str(code), f"{code}: {message}"
+        return str(code) if code else None, str(message)
+
+    if isinstance(payload, dict):
+        top_type = payload.get("type")
+        code = (
+            payload.get("code")
+            or payload.get("error_type")
+            or (top_type if top_type != "error" else None)
+            or payload.get("status")
+        )
+        message = payload.get("message") or payload.get("reason") or fallback
+        if code and str(code) not in str(message):
+            return str(code), f"{code}: {message}"
+        return str(code) if code else None, str(message)
+
+    return None, fallback
+
+
+def _incomplete_stream_error_info(data: dict) -> tuple[str, str]:
+    """Readable error info for OpenAI Responses response.incomplete events."""
+    resp = data.get("response") if isinstance(data, dict) else None
+    details = resp.get("incomplete_details") if isinstance(resp, dict) else None
+    reason = details.get("reason") if isinstance(details, dict) else None
+    if reason is None and isinstance(resp, dict):
+        reason = resp.get("status")
+    return "response_incomplete", f"response incomplete: {reason or 'unknown reason'}"
+
+
+# Events that carry actual assistant/tool output. Metadata-only events such as
+# response.created / response.in_progress / keepalive must not be considered the
+# first downstream byte boundary; upstream errors before these events should still
+# be catchable/retryable.
+RESPONSES_VISIBLE_EVENTS = frozenset({
+    "response.output_item.added",
+    "response.output_text.delta",
+    "response.refusal.delta",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_text.delta",
+    "response.function_call_arguments.delta",
+    "response.output_text.annotation.added",
+    "response.web_search_call.in_progress",
+    "response.web_search_call.searching",
+    "response.web_search_call.completed",
+    "response.code_interpreter_call.in_progress",
+    "response.code_interpreter_call_code.delta",
+    "response.code_interpreter_call.completed",
+    "response.mcp_call.in_progress",
+    "response.mcp_call.completed",
+    "response.file_search_call.in_progress",
+    "response.file_search_call.completed",
+})
+
+
 # ─── SSE 解析 ────────────────────────────────────────────────────
 
 def parse_first_sse_event(chunk: bytes) -> Optional[dict]:
@@ -107,6 +189,9 @@ class SSEUsageTracker:
         # 是否已见到上游流的"收尾事件"。Anthropic: message_stop。见后判定
         # 即使 client 之后断开，服务端视角也已拿到完整响应，日志应归 success。
         self.saw_stream_end = False
+        self.saw_stream_error = False
+        self.stream_error_message: Optional[str] = None
+        self.stream_error_code: Optional[str] = None
 
     def feed(self, chunk_bytes: bytes) -> None:
         if not chunk_bytes:
@@ -126,6 +211,10 @@ class SSEUsageTracker:
             except Exception:
                 continue
             t = evt.get("type", "")
+            if t == "error" or isinstance(evt.get("error"), dict):
+                self.saw_stream_error = True
+                self.stream_error_code, self.stream_error_message = _format_stream_error_info(evt)
+                continue
             if t == "message_start":
                 u = (evt.get("message") or {}).get("usage") or {}
                 self.usage["input_tokens"] = int(u.get("input_tokens", 0) or 0)
@@ -307,6 +396,54 @@ def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
         return event_name, None
 
 
+def split_sse_events(buf: bytes) -> tuple[bytes, list[bytes]]:
+    """Byte-preserving SSE event splitter.
+
+    Returns raw event block bytes without the trailing blank line, so callers can
+    buffer metadata events before the first downstream-visible chunk and replay
+    them exactly.
+    """
+    events: list[bytes] = []
+    while True:
+        sep = b"\n\n"
+        if sep not in buf:
+            break
+        block, buf = buf.split(sep, 1)
+        events.append(block)
+    return buf, events
+
+
+def parse_sse_event_bytes(block: bytes) -> tuple[Optional[str], Optional[dict]]:
+    return _parse_event_block(block.decode("utf-8", errors="replace"))
+
+
+def is_stream_error_event(event_name: Optional[str], data: Optional[dict]) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if event_name == "error" or data.get("type") == "error":
+        return True
+    if event_name == "response.failed":
+        return True
+    if isinstance(data.get("error"), dict):
+        return True
+    resp = data.get("response")
+    if isinstance(resp, dict) and isinstance(resp.get("error"), dict):
+        return True
+    return False
+
+
+def is_downstream_visible_event(event_name: Optional[str], data: Optional[dict], protocol: str) -> bool:
+    """Whether an upstream SSE event should cross the first-byte boundary.
+
+    Metadata/control events are intentionally excluded. For OpenAI Responses,
+    response.created / response.in_progress / keepalive / response.completed /
+    response.failed do not constitute visible content.
+    """
+    if protocol == "openai-responses":
+        return event_name in RESPONSES_VISIBLE_EVENTS
+    return data is not None and not is_stream_error_event(event_name, data)
+
+
 # ─── OpenAI Chat SSE 工具 ─────────────────────────────────────────────
 
 
@@ -369,6 +506,9 @@ class ChatSSEUsageTracker:
         # Chat 流的收尾标记：[DONE] 或任一 choice 带 finish_reason。
         # 两者都足以说明上游完成了本次生成；若 client 之后断开日志归 success。
         self.saw_stream_end = False
+        self.saw_stream_error = False
+        self.stream_error_message: Optional[str] = None
+        self.stream_error_code: Optional[str] = None
 
     def feed(self, chunk_bytes: bytes) -> None:
         if not chunk_bytes:
@@ -387,6 +527,10 @@ class ChatSSEUsageTracker:
             except Exception:
                 continue
             if isinstance(evt, dict):
+                if isinstance(evt.get("error"), dict):
+                    self.saw_stream_error = True
+                    self.stream_error_code, self.stream_error_message = _format_stream_error_info(evt)
+                    continue
                 choices = evt.get("choices")
                 if isinstance(choices, list):
                     for ch in choices:
@@ -583,6 +727,9 @@ class ResponsesSSEUsageTracker:
         # Responses 流的收尾事件：completed / failed / incomplete 之一。
         # 收到即视为上游已完成本次生成，client 后续断开不影响日志归 success。
         self.saw_stream_end = False
+        self.saw_stream_error = False
+        self.stream_error_message: Optional[str] = None
+        self.stream_error_code: Optional[str] = None
 
     def feed(self, chunk_bytes: bytes) -> None:
         if not chunk_bytes:
@@ -594,8 +741,23 @@ class ResponsesSSEUsageTracker:
             event_name, data = _parse_event_block(block)
             if data is None:
                 continue
-            if event_name in ("response.completed", "response.failed", "response.incomplete"):
+            if event_name == "error" or (isinstance(data, dict) and data.get("type") == "error"):
+                self.saw_stream_error = True
+                self.stream_error_code, self.stream_error_message = _format_stream_error_info(data)
+                continue
+            if event_name == "response.failed":
                 self.saw_stream_end = True
+                self.saw_stream_error = True
+                self.stream_error_code, self.stream_error_message = _format_stream_error_info(data)
+            elif event_name == "response.incomplete":
+                # Incomplete is a terminal Responses event, but not necessarily an
+                # upstream fault (for example max_output_tokens maps to length).
+                # Treat it as stream end so client disconnect after it will not be
+                # mislabeled, while preserving existing success/translator close behavior.
+                self.saw_stream_end = True
+            elif event_name == "response.completed":
+                self.saw_stream_end = True
+            if event_name in ("response.completed", "response.failed", "response.incomplete"):
                 resp = data.get("response") if isinstance(data, dict) else None
                 if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
                     u = resp["usage"]

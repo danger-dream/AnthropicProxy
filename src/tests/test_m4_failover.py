@@ -30,6 +30,18 @@ import time
 import httpx
 
 
+class ChunkedByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            await asyncio.sleep(0)
+            yield chunk
+
+
+
+
 def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
@@ -125,6 +137,87 @@ def sse_first_event_error():
                           headers={"content-type": "text/event-stream"})
 
 
+def sse_midstream_error():
+    payload = (
+        b'data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","usage":{"input_tokens":10}}}\n\n'
+        b'data: {"type":"error","error":{"type":"overloaded_error","message":"busy later"}}\n\n'
+    )
+    return httpx.Response(200, content=payload,
+                          headers={"content-type": "text/event-stream"})
+
+
+def responses_sse_midstream_error():
+    payload = (
+        b'event: response.created\n'
+        b'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","status":"in_progress"}}\n\n'
+        b'event: response.in_progress\n'
+        b'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_1","status":"in_progress"}}\n\n'
+        b'event: error\n'
+        b'data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later.","param":null},"sequence_number":2}\n\n'
+    )
+    return httpx.Response(200, content=payload,
+                          headers={"content-type": "text/event-stream"})
+
+
+
+def responses_sse_chunked_metadata_then_error():
+    chunks = [
+        b'event: response.created\n'
+        b'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","status":"in_progress"}}\n\n',
+        b'event: response.in_progress\n'
+        b'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_1","status":"in_progress"}}\n\n',
+        b'event: error\n'
+        b'data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later.","param":null},"sequence_number":2}\n\n',
+    ]
+    return httpx.Response(200, stream=ChunkedByteStream(chunks),
+                          headers={"content-type": "text/event-stream"})
+
+
+def responses_sse_ok():
+    payload = (
+        b'event: response.created\n'
+        b'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_ok","status":"in_progress"}}\n\n'
+        b'event: response.in_progress\n'
+        b'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_ok","status":"in_progress"}}\n\n'
+        b'event: response.output_item.added\n'
+        b'data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"in_progress","content":[]}}\n\n'
+        b'event: response.output_text.delta\n'
+        b'data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"ok"}\n\n'
+        b'event: response.output_item.done\n'
+        b'data: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}}\n\n'
+        b'event: response.completed\n'
+        b'data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_ok","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}\n\n'
+    )
+    return httpx.Response(200, content=payload,
+                          headers={"content-type": "text/event-stream"})
+
+
+def responses_sse_item_then_error():
+    payload = (
+        b'event: response.created\n'
+        b'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","status":"in_progress"}}\n\n'
+        b'event: response.in_progress\n'
+        b'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_1","status":"in_progress"}}\n\n'
+        b'event: response.output_item.added\n'
+        b'data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"in_progress","content":[]}}\n\n'
+        b'event: error\n'
+        b'data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later.","param":null},"sequence_number":3}\n\n'
+    )
+    return httpx.Response(200, content=payload,
+                          headers={"content-type": "text/event-stream"})
+
+
+def chat_sse_ok():
+    payload = (
+        b'data: {"id":"chatcmpl_ok","object":"chat.completion.chunk","created":1,"model":"gpt-5.5","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+        b'data: {"id":"chatcmpl_ok","object":"chat.completion.chunk","created":1,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+        b'data: {"id":"chatcmpl_ok","object":"chat.completion.chunk","created":1,"model":"gpt-5.5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    return httpx.Response(200, content=payload,
+                          headers={"content-type": "text/event-stream"})
+
+
 def sse_with_blacklist():
     payload = (
         b'data: {"type":"message_start","message":{"id":"x","role":"assistant",'
@@ -146,6 +239,18 @@ def _make_channel(m, name, base_url, real="glm-5", alias="glm-5", cc_mimicry=Fal
     })
 
 
+def _make_openai_channel(name, base_url, protocol="openai-responses",
+                         real="gpt-5.5", alias="gpt-5.5"):
+    from src.openai.channel.api_channel import OpenAIApiChannel
+    return OpenAIApiChannel({
+        "name": name, "type": "api",
+        "baseUrl": base_url, "apiKey": "sk-x",
+        "models": [{"real": real, "alias": alias}],
+        "protocol": protocol,
+        "enabled": True,
+    })
+
+
 def _install_channels(m, channels):
     reg = m["registry"]
     with reg._lock:
@@ -155,8 +260,9 @@ def _install_channels(m, channels):
 _REQUEST_SEQ = itertools.count()
 
 
-async def _call_proxy(m, router: MockRouter, body: dict, api_key="k1", client_ip="1.1.1.1"):
-    """模拟 server.py /v1/messages 的核心调用链。"""
+async def _call_proxy(m, router: MockRouter, body: dict, api_key="k1", client_ip="1.1.1.1",
+                      ingress_protocol="anthropic"):
+    """模拟 server.py /v1/messages 或 OpenAI handler 的核心调用链。"""
     # 注入 mock client
     transport = httpx.MockTransport(router.handle)
     mock_client = httpx.AsyncClient(transport=transport, timeout=10.0)
@@ -165,14 +271,18 @@ async def _call_proxy(m, router: MockRouter, body: dict, api_key="k1", client_ip
     request_id = f"req-{int(time.time()*1000)}-{next(_REQUEST_SEQ)}"
     start = time.time()
 
+    msg_items = body.get("messages") if ingress_protocol == "anthropic" else body.get("input")
     await asyncio.to_thread(
         m["log_db"].insert_pending,
         request_id, client_ip, api_key, body.get("model"), bool(body.get("stream", True)),
-        len(body.get("messages") or []), len(body.get("tools") or []),
-        {}, body,
+        len(msg_items or []), len(body.get("tools") or []),
+        {}, body, ingress_protocol=ingress_protocol,
     )
 
-    sched_result = m["scheduler"].schedule(body, api_key_name=api_key, client_ip=client_ip)
+    sched_result = m["scheduler"].schedule(
+        body, api_key_name=api_key, client_ip=client_ip,
+        ingress_protocol=ingress_protocol,
+    )
     if not sched_result.candidates:
         from src import errors as er
         resp = er.json_error_response(503, er.ErrType.API, "no candidates")
@@ -182,6 +292,7 @@ async def _call_proxy(m, router: MockRouter, body: dict, api_key="k1", client_ip
     resp = await m["failover"].run_failover(
         sched_result, body, request_id, api_key, client_ip,
         is_stream=bool(body.get("stream", True)), start_time=start,
+        ingress_protocol=ingress_protocol,
     )
     # 非流式 resp 可以立刻关 client；流式需要等流消费完
     if not isinstance(resp, httpx.AsyncClient):  # 占位判断
@@ -365,6 +476,112 @@ async def test_stream_first_event_error_switches(m):
     print("  [PASS] stream first event error → switch → chB ok")
 
 
+async def test_stream_midstream_error_logs_upstream_error(m):
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: sse_midstream_error())
+    chA = _make_channel(m, "chA", "https://cha")
+    _install_channels(m, [chA])
+
+    body = {"model": "glm-5", "stream": True, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body)
+    assert resp.status_code == 200
+    body_text = await _consume_streaming_to_string(resp)
+    await _close_background(resp, mc)
+
+    assert "busy later" in body_text
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["status"] == "error", log["log"]
+    assert "busy later" in log["log"]["error_message"]
+    assert log["log"]["error_message"] != "client disconnected"
+    assert log["retry_chain"][0]["outcome"] == "success"
+    print("  [PASS] stream midstream error → DB records upstream error, not client disconnected")
+
+
+async def test_responses_error_before_visible_chunk_switches(m):
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: responses_sse_midstream_error())
+    router.register("https://chb", lambda r: responses_sse_ok())
+    chA = _make_openai_channel("chA", "https://cha", protocol="openai-responses")
+    chB = _make_openai_channel("chB", "https://chb", protocol="openai-responses")
+    _install_channels(m, [chA, chB])
+
+    body = {"model": "gpt-5.5", "stream": True, "store": False,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body, ingress_protocol="responses")
+    assert resp.status_code == 200
+    body_text = await _consume_streaming_to_string(resp)
+    await _close_background(resp, mc)
+
+    assert "server_is_overloaded" not in body_text
+    assert "event: response.created" in body_text
+    assert "event: response.output_text.delta" in body_text
+    assert "event: response.completed" in body_text
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["status"] == "success", log["log"]
+    assert log["log"]["final_channel_key"] == "api:chB"
+    outcomes = [a["outcome"] for a in log["retry_chain"]]
+    assert outcomes == ["upstream_error_json", "success"], outcomes
+    print("  [PASS] responses metadata→error before visible chunk → switch → chB ok")
+
+
+
+
+async def test_responses_chunked_metadata_error_before_visible_chunk_switches(m):
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: responses_sse_chunked_metadata_then_error())
+    router.register("https://chb", lambda r: responses_sse_ok())
+    chA = _make_openai_channel("chA", "https://cha", protocol="openai-responses")
+    chB = _make_openai_channel("chB", "https://chb", protocol="openai-responses")
+    _install_channels(m, [chA, chB])
+
+    body = {"model": "gpt-5.5", "stream": True, "store": False,
+            "input": [{"role": "user", "content": [{"type":"input_text", "text":"hi"}]}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body, ingress_protocol="responses")
+    assert resp.status_code == 200
+    body_text = await _consume_streaming_to_string(resp)
+    await _close_background(resp, mc)
+
+    assert "server_is_overloaded" not in body_text
+    assert "event: response.created" in body_text
+    assert "event: response.output_text.delta" in body_text
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["status"] == "success", log["log"]
+    assert log["log"]["final_channel_key"] == "api:chB"
+    outcomes = [a["outcome"] for a in log["retry_chain"]]
+    assert outcomes == ["upstream_error_json", "success"], outcomes
+    print("  [PASS] responses chunked metadata→error before visible chunk → switch → chB ok")
+
+
+async def test_responses_to_chat_error_after_item_added_before_chat_bytes_switches(m):
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: responses_sse_item_then_error())
+    router.register("https://chb", lambda r: chat_sse_ok())
+    chA = _make_openai_channel("chA", "https://cha", protocol="openai-responses")
+    chB = _make_openai_channel("chB", "https://chb", protocol="openai-chat")
+    _install_channels(m, [chA, chB])
+
+    body = {"model": "gpt-5.5", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body, ingress_protocol="chat")
+    assert resp.status_code == 200
+    body_text = await _consume_streaming_to_string(resp)
+    await _close_background(resp, mc)
+
+    assert "server_is_overloaded" not in body_text
+    assert '"content": "ok"' in body_text or '"content":"ok"' in body_text
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["status"] == "success", log["log"]
+    assert log["log"]["final_channel_key"] == "api:chB"
+    outcomes = [a["outcome"] for a in log["retry_chain"]]
+    assert outcomes == ["upstream_error_json", "success"], outcomes
+    print("  [PASS] responses→chat item.added then error before chat bytes → switch → chB ok")
+
+
 async def test_stream_blacklist_switch(m):
     _setup(m)
     # 在 config 里配置黑名单
@@ -489,6 +706,10 @@ async def amain():
         test_400_switches_no_cooldown,
         test_stream_success_full_forward,
         test_stream_first_event_error_switches,
+        test_stream_midstream_error_logs_upstream_error,
+        test_responses_error_before_visible_chunk_switches,
+        test_responses_chunked_metadata_error_before_visible_chunk_switches,
+        test_responses_to_chat_error_after_item_added_before_chat_bytes_switches,
         test_stream_blacklist_switch,
         test_affinity_pins_channel,
         test_cooldown_excludes_from_next,

@@ -29,6 +29,18 @@ import sys
 import httpx
 
 
+class ChunkedByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            await asyncio.sleep(0)
+            yield chunk
+
+
+
+
 def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
@@ -542,6 +554,107 @@ async def test_e2e_chat_to_responses_stream(m):
     print("  [PASS] 端到端：chat ingress → openai-responses 上游 stream")
 
 
+
+async def test_e2e_responses_chunked_error_before_visible_switch(m):
+    _setup(m)
+    _install_keys(m, {"k": {"key": "ccp-test"}})
+    router = MockRouter()
+
+    def _bad(req):
+        chunks = [
+            b'event: response.created\n'
+            b'data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_bad","status":"in_progress"}}\n\n',
+            b'event: response.in_progress\n'
+            b'data: {"type":"response.in_progress","sequence_number":2,"response":{"id":"resp_bad","status":"in_progress"}}\n\n',
+            b'event: error\n'
+            b'data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"overloaded","param":null},"sequence_number":3}\n\n',
+        ]
+        return httpx.Response(200, stream=ChunkedByteStream(chunks),
+                              headers={"content-type": "text/event-stream"})
+
+    def _ok(req):
+        payload = (
+            b'event: response.created\n'
+            b'data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_ok","status":"in_progress"}}\n\n'
+            b'event: response.output_item.added\n'
+            b'data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"in_progress","content":[]}}\n\n'
+            b'event: response.output_text.delta\n'
+            b'data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"ok"}\n\n'
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_ok","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}\n\n'
+        )
+        return httpx.Response(200, content=payload,
+                              headers={"content-type": "text/event-stream"})
+
+    router.register("https://bad.example", _bad)
+    router.register("https://ok.example", _ok)
+    ch_bad = _make_openai_channel(m, "bad", "https://bad.example", protocol="openai-responses")
+    ch_ok = _make_openai_channel(m, "ok", "https://ok.example", protocol="openai-responses")
+    _install_channels(m, [ch_bad, ch_ok])
+
+    body = {"model": "gpt-5", "stream": True, "input": "ping"}
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    assert resp.status_code == 200
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert "server_is_overloaded" not in text
+    assert "overloaded" not in text
+    assert "resp_bad" not in text
+    assert "resp_ok" in text
+    assert "response.output_text.delta" in text
+    assert '"delta":"ok"' in text or '"delta": "ok"' in text
+    print("  [PASS] handler e2e: responses chunked pre-visible error → failover")
+
+
+async def test_e2e_chat_responses_item_added_error_before_chat_bytes_switch(m):
+    _setup(m)
+    _install_keys(m, {"k": {"key": "ccp-test"}})
+    router = MockRouter()
+
+    def _bad(req):
+        chunks = [
+            b'event: response.created\n'
+            b'data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_bad","status":"in_progress"}}\n\n',
+            b'event: response.output_item.added\n'
+            b'data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"in_progress","content":[]}}\n\n',
+            b'event: error\n'
+            b'data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"overloaded","param":null},"sequence_number":3}\n\n',
+        ]
+        return httpx.Response(200, stream=ChunkedByteStream(chunks),
+                              headers={"content-type": "text/event-stream"})
+
+    def _ok(req):
+        payload = (
+            b'data: {"id":"chatcmpl_ok","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+            b'data: {"id":"chatcmpl_ok","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+            b'data: {"id":"chatcmpl_ok","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        return httpx.Response(200, content=payload,
+                              headers={"content-type": "text/event-stream"})
+
+    router.register("https://bad.example", _bad)
+    router.register("https://ok.example", _ok)
+    ch_bad = _make_openai_channel(m, "bad", "https://bad.example", protocol="openai-responses")
+    ch_ok = _make_openai_channel(m, "ok", "https://ok.example", protocol="openai-chat")
+    _install_channels(m, [ch_bad, ch_ok])
+
+    body = {"model": "gpt-5", "stream": True,
+            "messages": [{"role": "user", "content": "ping"}]}
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    assert resp.status_code == 200
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert "server_is_overloaded" not in text
+    assert "overloaded" not in text
+    assert "event: response." not in text
+    assert "chat.completion.chunk" in text
+    assert '"content":"ok"' in text or '"content": "ok"' in text
+    print("  [PASS] handler e2e: chat via responses item.added pre-byte error → failover")
+
+
 async def test_e2e_responses_to_chat_stream(m):
     _setup(m)
     _install_keys(m, {"k": {"key": "ccp-test"}})
@@ -610,6 +723,8 @@ def main() -> int:
         test_c2r_reasoning,
         test_c2r_upstream_error,
         test_c2r_empty_content_only_tool_calls,
+        _async(test_e2e_responses_chunked_error_before_visible_switch),
+        _async(test_e2e_chat_responses_item_added_error_before_chat_bytes_switch),
         _async(test_e2e_chat_to_responses_stream),
         _async(test_e2e_responses_to_chat_stream),
     ]
