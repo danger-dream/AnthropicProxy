@@ -49,6 +49,7 @@ def isolate() -> str:
         "telegram": {"botToken": "", "adminIds": []},
         # 确保测试里 mock 模式开（OAuth 不触网）
         "oauth": {"mockMode": True},
+        "images": {"dbPath": os.path.join(tmp, "image_logs.db")},
     }
     with open(cfg_path, "w") as f:
         json.dump(minimal, f, indent=2, ensure_ascii=False)

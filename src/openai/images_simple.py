@@ -91,7 +91,15 @@ def _prompt_hash(prompt: str) -> str:
 
 def _disabled_accounts_set(cfg: dict) -> set[str]:
     vals = cfg.get("disabledAccounts") or []
-    return {str(x).strip().lower() for x in vals if str(x).strip()}
+    out: set[str] = set()
+    for value in vals:
+        raw = str(value).strip()
+        if not raw:
+            continue
+        out.add(raw.lower())
+        if raw.startswith("oauth:"):
+            out.add(raw[len("oauth:"):].lower())
+    return out
 
 
 def _cooldown_active(account_key: str) -> bool:
@@ -118,7 +126,12 @@ def list_image_accounts(include_disabled: bool = False) -> list[dict]:
             continue
         ak = make_account_key(acc)
         email = str(acc.get("email") or "")
-        image_disabled = ak.lower() in disabled or email.lower() in disabled
+        image_disabled = (
+            ak.lower() in disabled
+            or f"oauth:{ak}".lower() in disabled
+            or email.lower() in disabled
+            or f"openai:{email}".lower() in disabled
+        )
         row = {
             "account": acc,
             "account_key": ak,
@@ -126,7 +139,7 @@ def list_image_accounts(include_disabled: bool = False) -> list[dict]:
             "enabled": bool(acc.get("enabled", True)) and not bool(acc.get("disabled_reason")),
             "image_disabled": image_disabled,
             "image_cooldown_until": _IMAGE_COOLDOWNS.get(ak, 0),
-            "missing_account_id": not bool(acc.get("chatgpt_account_id") or acc.get("account_id")),
+            "missing_account_id": not bool(acc.get("workspace_id") or acc.get("chatgpt_account_id") or acc.get("account_id")),
         }
         if include_disabled or (row["enabled"] and not image_disabled and not row["missing_account_id"] and not _cooldown_active(ak)):
             out.append(row)
@@ -312,9 +325,9 @@ async def _call_upstream_once(account_row: dict, payload: dict, *, timeout_s: in
     acc = account_row["account"]
     ak = account_row["account_key"]
     email = account_row.get("email") or ""
-    account_id = str(acc.get("chatgpt_account_id") or acc.get("account_id") or "").strip()
+    account_id = str(acc.get("workspace_id") or acc.get("chatgpt_account_id") or acc.get("account_id") or "").strip()
     if not account_id:
-        raise UpstreamImageError("OpenAI OAuth account missing chatgpt_account_id", 403, errors.ErrTypeOpenAI.PERMISSION, retryable=True, cooldown=True)
+        raise UpstreamImageError("OpenAI OAuth account missing chatgpt_account_id/workspace_id", 403, errors.ErrTypeOpenAI.PERMISSION, retryable=True, cooldown=True)
 
     access_token = await (oauth_manager.force_refresh(ak) if refresh_first else oauth_manager.ensure_valid_token(ak))
     headers = _build_headers(access_token, account_id)

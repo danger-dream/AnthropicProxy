@@ -112,12 +112,12 @@ def test_import_duplicate_both_valid_keeps_existing(m):
     provider = m["openai_provider"]
     om = m["oauth_manager"]
 
-    old_tok = provider._mock_token_response("same@example.com")
+    old_tok = provider._mock_token_response("same@example.com", workspace_id="acct-same")
     old_tok["refresh_token"] = "old-valid-refresh-token-xxxxxxxx"
     old_entry, _ = oauth_menu._openai_token_to_entry(old_tok)
     om.add_account(old_entry)
 
-    new_tok = provider._mock_token_response("same@example.com")
+    new_tok = provider._mock_token_response("same@example.com", workspace_id="acct-same")
     new_tok["refresh_token"] = "new-valid-refresh-token-yyyyyyyy"
     new_entry, _ = oauth_menu._openai_token_to_entry(new_tok)
 
@@ -125,10 +125,34 @@ def test_import_duplicate_both_valid_keeps_existing(m):
 
     assert action == "skipped"
     assert "现有 token 有效" in msg
-    acc = om.get_account("openai:same@example.com")
+    acc = om.get_account("openai:acct-same")
     assert acc is not None
     # 验证现有账号仍可用且没有被替换为导入 token。
     assert acc["refresh_token"] != "new-valid-refresh-token-yyyyyyyy"
+
+
+def test_import_same_email_different_workspace_adds_new_account(m):
+    _setup(m)
+    oauth_menu = m["oauth_menu"]
+    provider = m["openai_provider"]
+    om = m["oauth_manager"]
+
+    team_tok = provider._mock_token_response("same@example.com", workspace_id="acct-team")
+    team_tok["workspace_type"] = "team"
+    team_entry, _ = oauth_menu._openai_token_to_entry(team_tok)
+    om.add_account(team_entry)
+
+    personal_tok = provider._mock_token_response("same@example.com", workspace_id="acct-personal")
+    personal_tok["workspace_type"] = "personal"
+    personal_entry, _ = oauth_menu._openai_token_to_entry(personal_tok)
+
+    action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(personal_entry)
+
+    assert action == "added"
+    assert om.get_account("openai:acct-team") is not None
+    assert om.get_account("openai:acct-personal") is not None
+    accounts = [a for a in om.list_accounts() if a.get("email") == "same@example.com"]
+    assert len(accounts) == 2
 
 
 def test_import_duplicate_existing_invalid_replaces_with_imported(m, monkeypatch):
@@ -137,29 +161,32 @@ def test_import_duplicate_existing_invalid_replaces_with_imported(m, monkeypatch
     provider = m["openai_provider"]
     om = m["oauth_manager"]
 
-    old_tok = provider._mock_token_response("same@example.com")
+    old_tok = provider._mock_token_response("same@example.com", workspace_id="acct-same")
     old_tok["refresh_token"] = "old-bad-refresh-token-xxxxxxxx"
     old_entry, _ = oauth_menu._openai_token_to_entry(old_tok)
     om.add_account(old_entry)
 
-    def fake_refresh(rt, *, email=None):
+    def fake_refresh(rt, *, email=None, workspace_id=None, org_id=None):
         if rt == "old-bad-refresh-token-xxxxxxxx":
             raise RuntimeError("old token invalid")
-        tok = provider._mock_token_response(email or "same@example.com")
+        tok = provider._mock_token_response(
+            email or "same@example.com", workspace_id=workspace_id or "acct-same",
+        )
         tok.pop("refresh_token", None)
         return tok
 
     monkeypatch.setattr(provider, "refresh_sync", fake_refresh)
 
     new_entry, _, err = oauth_menu._refresh_openai_rt_to_entry(
-        "new-good-refresh-token-yyyyyyyy", email_hint="same@example.com"
+        "new-good-refresh-token-yyyyyyyy", email_hint="same@example.com",
+        workspace_id="acct-same",
     )
     assert err is None
     action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(new_entry)
 
     assert action == "replaced"
     assert "现有 token 无效" in msg
-    acc = om.get_account("openai:same@example.com")
+    acc = om.get_account("openai:acct-same")
     assert acc is not None
     assert acc["refresh_token"] == "new-good-refresh-token-yyyyyyyy"
 
@@ -170,15 +197,17 @@ def test_import_candidate_invalid_new_keeps_valid_existing(m, monkeypatch):
     provider = m["openai_provider"]
     om = m["oauth_manager"]
 
-    old_tok = provider._mock_token_response("same@example.com")
+    old_tok = provider._mock_token_response("same@example.com", workspace_id="acct-same")
     old_tok["refresh_token"] = "old-good-refresh-token-xxxxxxxx"
     old_entry, _ = oauth_menu._openai_token_to_entry(old_tok)
     om.add_account(old_entry)
 
-    def fake_refresh(rt, *, email=None):
+    def fake_refresh(rt, *, email=None, workspace_id=None, org_id=None):
         if rt == "new-bad-refresh-token-yyyyyyyy":
             raise RuntimeError("new token invalid")
-        tok = provider._mock_token_response(email or "same@example.com")
+        tok = provider._mock_token_response(
+            email or "same@example.com", workspace_id=workspace_id or "acct-same",
+        )
         tok.pop("refresh_token", None)
         return tok
 
@@ -192,7 +221,7 @@ def test_import_candidate_invalid_new_keeps_valid_existing(m, monkeypatch):
     assert status == "skipped"
     assert email == "same@example.com"
     assert "现有 token 有效" in msg
-    acc = om.get_account("openai:same@example.com")
+    acc = om.get_account("openai:acct-same")
     assert acc is not None
     assert acc["refresh_token"] == "old-good-refresh-token-xxxxxxxx"
 

@@ -290,6 +290,290 @@ def run_composite_key_migration(email_to_key: dict[str, str]) -> dict:
 
     return stats
 
+def _rename_performance_stats_channel_key_no_commit(
+    conn: sqlite3.Connection,
+    old_key: str,
+    new_key: str,
+) -> int:
+    """Rename performance_stats channel_key safely.
+
+    performance_stats has PRIMARY KEY(channel_key, model), so if both old_key
+    and new_key already have the same model row, a direct UPDATE would violate
+    the unique constraint. For conflicts, keep the newer row and delete old.
+    """
+    if old_key == new_key:
+        return 0
+
+    # 冲突行：old_key 和 new_key 下有相同 model。
+    # 这里保留 last_updated 更新的那条；如果 old 更新，则用 old 覆盖 new。
+    cur = conn.execute(
+        """
+        UPDATE performance_stats AS dst
+        SET
+          total_requests = src.total_requests,
+          success_count = src.success_count,
+          recent_requests = src.recent_requests,
+          recent_success_count = src.recent_success_count,
+          avg_connect_ms = src.avg_connect_ms,
+          avg_first_byte_ms = src.avg_first_byte_ms,
+          avg_total_ms = src.avg_total_ms,
+          last_updated = src.last_updated
+        FROM performance_stats AS src
+        WHERE dst.channel_key = ?
+          AND src.channel_key = ?
+          AND dst.model = src.model
+          AND src.last_updated > dst.last_updated
+        """,
+        (new_key, old_key),
+    )
+    updated_conflicts = int(cur.rowcount or 0)
+
+    # 删除所有会冲突的 old_key 行
+    cur = conn.execute(
+        """
+        DELETE FROM performance_stats
+        WHERE channel_key = ?
+          AND model IN (
+            SELECT model
+            FROM performance_stats
+            WHERE channel_key = ?
+          )
+        """,
+        (old_key, new_key),
+    )
+    deleted_conflicts = int(cur.rowcount or 0)
+
+    # 剩下不会冲突的 old_key 行正常改名
+    cur = conn.execute(
+        """
+        UPDATE performance_stats
+        SET channel_key = ?
+        WHERE channel_key = ?
+        """,
+        (new_key, old_key),
+    )
+    renamed = int(cur.rowcount or 0)
+
+    return updated_conflicts + deleted_conflicts + renamed
+
+def _rename_channel_key_no_commit(conn: sqlite3.Connection, old_key: str, new_key: str) -> int:
+    if old_key == new_key:
+        return 0
+    count = 0
+    # performance_stats 有 PRIMARY KEY(channel_key, model)，需先合并再改名。
+    count += _rename_performance_stats_channel_key_no_commit(conn, old_key, new_key)
+    # 其他表没有同样的复合唯一键冲突，直接改名即可。
+    for table in ("channel_errors", "cache_affinities", "client_affinities"):
+        try:
+            cur = conn.execute(
+                f"UPDATE {table} SET channel_key=? WHERE channel_key=?",
+                (new_key, old_key),
+            )
+            count += int(cur.rowcount or 0)
+        except sqlite3.OperationalError:
+            # Older DBs may not have client_affinities yet.
+            pass
+    return count
+
+
+def quota_rename_account_key(old_key: str, new_key: str, *, email: str | None = None) -> int:
+    """Rename oauth_quota_cache primary key without changing quota contents."""
+    if not old_key or not new_key or old_key == new_key:
+        return 0
+    if email is None:
+        email = new_key.split(":", 1)[1] if ":" in new_key else new_key
+    with _write_lock:
+        conn = _get_conn()
+        old = conn.execute(
+            "SELECT * FROM oauth_quota_cache WHERE account_key=?",
+            (old_key,),
+        ).fetchone()
+        if old is None:
+            return 0
+        new = conn.execute(
+            "SELECT * FROM oauth_quota_cache WHERE account_key=?",
+            (new_key,),
+        ).fetchone()
+        if new is not None:
+            conn.execute("DELETE FROM oauth_quota_cache WHERE account_key=?", (old_key,))
+            conn.commit()
+            return 0
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
+        insert_cols = cols
+        placeholders = ",".join(["?"] * len(insert_cols))
+        values = [
+            new_key if c == "account_key"
+            else email if c == "email"
+            else old[c]
+            for c in insert_cols
+        ]
+        conn.execute(
+            f"INSERT INTO oauth_quota_cache ({','.join(insert_cols)}) VALUES ({placeholders})",
+            values,
+        )
+        conn.execute("DELETE FROM oauth_quota_cache WHERE account_key=?", (old_key,))
+        conn.commit()
+        return 1
+
+
+def rename_oauth_identity(old_account_key: str, new_account_key: str, *,
+                          email: str | None = None) -> dict:
+    """Rename state rows from one OAuth logical identity to another."""
+    stats = {"quota_rows": 0, "channel_rows": 0}
+    if not old_account_key or not new_account_key or old_account_key == new_account_key:
+        return stats
+    with _write_lock:
+        conn = _get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            old_ck = f"oauth:{old_account_key}"
+            new_ck = f"oauth:{new_account_key}"
+            stats["channel_rows"] = _rename_channel_key_no_commit(conn, old_ck, new_ck)
+
+            old = conn.execute(
+                "SELECT * FROM oauth_quota_cache WHERE account_key=?",
+                (old_account_key,),
+            ).fetchone()
+            if old is not None:
+                new = conn.execute(
+                    "SELECT * FROM oauth_quota_cache WHERE account_key=?",
+                    (new_account_key,),
+                ).fetchone()
+                if new is not None:
+                    conn.execute(
+                        "DELETE FROM oauth_quota_cache WHERE account_key=?",
+                        (old_account_key,),
+                    )
+                else:
+                    if email is None:
+                        email = old["email"]
+                    cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
+                    placeholders = ",".join(["?"] * len(cols))
+                    values = [
+                        new_account_key if c == "account_key"
+                        else email if c == "email"
+                        else old[c]
+                        for c in cols
+                    ]
+                    conn.execute(
+                        f"INSERT INTO oauth_quota_cache ({','.join(cols)}) VALUES ({placeholders})",
+                        values,
+                    )
+                    conn.execute(
+                        "DELETE FROM oauth_quota_cache WHERE account_key=?",
+                        (old_account_key,),
+                    )
+                    stats["quota_rows"] = 1
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+    return stats
+
+
+OPENAI_WORKSPACE_KEY_VERSION = "1"
+OPENAI_WORKSPACE_KEY_FLAG = "openai_workspace_key_version"
+
+
+def openai_workspace_key_migration_done() -> bool:
+    return schema_meta_get(OPENAI_WORKSPACE_KEY_FLAG) == OPENAI_WORKSPACE_KEY_VERSION
+
+
+def openai_workspace_key_migration_scope_done(scope_key: str) -> bool:
+    """Return whether one concrete OpenAI legacy→workspace mapping was migrated."""
+    return schema_meta_get(scope_key) == OPENAI_WORKSPACE_KEY_VERSION
+
+
+def run_openai_workspace_key_migration(old_to_new: dict[str, dict[str, str]], *,
+                                        scope_key: str | None = None) -> dict:
+    """Idempotently migrate OpenAI state keys from email to workspace identity.
+
+    `old_to_new` maps old account_key (`openai:<email>`) to a dict containing
+    `new` (`openai:<workspace_id>`) and `email`. The caller only includes unique
+    email mappings, so ambiguous email rows are deliberately left untouched.
+    """
+    stats = {
+        "quota_rows": 0,
+        "channel_rows": 0,
+        "skipped": False,
+        "reason": "",
+    }
+    if not old_to_new:
+        stats["skipped"] = True
+        stats["reason"] = "no eligible mappings"
+        return stats
+    flag_key = scope_key or OPENAI_WORKSPACE_KEY_FLAG
+    done = (
+        openai_workspace_key_migration_scope_done(flag_key)
+        if scope_key else openai_workspace_key_migration_done()
+    )
+    if done:
+        stats["skipped"] = True
+        stats["reason"] = "flag already set"
+        return stats
+
+    with _write_lock:
+        conn = _get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for old_key, meta in old_to_new.items():
+                new_key = str(meta.get("new") or "")
+                email = str(meta.get("email") or "")
+                if not old_key or not new_key or old_key == new_key:
+                    continue
+                old_ck = f"oauth:{old_key}"
+                new_ck = f"oauth:{new_key}"
+                stats["channel_rows"] += _rename_channel_key_no_commit(conn, old_ck, new_ck)
+
+                old = conn.execute(
+                    "SELECT * FROM oauth_quota_cache WHERE account_key=?",
+                    (old_key,),
+                ).fetchone()
+                if old is not None:
+                    new = conn.execute(
+                        "SELECT * FROM oauth_quota_cache WHERE account_key=?",
+                        (new_key,),
+                    ).fetchone()
+                    if new is not None:
+                        conn.execute(
+                            "DELETE FROM oauth_quota_cache WHERE account_key=?",
+                            (old_key,),
+                        )
+                    else:
+                        cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
+                        placeholders = ",".join(["?"] * len(cols))
+                        values = [
+                            new_key if c == "account_key"
+                            else email if c == "email"
+                            else old[c]
+                            for c in cols
+                        ]
+                        conn.execute(
+                            f"INSERT INTO oauth_quota_cache ({','.join(cols)}) VALUES ({placeholders})",
+                            values,
+                        )
+                        conn.execute(
+                            "DELETE FROM oauth_quota_cache WHERE account_key=?",
+                            (old_key,),
+                        )
+                        stats["quota_rows"] += 1
+
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                (flag_key, OPENAI_WORKSPACE_KEY_VERSION),
+            )
+            conn.execute("COMMIT")
+        except Exception as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise RuntimeError(f"openai workspace key migration failed: {exc}") from exc
+    return stats
+
 
 
 # oauth_quota_cache 在几个里程碑里逐步加过列：
@@ -767,15 +1051,17 @@ def quota_load(account_key_or_email: str) -> dict | None:
         if row is None:
             # 兜底：老数据可能以裸 email 作 PK 写入
             email = account_key_or_email.split(":", 1)[1]
-            row = _get_conn().execute(
-                "SELECT * FROM oauth_quota_cache WHERE email=? LIMIT 1",
+            rows = _get_conn().execute(
+                "SELECT * FROM oauth_quota_cache WHERE email=?",
                 (email,),
-            ).fetchone()
+            ).fetchall()
+            row = rows[0] if len(rows) == 1 else None
     else:
-        row = _get_conn().execute(
-            "SELECT * FROM oauth_quota_cache WHERE email=? LIMIT 1",
+        rows = _get_conn().execute(
+            "SELECT * FROM oauth_quota_cache WHERE email=?",
             (account_key_or_email,),
-        ).fetchone()
+        ).fetchall()
+        row = rows[0] if len(rows) == 1 else None
     return dict(row) if row else None
 
 
@@ -791,6 +1077,14 @@ def quota_delete(account_key_or_email: str) -> None:
                 "DELETE FROM oauth_quota_cache WHERE account_key=?",
                 (account_key_or_email,),
             )
+            # Historical OpenAI keys could be stored with account_key=email after
+            # early schema upgrades. Keep this as a best-effort cleanup only.
+            prov, identity = account_key_or_email.split(":", 1)
+            if prov == "openai":
+                _get_conn().execute(
+                    "DELETE FROM oauth_quota_cache WHERE account_key=?",
+                    (identity,),
+                )
         else:
             _get_conn().execute(
                 "DELETE FROM oauth_quota_cache WHERE email=?",

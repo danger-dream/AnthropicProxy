@@ -150,6 +150,28 @@ async def lifespan(app: FastAPI):
         print(f"[oauth] composite-key migration FAILED: {_exc}")
         raise
 
+    # OpenAI OAuth workspace identity migration：openai:<email> → openai:<workspace_id>
+    # Only unique email→workspace mappings are migrated; ambiguous same-email
+    # workspaces remain unresolved so old keys cannot silently hit the wrong team.
+    try:
+        _ow_result = oauth_manager.bootstrap_openai_workspace_key_migration()
+        _state = _ow_result.get("state") or {}
+        if _state.get("skipped"):
+            print(f"[oauth] openai workspace-key migration: skipped ({_state.get('reason')})")
+        else:
+            print(
+                f"[oauth] openai workspace-key migration: mappings={_ow_result.get('mapping_count', 0)},"
+                f" state_quota={_state.get('quota_rows', 0)},"
+                f" state_channels={_state.get('channel_rows', 0)},"
+                f" log_rows={(_ow_result.get('logs') or {}).get('request_log_rows', 0)}"
+                f"+{(_ow_result.get('logs') or {}).get('retry_chain_rows', 0)},"
+                f" image_rows={(_ow_result.get('images') or {}).get('call_rows', 0)}"
+                f"+{(_ow_result.get('images') or {}).get('attempt_rows', 0)}"
+            )
+    except Exception as _exc:
+        print(f"[oauth] openai workspace-key migration FAILED: {_exc}")
+        raise
+
     # 内存表从 state.db 恢复
     affinity.init()
     affinity.client_init()

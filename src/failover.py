@@ -51,14 +51,14 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: httpx.Response) -> None:
             return
         account_key = getattr(ch, "account_key", None) or ch.email
         email = ch.email
-        # throttle bucket 用 email 作 key（同一邮箱下 OpenAI 最多一个账号，不会冲突；
-        # 同时保留 forget_codex_snapshot(email) / forget_codex_snapshot(account_key) 两种语义）
+        # throttle bucket 用 account_key 作 key；OpenAI 同一邮箱可能有多个
+        # workspace，不能按 email 合并。
         now = time.time()
         with _codex_snapshot_lock:
-            last = _codex_snapshot_last.get(email, 0.0)
+            last = _codex_snapshot_last.get(account_key, 0.0)
             if now - last < _CODEX_SNAPSHOT_WRITE_INTERVAL_S:
                 return
-            _codex_snapshot_last[email] = now
+            _codex_snapshot_last[account_key] = now
         normalized = openai_provider.normalize_codex_snapshot(snap)
         state_db.quota_save_openai_snapshot(account_key, snap, normalized, email=email)
 
@@ -127,7 +127,7 @@ def forget_anthropic_snapshot(account_key_or_email: str) -> None:
     if not account_key_or_email:
         return
     key = account_key_or_email
-    email = key.split(":", 1)[1] if ":" in key else key
+    email = oauth_manager.account_key_to_email(key) if ":" in key else key
     with _anthropic_snapshot_lock:
         _anthropic_snapshot_last.pop(email, None)
         _anthropic_snapshot_last.pop(key, None)
@@ -280,13 +280,13 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
 def forget_codex_snapshot(account_key_or_email: str) -> None:
     """账户删除时清本地节流桶，避免内存无限累积。
 
-    入参既接受 account_key (=provider:email)，也接受纯 email（兼容老调用）。
-    统一把 account_key 里的 email 段拆出来清。
+    入参既接受 account_key，也接受纯 email（兼容老调用）。OpenAI 新 key
+    是 workspace identity；同时清 email 与 key 两种历史桶。
     """
     if not account_key_or_email:
         return
     key = account_key_or_email
-    email = key.split(":", 1)[1] if ":" in key else key
+    email = oauth_manager.account_key_to_email(key) if ":" in key else key
     with _codex_snapshot_lock:
         _codex_snapshot_last.pop(email, None)
         _codex_snapshot_last.pop(key, None)

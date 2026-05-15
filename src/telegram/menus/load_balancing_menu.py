@@ -72,8 +72,9 @@ def _format_item_line(idx: int, key: str) -> str:
     ch = registry.get_channel(key)
     if ch is None:
         return f"{idx}. <code>{ui.escape_html(key)}</code> ⚠ 已不存在"
+    display = ui.channel_display_name(ch.key, with_family=False)
     return (
-        f"{idx}. {_channel_icon(ch)} <code>{ui.escape_html(ch.display_name)}</code> "
+        f"{idx}. {_channel_icon(ch)} <code>{ui.escape_html(display)}</code> "
         f"{ui.escape_html(_status_text(ch))}"
     )
 

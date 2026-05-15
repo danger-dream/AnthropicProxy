@@ -514,6 +514,43 @@ FAMILY_ICON = {"anthropic": "🅰", "openai": "🅾"}
 FAMILY_LABEL = {"anthropic": "Anthropic", "openai": "OpenAI"}
 
 
+def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
+    """Human-facing channel name for TG UI.
+
+    Internal channel keys may contain OpenAI workspace ids. Never show those raw
+    keys in user-facing menus/logs; resolve OAuth channels back to email and use
+    only a short provider tag for disambiguation.
+    """
+    key = str(channel_key or "?")
+    if key.startswith("oauth:"):
+        account_key = key[len("oauth:"):]
+        try:
+            from .. import oauth_manager
+            acc = oauth_manager.get_account(account_key)
+            if acc is not None:
+                name = str(acc.get("email") or "?")
+                provider = oauth_manager.provider_of(acc)
+            else:
+                name = oauth_manager.account_key_to_email(account_key) or "?"
+                provider = oauth_manager.provider_of(account_key)
+        except Exception:
+            # Last resort for legacy Claude keys. For OpenAI workspace ids this
+            # may still be opaque, but normal runtime should resolve via config.
+            provider, _, ident = account_key.partition(":")
+            name = ident or account_key
+        if with_family:
+            if provider == "openai":
+                name += " 🅾"
+            elif provider == "claude":
+                name += " 🅰"
+        return name
+    if key.startswith("api:"):
+        return key.split(":", 1)[1]
+    if ":" in key:
+        return key.split(":", 1)[1]
+    return key
+
+
 def family_tag(family: Optional[str]) -> str:
     """统一的家族前缀标签，格式：🅰 Anthropic"""
     if not family:

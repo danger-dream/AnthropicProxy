@@ -195,6 +195,58 @@ def checkpoint() -> None:
         pass
 
 
+def migrate_channel_keys(mapping: dict[str, str]) -> dict:
+    """Rename channel keys across all monthly log DBs.
+
+    `mapping` maps full channel keys, e.g. `oauth:openai:email` →
+    `oauth:openai:workspace`. Idempotent and best-effort for existing DB files.
+    """
+    stats = {"request_log_rows": 0, "retry_chain_rows": 0, "db_files": 0}
+    if not mapping or _log_dir is None or not os.path.isdir(_log_dir):
+        return stats
+
+    for name in sorted(os.listdir(_log_dir)):
+        if not name.endswith(".db"):
+            continue
+        path = os.path.join(_log_dir, name)
+        try:
+            conn = sqlite3.connect(path, timeout=10)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            continue
+        try:
+            with _write_lock:
+                _ensure_migrations(conn)
+                changed = 0
+                for old_key, new_key in mapping.items():
+                    if not old_key or not new_key or old_key == new_key:
+                        continue
+                    cur = conn.execute(
+                        "UPDATE request_log SET final_channel_key=? WHERE final_channel_key=?",
+                        (new_key, old_key),
+                    )
+                    stats["request_log_rows"] += int(cur.rowcount or 0)
+                    changed += int(cur.rowcount or 0)
+                    cur = conn.execute(
+                        "UPDATE retry_chain SET channel_key=? WHERE channel_key=?",
+                        (new_key, old_key),
+                    )
+                    stats["retry_chain_rows"] += int(cur.rowcount or 0)
+                    changed += int(cur.rowcount or 0)
+                if changed:
+                    conn.commit()
+                    stats["db_files"] += 1
+        except Exception as exc:
+            print(f"[log_db] channel key migration skipped {name}: {exc}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return stats
+
+
 # ─── 写入 ──────────────────────────────────────────────────────────
 
 def insert_pending(

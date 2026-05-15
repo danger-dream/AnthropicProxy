@@ -71,7 +71,7 @@ def _render_list(rows: list[dict], *, page: int = 1, total: int | None = None, t
 
         # 通道 + 重试数
         if r.get("final_channel_key"):
-            ch_short = ui.escape_html(r["final_channel_key"])
+            ch_short = ui.escape_html(ui.channel_display_name(r["final_channel_key"], with_family=True))
             line += f"\n  渠道: <code>{ch_short}</code>"
             if r.get("retry_count"):
                 line += f"（重试 {r['retry_count']} 次）"
@@ -206,8 +206,9 @@ def _render_detail(detail: dict) -> str:
         f"请求模型: <code>{ui.escape_html(log.get('requested_model') or '?')}</code>",
     ]
     if log.get("final_channel_key"):
+        final_ch = ui.channel_display_name(log["final_channel_key"], with_family=True)
         lines.append(
-            f"最终渠道: <code>{ui.escape_html(log['final_channel_key'])}</code>"
+            f"最终渠道: <code>{ui.escape_html(final_ch)}</code>"
             f" / <code>{ui.escape_html(log.get('final_model') or '?')}</code>"
         )
     # 协议（入口 + 上游）：老日志可能为空，非空才显示避免噪音
@@ -256,7 +257,7 @@ def _render_detail(detail: dict) -> str:
         lines.append("  (无记录)")
     for c in chain:
         order = c.get("attempt_order") or "?"
-        ch = ui.escape_html(c.get("channel_key") or "?")
+        ch = ui.escape_html(ui.channel_display_name(c.get("channel_key") or "?", with_family=True))
         model = ui.escape_html(c.get("model") or "?")
         oc = c.get("outcome") or "?"
         mark = "✅" if oc == "success" else "❌"

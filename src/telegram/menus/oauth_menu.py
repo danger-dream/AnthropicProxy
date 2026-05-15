@@ -26,7 +26,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from ... import affinity, config, cooldown, load_balancing, log_db, oauth_errors, oauth_manager, state_db
-from ...oauth_ids import account_key as _account_key, split_account_key as _split_ak
+from ...oauth_ids import account_key as _account_key, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
 from ...oauth import openai as openai_provider
 from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
 from .. import states, ui
@@ -44,11 +44,53 @@ def _resolve_to_account_key(resolved):
     if resolved is None:
         return None
     if ":" in resolved:
-        return resolved
-    for acc in oauth_manager.list_accounts():
-        if acc.get("email") == resolved:
-            return _account_key(acc)
-    return resolved
+        try:
+            return oauth_manager.resolve_account_key(resolved)
+        except oauth_manager.AmbiguousOAuthAccountKey:
+            return None
+    try:
+        return oauth_manager.resolve_account_key(resolved)
+    except oauth_manager.AmbiguousOAuthAccountKey:
+        return None
+
+
+def _account_email(account_key: str) -> str:
+    acc = oauth_manager.get_account(account_key)
+    if acc is not None:
+        return str(acc.get("email") or "")
+    return oauth_manager.account_key_to_email(account_key)
+
+
+def _openai_same_email_count(acc: dict) -> int:
+    """OpenAI 同邮箱 workspace 数；只用于决定 UI 是否需要消歧标签。"""
+    if oauth_manager.provider_of(acc) != "openai":
+        return 0
+    email = str(acc.get("email") or "")
+    return sum(
+        1 for item in oauth_manager.list_accounts()
+        if oauth_manager.provider_of(item) == "openai"
+        and str(item.get("email") or "") == email
+    )
+
+
+def _openai_workspace_label(acc: dict, *, html: bool = True, force: bool = False) -> str:
+    """Human-facing OpenAI disambiguation label.
+
+    只在同邮箱多个 workspace 时补一个极短标签。默认不展示内部 workspace id。
+    """
+    if oauth_manager.provider_of(acc) != "openai":
+        return ""
+    if not force and _openai_same_email_count(acc) <= 1:
+        return ""
+    name = str(acc.get("workspace_name") or "").strip()
+    wtype = str(acc.get("workspace_type") or "").strip()
+    if name:
+        text = name
+    elif wtype:
+        text = wtype
+    else:
+        text = "workspace"
+    return ui.escape_html(text) if html else text
 
 # ─── 辅助：异步调用在线程里运行 ───────────────────────────────────
 
@@ -167,6 +209,9 @@ def _format_account_block(acc: dict) -> str:
         suffix = f" · {ui.escape_html(plan)}" if plan else ""
         if sub_exp:
             suffix += f" · sub 到 {_format_bjt(sub_exp)}"
+        workspace = _openai_workspace_label(acc)
+        if workspace:
+            suffix += f" · {workspace}"
         provider_tag = f" 🅾 OpenAI{suffix}"
 
     lines = [f"{icon} <code>{ui.escape_html(email)}</code>{provider_tag}{tag}"]
@@ -451,6 +496,14 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
     ]
     if account_keys:
         oauth_manager.ensure_quota_fresh_sync(account_keys)
+        # 如果缓存已经显示 >= quotaMonitor 阈值，立即收敛账号状态，
+        # 不等 600s 后台监控下一轮。
+        for ak in account_keys:
+            try:
+                oauth_manager.evaluate_and_toggle_by_cached_quota(ak)
+            except Exception as exc:
+                print(f"[oauth_menu] cached quota evaluate failed for {ak}: {exc}")
+        accounts_all = oauth_manager.list_accounts()
     total_all = len(accounts_all)
     normal = sum(1 for a in accounts_all if a.get("enabled", True) and not a.get("disabled_reason"))
     quota_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "quota")
@@ -518,13 +571,14 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
     page_accs = accounts[start:end]
     for idx in range(0, len(page_accs), 2):
         row_btns: list[dict] = []
-        for acc in page_accs[idx:idx + 2]:
+        for offset, acc in enumerate(page_accs[idx:idx + 2], start=idx):
             email = acc.get("email", "?")
             ak = _account_key(acc)
             short = ui.register_code(ak)
             prov = oauth_manager.provider_of(acc)
             tag = "🅾" if prov == "openai" else ("🅰" if prov == "claude" else "✉")
-            row_btns.append(ui.btn(f"{tag} {email}", f"oa:view:{_callback_payload(short, page, filter_key)}"))
+            num = start + offset + 1
+            row_btns.append(ui.btn(f"{num}. {tag} {email}", f"oa:view:{_callback_payload(short, page, filter_key)}"))
         rows.append(row_btns)
 
     # 翻页
@@ -632,6 +686,11 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
 
     if not acc.get("disabled_reason"):
         oauth_manager.ensure_quota_fresh_sync(account_key)
+        try:
+            oauth_manager.evaluate_and_toggle_by_cached_quota(account_key)
+        except Exception as exc:
+            print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
+        acc = oauth_manager.get_account(account_key) or acc
 
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason") or "—"
@@ -646,6 +705,9 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         provider_line = (
             f"提供者: <code>🅾 OpenAI (Codex)</code> · 计划: <code>{ui.escape_html(plan)}</code>{sub_line}\n"
         )
+        workspace = _openai_workspace_label(acc, force=True)
+        if workspace and _openai_same_email_count(acc) > 1:
+            provider_line += f"工作区: <code>{workspace}</code>\n"
     elif prov == "claude":
         provider_line = f"提供者: <code>🅰 Anthropic (Claude)</code>\n"
     max_cc = int(acc.get("maxConcurrent", 0) or 0)
@@ -731,7 +793,7 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
         ))
         return
 
-    _, email = _split_ak(ak)
+    email = _account_email(ak)
     if oauth_manager.provider_of(ak) != "openai":
         usage_result = _run_sync(oauth_manager.fetch_usage(ak))
         if not isinstance(usage_result, Exception):
@@ -751,7 +813,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    _, email = _split_ak(ak)
+    email = _account_email(ak)
     if oauth_manager.provider_of(ak) == "openai":
         from ...channel import registry
         from ...channel.openai_oauth_channel import OpenAIOAuthChannel
@@ -773,9 +835,25 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
                 pr, provider="openai", operation="probe_usage",
             ))
             return
+        quota_action = None
+        if pr.get("ok"):
+            try:
+                row = state_db.quota_load(ak) or {}
+                usage = oauth_manager._synthesize_openai_usage_from_row(row)
+                quota_action = oauth_manager.evaluate_and_toggle_by_usage(ak, usage)
+            except Exception as exc:
+                print(f"[oauth_menu] openai refresh_usage quota evaluate failed for {ak}: {exc}")
         text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
         if pr.get("ok"):
             head = "✅ 已刷新 Token 并更新用量（探测请求成功）"
+            if quota_action and quota_action.get("action") == "disabled":
+                hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+                head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
+            elif quota_action and quota_action.get("action") == "still_over_quota":
+                hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+                head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
+            elif quota_action and quota_action.get("action") == "resumed":
+                head += "\n♻ 额度已恢复，已自动解除配额禁用"
         else:
             reason = pr.get("reason", "?")
             head = (
@@ -862,7 +940,8 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: i
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    _, email = _split_ak(ak)
+    acc = oauth_manager.get_account(ak)
+    email = (acc or {}).get("email") or _account_email(ak)
     prov = oauth_manager.provider_of(ak)
     prov_tag = "🅾 OpenAI" if prov == "openai" else "🅰 Claude"
     ui.answer_cb(cb_id)
@@ -883,7 +962,7 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         ui.answer_cb(cb_id, "短码已失效")
         show(chat_id, message_id, page=page, filter_key=filter_key)
         return
-    _, email = _split_ak(ak)
+    email = _account_email(ak)
     try:
         oauth_manager.delete_account(ak)
     except Exception as exc:
@@ -1496,7 +1575,10 @@ def _openai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict
         "models": [],
         "id_token": id_token,
         "chatgpt_account_id": info.get("chatgpt_account_id", ""),
-        "organization_id": info.get("organization_id", ""),
+        "workspace_id": tok.get("workspace_id") or info.get("workspace_id") or info.get("chatgpt_account_id", ""),
+        "workspace_name": tok.get("workspace_name") or info.get("workspace_name", ""),
+        "workspace_type": tok.get("workspace_type") or info.get("workspace_type", ""),
+        "organization_id": tok.get("organization_id") or info.get("organization_id", ""),
         "plan_type": tok.get("plan_type") or info.get("plan_type", ""),
         "subscription_expires_at": tok.get("subscription_expires_at", ""),
     }
@@ -1505,14 +1587,24 @@ def _openai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict
         "expired": new_expired,
         "plan_type": entry.get("plan_type", ""),
         "subscription_expires_at": entry.get("subscription_expires_at", ""),
+        "workspace_id": entry.get("workspace_id", ""),
+        "workspace_name": entry.get("workspace_name", ""),
+        "workspace_type": entry.get("workspace_type", ""),
     }
     return entry, meta
 
 
-def _refresh_openai_rt_to_entry(refresh_token: str, *, email_hint: str = "") -> tuple[dict | None, dict | None, Exception | None]:
+def _refresh_openai_rt_to_entry(refresh_token: str, *, email_hint: str = "",
+                                workspace_id: str = "",
+                                org_id: str = "") -> tuple[dict | None, dict | None, Exception | None]:
     """refresh_token → entry；失败时返回异常。"""
     try:
-        tok = openai_provider.refresh_sync(refresh_token, email=email_hint or None)
+        kwargs = {"email": email_hint or None}
+        if workspace_id:
+            kwargs["workspace_id"] = workspace_id
+        if org_id:
+            kwargs["org_id"] = org_id
+        tok = openai_provider.refresh_sync(refresh_token, **kwargs)
         if not tok.get("refresh_token"):
             tok["refresh_token"] = refresh_token
         entry, meta = _openai_token_to_entry(tok, fallback_email=email_hint)
@@ -1525,19 +1617,52 @@ def _find_openai_account_by_email(email: str) -> dict | None:
     email = (email or "").strip()
     if not email:
         return None
-    return oauth_manager.get_account(f"openai:{email}")
+    matches = [
+        acc for acc in oauth_manager.list_accounts()
+        if oauth_manager.provider_of(acc) == "openai" and acc.get("email") == email
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _find_openai_account_by_workspace(entry: dict) -> dict | None:
+    wanted = _openai_workspace_id(entry)
+    if not wanted:
+        return None
+    for acc in oauth_manager.list_accounts():
+        if oauth_manager.provider_of(acc) != "openai":
+            continue
+        if _openai_workspace_id(acc) == wanted:
+            return acc
+    return None
+
+
+def _find_openai_existing_for_entry(entry: dict) -> dict | None:
+    """Find existing OpenAI account for an incoming token entry.
+
+    If the token exposes a workspace identity, email is display-only and must not
+    be used as a duplicate key; same email can legitimately have Personal + Team
+    workspaces. Email fallback is only for legacy/metadata-poor tokens that have
+    no workspace/chatgpt account id.
+    """
+    if _openai_workspace_id(entry):
+        return _find_openai_account_by_workspace(entry)
+    return _find_openai_account_by_email(entry.get("email", ""))
 
 
 def _upsert_openai_account_entry(entry: dict, *, preserve_existing_settings: bool = True) -> bool:
     """写入 OpenAI 账号。返回 True 表示替换既有账号，False 表示新增。"""
-    email = entry.get("email")
+    target = _find_openai_existing_for_entry(entry)
+    if target is None:
+        oauth_manager.add_account(entry)
+        return False
+    target_key = _account_key(target)
     replaced = False
 
     def mutate(cfg):
         nonlocal replaced
         accounts = cfg.setdefault("oauthAccounts", [])
         for acc in accounts:
-            if acc.get("email") != email or oauth_manager.provider_of(acc) != "openai":
+            if _account_key(acc) != target_key:
                 continue
             keep_models = acc.get("models")
             keep_max = acc.get("maxConcurrent")
@@ -1558,19 +1683,22 @@ def _upsert_openai_account_entry(entry: dict, *, preserve_existing_settings: boo
 def _save_openai_entry_with_duplicate_policy(entry: dict) -> tuple[str, str]:
     """保存 OpenAI 账号；重复账号按 token 有效性决策。
 
-    规则：同 provider + email 已存在时，刷新验证现有 refresh_token：
+    规则：同 workspace 已存在时更新；否则同 email 仅在唯一时作为旧数据兼容：
       - 现有有效、新 token 有效：保留现有（并写回刷新后的 token），跳过新 token
       - 现有无效、新 token 有效：用新 token 替换现有账号
       - 不存在：新增
     """
     email = entry.get("email", "")
-    existing = _find_openai_account_by_email(email)
+    existing = _find_openai_existing_for_entry(entry)
     if not existing:
         oauth_manager.add_account(entry)
         return "added", "新增"
 
     existing_entry, _, existing_err = _refresh_openai_rt_to_entry(
-        existing.get("refresh_token", ""), email_hint=email,
+        existing.get("refresh_token", ""),
+        email_hint=email,
+        workspace_id=_openai_workspace_id(existing),
+        org_id=existing.get("organization_id") or "",
     )
     if existing_entry is not None:
         _upsert_openai_account_entry(existing_entry, preserve_existing_settings=True)
@@ -1597,6 +1725,10 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
     plan_tag = f" · plan: <code>{ui.escape_html(plan)}</code>"
     if meta.get("subscription_expires_at"):
         plan_tag += f" · sub: <code>{_format_bjt(meta.get('subscription_expires_at'))}</code>"
+    workspace_line = ""
+    if meta.get("workspace_name") or meta.get("workspace_type") or meta.get("workspace_id"):
+        label = meta.get("workspace_name") or meta.get("workspace_type") or "workspace"
+        workspace_line = f"工作区: <code>{ui.escape_html(label)}</code>\n"
     title = {
         "added": "✅ <b>OpenAI OAuth 账户已添加</b>",
         "replaced": "✅ <b>OpenAI OAuth 账户已更新</b>",
@@ -1610,6 +1742,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
         chat_id,
         f"{title}\n\n"
         f"Email: <code>{ui.escape_html(meta.get('email') or entry.get('email') or '')}</code>{plan_tag}\n"
+        f"{workspace_line}"
         f"过期: <code>{_format_bjt(meta.get('expired'))}</code>\n"
         f"处理: <code>{ui.escape_html(action_msg)}</code>\n"
         f"来源: <code>{source}</code>{lb_hint}",
@@ -1754,11 +1887,16 @@ def _import_candidate_with_policy(item: dict) -> tuple[str, str, str]:
         action, msg = _save_openai_entry_with_duplicate_policy(entry)
         return action, meta.get("email") or entry.get("email") or email_hint, msg
 
-    # 新 token 无效时，若同邮箱已有账号，则验证现有账号；现有有效就继续用现有。
+    # 新 token 无效时，还没有可信 workspace identity，只能做 legacy 兜底：
+    # 同邮箱恰好一个账号时，验证现有 token；多 workspace 时 _find_openai_account_by_email
+    # 会返回 None，避免 Personal/Team 串号。
     existing = _find_openai_account_by_email(email_hint)
     if existing is not None:
         existing_entry, _, existing_err = _refresh_openai_rt_to_entry(
-            existing.get("refresh_token", ""), email_hint=email_hint,
+            existing.get("refresh_token", ""),
+            email_hint=email_hint,
+            workspace_id=_openai_workspace_id(existing),
+            org_id=existing.get("organization_id") or "",
         )
         if existing_entry is not None:
             _upsert_openai_account_entry(existing_entry, preserve_existing_settings=True)

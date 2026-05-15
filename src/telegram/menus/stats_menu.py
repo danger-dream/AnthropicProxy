@@ -52,17 +52,8 @@ def _channel_icon(key: str) -> str:
 
 
 def _ch_short_name(key: str) -> str:
-    """oauth:claude:foo@bar → foo@bar 🅰；oauth:openai:foo@bar → foo@bar 🅾；api:智谱 → 智谱。"""
-    if key.startswith("oauth:"):
-        body = key[len("oauth:"):]
-        if ":" in body:
-            prov, email = body.split(":", 1)
-            tag = " 🅾" if prov == "openai" else (" 🅰" if prov == "claude" else "")
-            return f"{email}{tag}"
-        return body  # 兜底：老格式 oauth:<email>
-    if ":" in key:
-        return key.split(":", 1)[1]
-    return key
+    """Human-facing channel name; never expose OpenAI workspace ids."""
+    return ui.channel_display_name(key, with_family=True)
 
 
 def _section_overall(overall: dict) -> str:

@@ -76,10 +76,24 @@ class OpenAIOAuthChannel(Channel):
 
     def __init__(self, account: dict, default_models: list[str] | None = None):
         from ..oauth_ids import account_key as _account_key
+        from .. import oauth_manager as _oauth_manager
         self.email = account["email"]
-        self.account_key = _account_key(account)   # provider:email
+        self.account_key = _account_key(account)   # openai:<workspace_id>
         self.key = f"oauth:{self.account_key}"
-        self.display_name = self.email
+        self.workspace_id = str(account.get("workspace_id") or account.get("chatgpt_account_id") or "")
+        self.workspace_name = str(account.get("workspace_name") or "")
+        self.workspace_type = str(account.get("workspace_type") or "")
+        same_email_count = sum(
+            1 for item in _oauth_manager.list_accounts()
+            if _oauth_manager.provider_of(item) == "openai"
+            and str(item.get("email") or "") == self.email
+        )
+        if same_email_count > 1:
+            label = self.workspace_name or self.workspace_type or "workspace"
+            self.display_name = f"{self.email} · {label}"
+        else:
+            self.display_name = self.email
+        self.workspace_label = self.display_name
         self.enabled = bool(account.get("enabled", True))
         self.disabled_reason = account.get("disabled_reason")
         try:
@@ -88,7 +102,9 @@ class OpenAIOAuthChannel(Channel):
             self.max_concurrent = 0
 
         # Codex 请求必备 meta（缺失也允许注册，build 时再校验）
-        self.chatgpt_account_id = str(account.get("chatgpt_account_id") or "")
+        self.chatgpt_account_id = str(
+            account.get("workspace_id") or account.get("chatgpt_account_id") or ""
+        )
         self.plan_type = str(account.get("plan_type") or "")
 
         # 账户 models 优先级：
@@ -313,7 +329,7 @@ class OpenAIOAuthChannel(Channel):
         return ChannelDisplay(
             key=self.key,
             type="oauth",
-            display_name=self.email,
+            display_name=self.display_name,
             enabled=self.enabled,
             disabled_reason=self.disabled_reason,
             models=list(self.models),

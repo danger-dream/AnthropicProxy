@@ -100,9 +100,20 @@ def get_channel(key: str) -> Optional[Channel]:
         # 兼容：调用方可能还在传老格式 "oauth:<email>"（不含 provider 段）
         if key.startswith("oauth:") and key.count(":") == 1:
             email = key[len("oauth:"):]
-            for c in _channels.values():
-                if getattr(c, "email", None) == email and c.type == "oauth":
-                    return c
+            matches = [
+                c for c in _channels.values()
+                if getattr(c, "email", None) == email and c.type == "oauth"
+            ]
+            return matches[0] if len(matches) == 1 else None
+        if key.startswith("oauth:openai:"):
+            identity = key[len("oauth:openai:"):]
+            matches = [
+                c for c in _channels.values()
+                if c.type == "oauth"
+                and getattr(c, "protocol", "") == "openai-responses"
+                and getattr(c, "email", None) == identity
+            ]
+            return matches[0] if len(matches) == 1 else None
         return None
 
 

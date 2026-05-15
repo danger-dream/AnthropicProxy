@@ -33,7 +33,11 @@ from .oauth import (
     VALID_PROVIDERS as _VALID_PROVIDERS,
     normalize_provider as _normalize_provider,
 )
-from .oauth_ids import account_key as _account_key, split_account_key as _split_ak
+from .oauth_ids import (
+    account_key as _account_key,
+    openai_workspace_id as _openai_workspace_id,
+    split_account_key as _split_ak,
+)
 from .oauth import openai as openai_provider
 from .transform.cc_mimicry import CLI_USER_AGENT
 
@@ -68,24 +72,115 @@ def list_accounts() -> list[dict]:
     return list(config.get().get("oauthAccounts", []))
 
 
+class AmbiguousOAuthAccountKey(ValueError):
+    """Legacy email key matches more than one logical OAuth account."""
+
+
+def _acc_provider(acc: dict) -> str:
+    return _normalize_provider(acc.get("provider") or _DEFAULT_PROVIDER)
+
+
+def _is_openai_acc(acc: dict) -> bool:
+    return _acc_provider(acc) == "openai"
+
+
+def _canonical_key(acc: dict) -> str:
+    return _account_key(acc)
+
+
+def _matching_accounts_for_key(key: str) -> list[dict]:
+    """Return config accounts matching either a canonical key or a legacy key.
+
+    OpenAI legacy keys are `openai:<email>`. They are accepted only by callers
+    that subsequently check ambiguity; this helper intentionally returns all
+    possible matches.
+    """
+    if not key:
+        return []
+    accounts = list(config.get().get("oauthAccounts", []))
+    if ":" in key:
+        provider, identity = _split_ak(key)
+        exact = [
+            acc for acc in accounts
+            if _acc_provider(acc) == provider and _canonical_key(acc) == key
+        ]
+        if exact:
+            return exact
+        if provider == "openai":
+            return [
+                acc for acc in accounts
+                if _is_openai_acc(acc) and acc.get("email") == identity
+            ]
+        return [
+            acc for acc in accounts
+            if _acc_provider(acc) == provider and acc.get("email") == identity
+        ]
+    return [acc for acc in accounts if acc.get("email") == key]
+
+
+def resolve_account_key(value: str | None) -> str | None:
+    """Resolve canonical account_key from canonical or legacy input.
+
+    - Canonical keys return themselves.
+    - Legacy `openai:<email>` resolves only when exactly one OpenAI account has
+      that email.
+    - Bare email resolves only when exactly one OAuth account has that email.
+    - Ambiguous legacy input raises instead of silently selecting an account.
+    """
+    if value is None:
+        return None
+    raw = str(value or "")
+    if not raw:
+        return raw
+
+    matches = _matching_accounts_for_key(raw)
+    if not matches:
+        return raw
+    canonical = {_canonical_key(acc) for acc in matches}
+    if len(canonical) == 1:
+        return next(iter(canonical))
+    raise AmbiguousOAuthAccountKey(
+        f"ambiguous OAuth account key {raw!r}; matches {len(matches)} accounts"
+    )
+
+
+def _resolve_existing_account_key(value: str) -> str | None:
+    try:
+        key = resolve_account_key(value)
+    except AmbiguousOAuthAccountKey:
+        raise
+    if key is None:
+        return None
+    for acc in config.get().get("oauthAccounts", []):
+        if _canonical_key(acc) == key:
+            return key
+    return None
+
+
+def _resolve_existing_account_key_or_raise(value: str) -> str:
+    key = _resolve_existing_account_key(value)
+    if key is None:
+        raise ValueError(f"unknown OAuth account: {value}")
+    return key
+
+
 def get_account(account_key: str) -> dict | None:
-    """按 account_key (=f"{provider}:{email}") 精确匹配账户。
+    """按 canonical account_key 精确匹配账户。
 
     历史上本函数按 email 查找；同邮箱下 Claude + OpenAI 共存后必须联合键。
-    若传入的字符串不含 ":" 则按旧 email 语义回退（兼容过渡期的老调用）。
+    兼容期内：
+      - `openai:<email>` 只有在该 email 下恰好一个 OpenAI 工作区时才回退
+      - 裸 email 只有在恰好一个账户匹配时才回退
+    匹配不唯一时返回 None，避免静默选错工作区。
     """
-    if ":" in account_key:
-        provider, email = _split_ak(account_key)
-        for acc in config.get().get("oauthAccounts", []):
-            if acc.get("email") != email:
-                continue
-            acc_prov = _normalize_provider(acc.get("provider") or _DEFAULT_PROVIDER)
-            if acc_prov == provider:
-                return acc
+    try:
+        canonical = resolve_account_key(account_key)
+    except AmbiguousOAuthAccountKey:
         return None
-    # 兼容：纯 email 的老写法 → 仍可用（返回首个匹配）
+    if not canonical:
+        return None
     for acc in config.get().get("oauthAccounts", []):
-        if acc.get("email") == account_key:
+        if _canonical_key(acc) == canonical:
             return acc
     return None
 
@@ -102,8 +197,14 @@ def iter_account_keys() -> list[str]:
 
 def account_key_to_email(account_key: str) -> str:
     """反查 email（用于日志/通知的人类可读字段）。"""
-    _, email = _split_ak(account_key)
-    return email
+    try:
+        acc = get_account(account_key)
+    except AmbiguousOAuthAccountKey:
+        acc = None
+    if acc is not None:
+        return str(acc.get("email") or "")
+    _, identity = _split_ak(account_key)
+    return identity
 
 
 # ─── 刷新 token ──────────────────────────────────────────────────
@@ -145,8 +246,14 @@ def provider_of(key_or_account: str | dict) -> str:
     若入参是 "provider:email" 三段式 → 直接拆出 provider 返回（不必查 config）。
     """
     if isinstance(key_or_account, dict):
-        return _normalize_provider(key_or_account.get("provider") or _DEFAULT_PROVIDER)
+        return _acc_provider(key_or_account)
     if isinstance(key_or_account, str) and ":" in key_or_account:
+        try:
+            acc = get_account(key_or_account)
+        except AmbiguousOAuthAccountKey:
+            acc = None
+        if acc is not None:
+            return _acc_provider(acc)
         prov, _ = _split_ak(key_or_account)
         return prov
     acc = get_account(key_or_account)
@@ -186,23 +293,48 @@ def _remaining_str(iso_or_none: str | None) -> str:
 def _save_token_fields(account_key: str, new: dict) -> None:
     """把刷新后的 token 字段写回 config.oauthAccounts（按 account_key 精确匹配）。
 
-    兼容：若入参不含 ":"（裸 email，老调用），则只按 email 匹配、不再过滤 provider，
-    避免把 OpenAI 账号的刷新结果漏写回去（同邮箱 Claude+OpenAI 共存前唯一的用法）。
+    若刷新返回了新的 OpenAI workspace/account id，则需要把相关运行时状态和
+    priorityOrders 从旧 account_key 一并改名到新 account_key。真实 OpenAI 一般
+    不会换 identity；此路径主要用于账号/团队切换后的安全收敛。
 
     若该账号此前因 `auth_error` 被自动禁用，刷新成功视为身份恢复：
     同时清掉 disabled_reason / disabled_until 并把 enabled 重新置 True。
     """
-    has_prov = ":" in account_key
-    target_provider, target_email = _split_ak(account_key)
+    canonical = _resolve_existing_account_key(account_key)
+    target_key = canonical or account_key
+    old_acc = get_account(target_key)
+    target_email = account_key_to_email(target_key)
+    old_key = _canonical_key(old_acc) if old_acc else (canonical or account_key)
+    new_key = old_key
+    if old_acc:
+        preview = dict(old_acc)
+        preview.update(new)
+        new_key = _canonical_key(preview)
+        target_email = str(preview.get("email") or target_email)
+
+    if old_key and new_key and old_key != new_key:
+        try:
+            state_db.rename_oauth_identity(old_key, new_key, email=target_email)
+        except Exception as exc:
+            print(f"[oauth] state rename failed {old_key} -> {new_key}: {exc}")
+        try:
+            load_balancing.sync_channel_renamed(
+                f"oauth:{old_key}", f"oauth:{new_key}",
+                "openai" if provider_of(old_acc or old_key) == "openai" else "anthropic",
+            )
+        except Exception as exc:
+            print(f"[oauth] priority rename failed {old_key} -> {new_key}: {exc}")
 
     def mutate(cfg):
         for acc in cfg.get("oauthAccounts", []):
-            if acc.get("email") != target_email:
-                continue
-            if has_prov:
-                acc_prov = _normalize_provider(acc.get("provider") or _DEFAULT_PROVIDER)
-                if acc_prov != target_provider:
+            if old_acc is not None:
+                if _canonical_key(acc) != old_key:
                     continue
+            elif canonical:
+                if _canonical_key(acc) != canonical:
+                    continue
+            elif acc.get("email") != target_email:
+                continue
             acc.update(new)
             if acc.get("disabled_reason") == "auth_error":
                 acc["disabled_reason"] = None
@@ -246,6 +378,7 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
     force=False 时进入锁后做一次"双重检查"：若另一并发刷新已完成且 token 仍有效则跳过实际请求。
     force=True 时无视剩余时间，强制刷新。
     """
+    account_key = _resolve_existing_account_key_or_raise(account_key)
     email = account_key_to_email(account_key)
     lock = _get_refresh_lock(account_key)
     with lock:
@@ -263,6 +396,8 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
         if provider == "openai":
             data = openai_provider.refresh_sync(
                 acc["refresh_token"], email=email,
+                workspace_id=acc.get("workspace_id") or acc.get("chatgpt_account_id") or None,
+                org_id=acc.get("organization_id") or None,
             )
         elif mock_mode_enabled():
             data = _do_refresh_mock(acc["refresh_token"])
@@ -290,16 +425,38 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
                 try:
                     claims = openai_provider.decode_id_token(data["id_token"])
                     info = openai_provider.extract_user_info(claims)
-                    for k in ("chatgpt_account_id", "organization_id", "plan_type"):
+                    for k in (
+                        "chatgpt_account_id", "workspace_id", "workspace_name",
+                        "workspace_type", "organization_id", "plan_type",
+                    ):
                         v = info.get(k)
-                        if v:   # 空值不覆盖已有字段
-                            new_fields[k] = v
+                        if not v:   # 空值不覆盖已有字段
+                            continue
+                        if k in ("chatgpt_account_id", "workspace_id"):
+                            old_identity = _openai_workspace_id(acc)
+                            # OpenAI refresh_token 绑定一个 ChatGPT workspace/account。
+                            # 如果上游/mock 返回了不同 identity，不要原地改主键，
+                            # 否则会把现有 account_key 重命名到另一个 workspace。
+                            if old_identity and str(v) != old_identity:
+                                continue
+                        new_fields[k] = v
                 except Exception as exc:
                     print(f"[oauth] openai refresh: id_token decode failed for {email}: {exc}")
             if data.get("plan_type"):
                 new_fields["plan_type"] = data["plan_type"]
             if data.get("subscription_expires_at"):
                 new_fields["subscription_expires_at"] = data["subscription_expires_at"]
+            for k in (
+                "workspace_id", "workspace_name", "workspace_type",
+                "organization_id",
+            ):
+                if not data.get(k):
+                    continue
+                if k == "workspace_id":
+                    old_identity = _openai_workspace_id(acc)
+                    if old_identity and str(data[k]) != old_identity:
+                        continue
+                new_fields[k] = data[k]
 
         _save_token_fields(account_key, new_fields)
         return new_fields["access_token"]
@@ -311,6 +468,7 @@ async def ensure_valid_token(account_key: str) -> str:
     返回可用的 access_token。剩余 ≥ 5min 直接返回缓存；否则在线程中持锁刷新。
     同一 account_key 的并发请求由 threading.Lock 串行（跨 event loop 安全）。
     """
+    account_key = _resolve_existing_account_key_or_raise(account_key)
     acc = get_account(account_key)
     if acc is None:
         raise ValueError(f"unknown OAuth account: {account_key}")
@@ -413,6 +571,10 @@ def _openai_probe_min_interval_seconds() -> int:
 
 def _openai_probe_should_skip(account_key: str) -> bool:
     """响应头被动采样足够新鲜时跳过 probe；否则按最小间隔节流。"""
+    try:
+        account_key = _resolve_existing_account_key_or_raise(account_key)
+    except Exception:
+        return True
     # 若最近 5 分钟内有响应头被动采样，认为数据足够新鲜，无需发 probe
     row = state_db.quota_load(account_key)
     if row:
@@ -432,6 +594,10 @@ def _openai_probe_should_skip(account_key: str) -> bool:
 
 
 def _openai_probe_mark(account_key: str) -> None:
+    try:
+        account_key = resolve_account_key(account_key) or account_key
+    except AmbiguousOAuthAccountKey:
+        pass
     with _openai_probe_lock:
         _OPENAI_PROBE_LAST[account_key] = time.time()
 
@@ -441,7 +607,10 @@ def forget_openai_probe(account_key_or_email: str) -> None:
     if not account_key_or_email:
         return
     key = account_key_or_email
-    email = key.split(":", 1)[1] if ":" in key else key
+    try:
+        email = account_key_to_email(key)
+    except Exception:
+        email = key.split(":", 1)[1] if ":" in key else key
     with _openai_probe_lock:
         _OPENAI_PROBE_LAST.pop(email, None)
         _OPENAI_PROBE_LAST.pop(key, None)
@@ -460,6 +629,7 @@ async def fetch_usage(account_key: str) -> dict:
     five_hour / seven_day / ...）。OpenAI 路径下返回一个**合成结构**，
     让上层 extract_utils_percent / flatten_usage 能无差别消费。
     """
+    account_key = _resolve_existing_account_key_or_raise(account_key)
     provider = provider_of(account_key)
 
     if provider != "openai":
@@ -556,6 +726,11 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
     """
     if not account_key:
         return False
+    try:
+        account_key = _resolve_existing_account_key_or_raise(account_key)
+    except Exception as exc:
+        print(f"[oauth] ensure_quota_fresh unknown account {account_key}: {exc}")
+        return False
     if _should_skip_access_refresh():
         return False
 
@@ -591,6 +766,13 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
         except Exception as exc:
             print(f"[oauth] ensure_quota_fresh save failed for {account_key}: {exc}")
             return False
+        # 访问路径刷新到新鲜用量后，也要按 quotaMonitor.disableThresholdPercent
+        # 立即收敛状态；否则 UI 会显示已超当前配置阈值但账户仍保持 enabled，
+        # 直到后台轮询下一轮才禁用。
+        try:
+            evaluate_and_toggle_by_usage(account_key, usage)
+        except Exception as exc:
+            print(f"[oauth] ensure_quota_fresh evaluate failed for {account_key}: {exc}")
     return True
 
 
@@ -727,6 +909,59 @@ def reset_iso_for_hit_windows(usage: dict, threshold: float) -> str | None:
     return _format_utc(latest.astimezone(timezone.utc))
 
 
+
+
+def usage_from_quota_row(row: dict) -> dict:
+    """Build a usage-shaped dict from oauth_quota_cache row.
+
+    This is intentionally display/cache oriented: it lets UI paths that already
+    show a cached value over the current quotaMonitor.disableThresholdPercent
+    apply the same quota-disable rule without waiting for the next monitor loop.
+    """
+    def _block(util, reset):
+        return {"utilization": util, "resets_at": reset} if util is not None else {}
+
+    return {
+        "five_hour": _block(row.get("five_hour_util"), row.get("five_hour_reset")),
+        "seven_day": _block(row.get("seven_day_util"), row.get("seven_day_reset")),
+        "seven_day_sonnet": _block(row.get("sonnet_util"), row.get("sonnet_reset")),
+        "seven_day_opus": _block(row.get("opus_util"), row.get("opus_reset")),
+        "extra_usage": {
+            "is_enabled": bool(row.get("extra_limit")),
+            "used_credits": row.get("extra_used") or 0,
+            "monthly_limit": row.get("extra_limit") or 0,
+            "utilization": row.get("extra_util") or 0,
+        },
+    }
+
+
+def evaluate_and_toggle_by_cached_quota(account_key: str,
+                                        *, threshold: float | None = None) -> dict:
+    """Disable account from cached quota data when it is already over threshold.
+
+    This is deliberately disable-only for below-threshold cache rows: cached data
+    may be stale, so automatic resume remains the job of quota_monitor/manual
+    refresh after fetching fresh usage. Over-threshold cache rows are still safe
+    to disable immediately because the UI is already showing that value.
+    """
+    row = state_db.quota_load(account_key)
+    if not row:
+        return {"action": "noop_no_cache", "utils": [], "any_over": False,
+                "hit_windows": [], "disabled_until": None}
+    if threshold is None:
+        qm = config.get().get("quotaMonitor") or {}
+        try:
+            threshold = float(qm.get("disableThresholdPercent", 95))
+        except Exception:
+            threshold = 95.0
+    usage = usage_from_quota_row(row)
+    utils = extract_utils_percent(usage)
+    if not any(u is not None and u >= threshold for u in utils):
+        return {"action": "cached_below_threshold", "utils": utils,
+                "any_over": False, "hit_windows": [],
+                "disabled_until": None}
+    return evaluate_and_toggle_by_usage(account_key, usage, threshold=threshold)
+
 def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                                  *, threshold: float | None = None) -> dict:
     """核心策略：拿到新鲜 usage 后评估禁用/恢复，并执行状态切换。
@@ -763,6 +998,9 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                    if u is not None and u >= threshold]
     any_over = bool(hit_windows)
 
+    canonical = _resolve_existing_account_key(account_key)
+    if canonical:
+        account_key = canonical
     acc = get_account(account_key)
     if acc is None:
         return {"action": "noop_missing", "utils": utils, "any_over": any_over,
@@ -847,12 +1085,153 @@ def bootstrap_composite_key_migration() -> dict:
     return state_db.run_composite_key_migration(email_to_key)
 
 
+def _unique_openai_email_workspace_mapping(accounts: list[dict]) -> dict[str, dict[str, str]]:
+    by_email: dict[str, list[dict]] = {}
+    for acc in accounts:
+        if not _is_openai_acc(acc):
+            continue
+        email = str(acc.get("email") or "")
+        if not email:
+            continue
+        by_email.setdefault(email, []).append(acc)
+
+    mapping: dict[str, dict[str, str]] = {}
+    for email, items in by_email.items():
+        if len(items) != 1:
+            continue
+        acc = items[0]
+        workspace_id = _openai_workspace_id(acc)
+        if not workspace_id:
+            continue
+        old_key = f"openai:{email}"
+        new_key = f"openai:{workspace_id}"
+        if old_key == new_key:
+            continue
+        mapping[old_key] = {"new": new_key, "email": email}
+    return mapping
+
+
+def _openai_workspace_mapping_scope_key(mapping: dict[str, dict[str, str]]) -> str:
+    """Stable schema_meta key for the exact set of safe OpenAI mappings."""
+    payload = json.dumps(mapping, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return f"openai_workspace_key_version:{digest}"
+
+
+def bootstrap_openai_workspace_key_migration() -> dict:
+    """Startup-safe migration from OpenAI email keys to workspace keys.
+
+    Only unique OpenAI email mappings are migrated. If the same OpenAI email has
+    multiple workspaces, old `openai:<email>` rows are intentionally left in
+    place so no refresh or stats view silently picks the wrong workspace.
+    """
+    accounts = list(config.get().get("oauthAccounts", []))
+    mapping = _unique_openai_email_workspace_mapping(accounts)
+    channel_mapping = {
+        f"oauth:{old}": f"oauth:{meta['new']}"
+        for old, meta in mapping.items()
+        if meta.get("new")
+    }
+
+    config_stats = {"accounts_patched": 0, "priority_entries": 0, "image_disabled_entries": 0}
+
+    def mutate(c):
+        for acc in c.get("oauthAccounts", []):
+            if not _is_openai_acc(acc):
+                continue
+            if not acc.get("workspace_id") and acc.get("chatgpt_account_id"):
+                acc["workspace_id"] = acc.get("chatgpt_account_id")
+                config_stats["accounts_patched"] += 1
+
+        lb = c.setdefault("loadBalancing", {})
+        po = lb.setdefault("priorityOrders", {})
+        for fam in ("anthropic", "openai"):
+            arr = list(po.get(fam) or [])
+            new_arr: list[str] = []
+            seen: set[str] = set()
+            for key in arr:
+                new_key = channel_mapping.get(key, key)
+                if new_key not in seen:
+                    new_arr.append(new_key)
+                    seen.add(new_key)
+                if new_key != key:
+                    config_stats["priority_entries"] += 1
+            po[fam] = new_arr
+
+        images = c.setdefault("images", {})
+        disabled = list(images.get("disabledAccounts") or [])
+        new_disabled: list[str] = []
+        seen_disabled: set[str] = set()
+        for value in disabled:
+            raw = str(value or "")
+            new_value = raw
+            if raw in mapping:
+                new_value = mapping[raw]["new"]
+            elif raw.startswith("oauth:") and raw in channel_mapping:
+                new_value = channel_mapping[raw]
+            elif raw.startswith("openai:") and raw in mapping:
+                new_value = mapping[raw]["new"]
+            elif raw:
+                maybe = f"openai:{raw}"
+                if maybe in mapping:
+                    new_value = mapping[maybe]["new"]
+            if new_value and new_value not in seen_disabled:
+                new_disabled.append(new_value)
+                seen_disabled.add(new_value)
+            if new_value != raw:
+                config_stats["image_disabled_entries"] += 1
+        images["disabledAccounts"] = new_disabled
+
+    config.update(mutate)
+
+    state_scope_key = _openai_workspace_mapping_scope_key(mapping) if mapping else None
+    state_stats = state_db.run_openai_workspace_key_migration(mapping, scope_key=state_scope_key)
+    log_stats: dict = {}
+    image_stats: dict = {}
+    try:
+        from . import log_db
+        log_stats = log_db.migrate_channel_keys(channel_mapping)
+    except Exception as exc:
+        log_stats = {"error": str(exc)}
+    try:
+        from . import image_db
+        image_stats = image_db.migrate_account_keys(mapping)
+    except Exception as exc:
+        image_stats = {"error": str(exc)}
+
+    return {
+        "mapping_count": len(mapping),
+        "mapping": mapping,
+        "channel_mapping": channel_mapping,
+        "config": config_stats,
+        "state": state_stats,
+        "logs": log_stats,
+        "images": image_stats,
+    }
+
+
+def _openai_metadata_patch(entry: dict) -> dict:
+    patch: dict[str, Any] = {
+        "id_token": entry.get("id_token", "") or "",
+        "chatgpt_account_id": entry.get("chatgpt_account_id", "") or "",
+        "workspace_id": entry.get("workspace_id") or entry.get("chatgpt_account_id", "") or "",
+        "workspace_name": entry.get("workspace_name", "") or "",
+        "workspace_type": entry.get("workspace_type", "") or "",
+        "organization_id": entry.get("organization_id", "") or "",
+        "plan_type": entry.get("plan_type", "") or "",
+        "subscription_expires_at": entry.get("subscription_expires_at", "") or "",
+    }
+    return patch
+
+
 def add_account(entry: dict) -> None:
     """entry 需至少含 email / access_token / refresh_token。
 
     支持可选字段：
       - provider: "claude" (默认) / "openai"
-      - id_token / chatgpt_account_id / organization_id / plan_type / subscription_expires_at  (OpenAI 专属)
+      - id_token / chatgpt_account_id / workspace_id / workspace_name /
+        workspace_type / organization_id / plan_type / subscription_expires_at
+        (OpenAI 专属)
     """
     required = ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
@@ -864,44 +1243,99 @@ def add_account(entry: dict) -> None:
     if provider not in _VALID_PROVIDERS:
         raise ValueError(f"unsupported provider: {entry.get('provider')!r}")
 
+    # 规范化字段
+    normalized = {
+        "email": email,
+        "provider": provider,
+        "access_token": entry["access_token"],
+        "refresh_token": entry["refresh_token"],
+        "expired": entry.get("expired", ""),
+        "last_refresh": entry.get("last_refresh", _format_utc(datetime.now(timezone.utc))),
+        "type": entry.get("type", "openai" if provider == "openai" else "claude"),
+        "enabled": entry.get("enabled", True),
+        "disabled_reason": entry.get("disabled_reason"),
+        "disabled_until": entry.get("disabled_until"),
+        "models": entry.get("models") or [],
+    }
+    # OpenAI 专属字段（缺失时保持空串，渲染端按需展示）
+    if provider == "openai":
+        normalized.update(_openai_metadata_patch(entry))
+
+    normalized_key = _account_key(normalized)
+    added = {"v": False}
+    existing_target = None
+    for a in config.get().get("oauthAccounts", []):
+        if provider == "openai":
+            if _is_openai_acc(a) and _canonical_key(a) == normalized_key:
+                existing_target = a
+                break
+        elif a.get("email") == email and _acc_provider(a) == provider:
+            existing_target = a
+            break
+    rename_old_key = _canonical_key(existing_target) if existing_target else ""
+    rename_new_key = normalized_key if rename_old_key and rename_old_key != normalized_key else ""
+    if rename_new_key:
+        try:
+            state_db.rename_oauth_identity(rename_old_key, rename_new_key, email=email)
+        except Exception as exc:
+            print(f"[oauth] pre-rename state failed {rename_old_key} -> {rename_new_key}: {exc}")
+
     def mutate(cfg):
         accounts = cfg.setdefault("oauthAccounts", [])
-        for a in accounts:
-            if a.get("email") != email:
-                continue
-            a_prov = _normalize_provider(a.get("provider") or _DEFAULT_PROVIDER)
-            if a_prov == provider:
+        target: dict | None = None
+        if provider == "openai":
+            for a in accounts:
+                if not _is_openai_acc(a):
+                    continue
+                if _canonical_key(a) == normalized_key:
+                    target = a
+                    break
+        else:
+            for a in accounts:
+                if a.get("email") == email and _acc_provider(a) == provider:
+                    target = a
+                    break
+
+        if target is not None:
+            if provider != "openai":
                 raise ValueError(
                     f"account already exists: provider={provider} email={email}"
                 )
-        # 规范化字段
-        normalized = {
-            "email": email,
-            "provider": provider,
-            "access_token": entry["access_token"],
-            "refresh_token": entry["refresh_token"],
-            "expired": entry.get("expired", ""),
-            "last_refresh": entry.get("last_refresh", _format_utc(datetime.now(timezone.utc))),
-            "type": entry.get("type", "claude"),
-            "enabled": entry.get("enabled", True),
-            "disabled_reason": entry.get("disabled_reason"),
-            "disabled_until": entry.get("disabled_until"),
-            "models": entry.get("models") or [],
-        }
-        # OpenAI 专属字段（缺失时保持空串，渲染端按需展示）
-        if provider == "openai":
-            normalized["id_token"] = entry.get("id_token", "") or ""
-            normalized["chatgpt_account_id"] = entry.get("chatgpt_account_id", "") or ""
-            normalized["organization_id"] = entry.get("organization_id", "") or ""
-            normalized["plan_type"] = entry.get("plan_type", "") or ""
-            normalized["subscription_expires_at"] = entry.get("subscription_expires_at", "") or ""
+            keep_models = target.get("models")
+            keep_max = target.get("maxConcurrent")
+            target.update(normalized)
+            if keep_models is not None and not entry.get("models"):
+                target["models"] = keep_models
+            if keep_max is not None and "maxConcurrent" not in entry:
+                target["maxConcurrent"] = keep_max
+            if rename_new_key:
+                lb = cfg.setdefault("loadBalancing", {})
+                po = lb.setdefault("priorityOrders", {})
+                fam = "openai" if provider == "openai" else "anthropic"
+                for f in ("anthropic", "openai"):
+                    arr = list(po.get(f) or [])
+                    new_arr: list[str] = []
+                    seen: set[str] = set()
+                    for key in arr:
+                        if f == fam and key == f"oauth:{rename_old_key}":
+                            key = f"oauth:{rename_new_key}"
+                        elif key in (f"oauth:{rename_old_key}", f"oauth:{rename_new_key}"):
+                            if f != fam:
+                                continue
+                        if key not in seen:
+                            new_arr.append(key)
+                            seen.add(key)
+                    po[f] = new_arr
+            return
         accounts.append(normalized)
+        added["v"] = True
 
     config.update(mutate)
-    load_balancing.sync_channel_added(
-        f"oauth:{_account_key(provider, email)}",
-        "openai" if provider == "openai" else "anthropic",
-    )
+    if added["v"]:
+        load_balancing.sync_channel_added(
+            f"oauth:{normalized_key}",
+            "openai" if provider == "openai" else "anthropic",
+        )
 
 
 def delete_account(account_key: str) -> None:
@@ -909,51 +1343,62 @@ def delete_account(account_key: str) -> None:
 
     兼容：若入参是裸 email（老 API），按 email 删除（可能删掉多条同邮箱的老数据）。
     """
+    canonical = _resolve_existing_account_key(account_key)
     has_prov = ":" in account_key
-    target_provider, target_email = _split_ak(account_key)
+    target_provider, target_identity = _split_ak(account_key)
 
     def mutate(cfg):
         accounts = cfg.get("oauthAccounts", [])
         def _keep(a):
-            if a.get("email") != target_email:
+            if canonical:
+                return _canonical_key(a) != canonical
+            if a.get("email") != target_identity:
                 return True
             if not has_prov:
                 return False  # 老 API：按 email 删除（同邮箱可能多条，统一删）
-            return _normalize_provider(a.get("provider") or _DEFAULT_PROVIDER) != target_provider
+            return _acc_provider(a) != target_provider
         cfg["oauthAccounts"] = [a for a in accounts if _keep(a)]
     config.update(mutate)
 
     # state.db 级联清理
-    ch_key = f"oauth:{account_key}"
+    cleanup_key = canonical or account_key
+    ch_key = f"oauth:{cleanup_key}"
     load_balancing.sync_channel_removed(ch_key)
     state_db.perf_delete(ch_key)
     state_db.error_delete(ch_key)
     state_db.affinity_delete_by_channel(ch_key)
-    state_db.quota_delete(account_key)
+    try:
+        state_db.client_affinity_delete_by_channel(ch_key)
+    except Exception:
+        pass
+    state_db.quota_delete(cleanup_key)
 
     # failover 的响应头 snapshot 节流桶（Codex + Anthropic 都清）
     try:
         from . import failover
-        failover.forget_codex_snapshot(account_key)
-        failover.forget_anthropic_snapshot(account_key)
+        failover.forget_codex_snapshot(cleanup_key)
+        failover.forget_anthropic_snapshot(cleanup_key)
     except Exception:
         pass
     # OpenAI probe 节流桶（fetch_usage 统一路径后新增）
-    forget_openai_probe(account_key)
+    forget_openai_probe(cleanup_key)
 
 
 def set_enabled(account_key: str, enabled: bool, reason: str | None = None,
                 disabled_until: str | None = None) -> None:
+    canonical = _resolve_existing_account_key(account_key)
     has_prov = ":" in account_key
-    target_provider, target_email = _split_ak(account_key)
+    target_provider, target_identity = _split_ak(account_key)
 
     def mutate(cfg):
         for acc in cfg.get("oauthAccounts", []):
-            if acc.get("email") != target_email:
-                continue
-            if has_prov:
-                acc_prov = _normalize_provider(acc.get("provider") or _DEFAULT_PROVIDER)
-                if acc_prov != target_provider:
+            if canonical:
+                if _canonical_key(acc) != canonical:
+                    continue
+            else:
+                if acc.get("email") != target_identity:
+                    continue
+                if has_prov and _acc_provider(acc) != target_provider:
                     continue
             acc["enabled"] = enabled
             if enabled:
@@ -971,16 +1416,19 @@ def set_disabled_by_quota(account_key: str, resets_at: str | None) -> None:
 
 
 def update_models(account_key: str, models: list[str]) -> None:
+    canonical = _resolve_existing_account_key(account_key)
     has_prov = ":" in account_key
-    target_provider, target_email = _split_ak(account_key)
+    target_provider, target_identity = _split_ak(account_key)
 
     def mutate(cfg):
         for acc in cfg.get("oauthAccounts", []):
-            if acc.get("email") != target_email:
-                continue
-            if has_prov:
-                acc_prov = _normalize_provider(acc.get("provider") or _DEFAULT_PROVIDER)
-                if acc_prov != target_provider:
+            if canonical:
+                if _canonical_key(acc) != canonical:
+                    continue
+            else:
+                if acc.get("email") != target_identity:
+                    continue
+                if has_prov and _acc_provider(acc) != target_provider:
                     continue
             acc["models"] = list(models)
             return
@@ -989,17 +1437,20 @@ def update_models(account_key: str, models: list[str]) -> None:
 
 def update_max_concurrent(account_key: str, max_concurrent: int) -> None:
     """设置 OAuth 账户的并发上限。0 / 负数 → 用全局 defaultMaxConcurrent。"""
+    canonical = _resolve_existing_account_key(account_key)
     has_prov = ":" in account_key
-    target_provider, target_email = _split_ak(account_key)
+    target_provider, target_identity = _split_ak(account_key)
     v = max(0, int(max_concurrent or 0))
 
     def mutate(cfg):
         for acc in cfg.get("oauthAccounts", []):
-            if acc.get("email") != target_email:
-                continue
-            if has_prov:
-                acc_prov = _normalize_provider(acc.get("provider") or _DEFAULT_PROVIDER)
-                if acc_prov != target_provider:
+            if canonical:
+                if _canonical_key(acc) != canonical:
+                    continue
+            else:
+                if acc.get("email") != target_identity:
+                    continue
+                if has_prov and _acc_provider(acc) != target_provider:
                     continue
             acc["maxConcurrent"] = v
             return

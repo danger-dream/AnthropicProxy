@@ -59,6 +59,17 @@ def _setup(m):
     conn.execute("DELETE FROM request_detail")
     conn.execute("DELETE FROM retry_chain")
     conn.commit()
+    def _cfg(c):
+        c["oauthAccounts"] = [{
+            "provider": "openai",
+            "email": "o@openai.test",
+            "workspace_id": "acct-raw-hidden",
+            "chatgpt_account_id": "acct-raw-hidden",
+            "access_token": "x",
+            "refresh_token": "r",
+            "models": ["gpt-5.1"],
+        }]
+    m["config"].update(_cfg)
     m["states"].clear_all()
 
 
@@ -324,7 +335,7 @@ def test_logs_detail_with_retry_chain(m):
     assert "日志详情" in text
     assert rid in text
     assert "重试链 (2 次尝试)" in text
-    assert "api:A" in text and "api:B" in text
+    assert "<code>A</code>" in text and "<code>B</code>" in text
     assert "http_error" in text
     # Tokens / 耗时；input=200, cache_read=100，总 prompt=300，缓存率 33.3%
     assert "↑" in text and "↓" in text
@@ -341,6 +352,40 @@ def test_logs_detail_short_expired(m):
     edit = rec.last("editMessageText")
     assert edit and "过期" in edit["text"] or "找到" in edit["text"]
     print("  [PASS] logs detail invalid short")
+
+
+def test_openai_workspace_id_hidden_in_stats_and_logs(m):
+    _setup(m)
+    raw_key = "oauth:openai:acct-raw-hidden"
+    _insert_success(m, "OID1", "k1", "gpt-5.1", raw_key, "oauth")
+
+    rec = _install_recorder(m)
+    m["stats_menu"].view(42, 100, "cb", period="0", dim="channel")
+    stats_text = rec.last("editMessageText")["text"]
+    assert "o@openai.test" in stats_text
+    assert "oauth:openai:" not in stats_text
+    assert "acct-raw-hidden" not in stats_text
+
+    rec.clear()
+    m["logs_menu"].show(42, 100, "cb")
+    logs_text = rec.last("editMessageText")["text"]
+    assert "o@openai.test" in logs_text
+    assert "oauth:openai:" not in logs_text
+    assert "acct-raw-hidden" not in logs_text
+
+    rid = "OID-detail"
+    m["log_db"].insert_pending(rid, "1.1.1.1", "k1", "gpt-5.1", True, 1, 0, {}, {})
+    att = m["log_db"].record_retry_attempt(rid, 1, raw_key, "oauth", "gpt-5.1", time.time())
+    m["log_db"].update_retry_attempt(att, connect_ms=1, first_byte_ms=2, ended_at=time.time(), outcome="success")
+    m["log_db"].finish_success(rid, raw_key, "oauth", "gpt-5.1", response_body="{}")
+    rec.clear()
+    short = m["ui"].register_code(rid)
+    m["logs_menu"].show_detail(42, 100, "cb", short)
+    detail_text = rec.last("editMessageText")["text"]
+    assert "o@openai.test" in detail_text
+    assert "oauth:openai:" not in detail_text
+    assert "acct-raw-hidden" not in detail_text
+    print("  [PASS] OpenAI workspace id hidden in stats/logs UI")
 
 
 def test_router_dispatch(m):
@@ -386,6 +431,7 @@ def main():
         test_logs_pagination,
         test_logs_detail_with_retry_chain,
         test_logs_detail_short_expired,
+        test_openai_workspace_id_hidden_in_stats_and_logs,
         test_router_dispatch,
     ]
 

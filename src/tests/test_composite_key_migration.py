@@ -73,9 +73,12 @@ def _setup(m):
 # ==============================================================
 
 def test_account_key_from_dict(m):
-    ak = m["oauth_ids"].account_key({"email": "a@b.c", "provider": "openai"})
-    assert ak == "openai:a@b.c", ak
-    print("  [PASS] account_key(dict) returns provider:email")
+    ak = m["oauth_ids"].account_key({
+        "email": "a@b.c", "provider": "openai",
+        "chatgpt_account_id": "acct-a",
+    })
+    assert ak == "openai:acct-a", ak
+    print("  [PASS] account_key(dict) uses OpenAI workspace identity")
 
 
 def test_account_key_default_provider(m):
@@ -104,9 +107,12 @@ def test_split_account_key_fallback(m):
 
 
 def test_channel_key_roundtrip(m):
-    ck = m["oauth_ids"].channel_key_for({"email": "a@b.c", "provider": "openai"})
-    assert ck == "oauth:openai:a@b.c", ck
-    assert m["oauth_ids"].email_from_channel_key(ck) == "a@b.c"
+    ck = m["oauth_ids"].channel_key_for({
+        "email": "a@b.c", "provider": "openai",
+        "chatgpt_account_id": "acct-a",
+    })
+    assert ck == "oauth:openai:acct-a", ck
+    assert m["oauth_ids"].email_from_channel_key(ck) == "acct-a"
     assert m["oauth_ids"].provider_from_channel_key(ck) == "openai"
     print("  [PASS] channel_key_for + reverse extractors roundtrip")
 
@@ -241,24 +247,24 @@ def test_add_same_email_different_provider_ok(m):
     print("  [PASS] add_account allows same email across different providers")
 
 
-def test_add_same_email_same_provider_rejected(m):
-    """同邮箱同 provider 必须拒绝，避免真正的重复。"""
+def test_add_same_email_openai_different_workspaces_ok(m):
+    """同邮箱 OpenAI 可挂多个 workspace；email 只是展示字段。"""
     _setup(m)
     om = m["oauth_manager"]
     om.add_account({
         "email": "same@x.com", "provider": "openai",
         "access_token": "a", "refresh_token": "r",
+        "chatgpt_account_id": "acct-one",
     })
-    try:
-        om.add_account({
-            "email": "same@x.com", "provider": "openai",
-            "access_token": "a2", "refresh_token": "r2",
-        })
-    except ValueError as exc:
-        assert "already exists" in str(exc), str(exc)
-        print("  [PASS] add_account rejects same (provider, email) combo")
-        return
-    assert False, "expected ValueError"
+    om.add_account({
+        "email": "same@x.com", "provider": "openai",
+        "access_token": "a2", "refresh_token": "r2",
+        "chatgpt_account_id": "acct-two",
+    })
+    assert om.get_account("openai:acct-one")["refresh_token"] == "r"
+    assert om.get_account("openai:acct-two")["refresh_token"] == "r2"
+    assert om.get_account("openai:same@x.com") is None
+    print("  [PASS] add_account allows same OpenAI email across workspaces")
 
 
 def test_get_account_isolates_by_provider(m):
@@ -268,15 +274,15 @@ def test_get_account_isolates_by_provider(m):
     om.add_account({"email": "iso@x.com", "provider": "claude",
                     "access_token": "CLAUDE-AT", "refresh_token": "c"})
     om.add_account({"email": "iso@x.com", "provider": "openai",
-                    "access_token": "OPENAI-AT", "refresh_token": "o"})
+                    "access_token": "OPENAI-AT", "refresh_token": "o",
+                    "chatgpt_account_id": "acct-iso"})
 
     claude = om.get_account("claude:iso@x.com")
-    openai = om.get_account("openai:iso@x.com")
+    openai = om.get_account("openai:acct-iso")
     assert claude and claude["access_token"] == "CLAUDE-AT"
     assert openai and openai["access_token"] == "OPENAI-AT"
-    # 纯 email（老语义）返回第一个匹配，不 crash
-    any_match = om.get_account("iso@x.com")
-    assert any_match is not None
+    # 纯 email 在同邮箱多 provider 时有歧义，不应静默选中。
+    assert om.get_account("iso@x.com") is None
     print("  [PASS] get_account(account_key) isolates same-email dual accounts")
 
 
@@ -287,7 +293,8 @@ def test_delete_account_only_targets_one_of_same_email(m):
     om.add_account({"email": "d@x.com", "provider": "claude",
                     "access_token": "a", "refresh_token": "b"})
     om.add_account({"email": "d@x.com", "provider": "openai",
-                    "access_token": "a", "refresh_token": "b"})
+                    "access_token": "a", "refresh_token": "b",
+                    "chatgpt_account_id": "acct-d"})
 
     om.delete_account("claude:d@x.com")
     remaining = [a for a in om.list_accounts() if a.get("email") == "d@x.com"]
@@ -301,11 +308,12 @@ def test_set_enabled_only_targets_one_of_same_email(m):
     om.add_account({"email": "t@x.com", "provider": "claude",
                     "access_token": "a", "refresh_token": "b"})
     om.add_account({"email": "t@x.com", "provider": "openai",
-                    "access_token": "a", "refresh_token": "b"})
+                    "access_token": "a", "refresh_token": "b",
+                    "chatgpt_account_id": "acct-t"})
 
     om.set_enabled("claude:t@x.com", False, reason="user")
     claude = om.get_account("claude:t@x.com")
-    openai = om.get_account("openai:t@x.com")
+    openai = om.get_account("openai:acct-t")
     assert claude["enabled"] is False and claude["disabled_reason"] == "user"
     assert openai["enabled"] is True and openai.get("disabled_reason") in (None, "",)
     print("  [PASS] set_enabled isolates state per (provider, email)")
@@ -317,11 +325,12 @@ def test_update_models_only_targets_one_of_same_email(m):
     om.add_account({"email": "u@x.com", "provider": "claude",
                     "access_token": "a", "refresh_token": "b"})
     om.add_account({"email": "u@x.com", "provider": "openai",
-                    "access_token": "a", "refresh_token": "b"})
+                    "access_token": "a", "refresh_token": "b",
+                    "chatgpt_account_id": "acct-u"})
 
-    om.update_models("openai:u@x.com", ["gpt-5"])
+    om.update_models("openai:acct-u", ["gpt-5"])
     claude = om.get_account("claude:u@x.com")
-    openai = om.get_account("openai:u@x.com")
+    openai = om.get_account("openai:acct-u")
     assert openai["models"] == ["gpt-5"], openai.get("models")
     assert claude.get("models") != ["gpt-5"], claude.get("models")
     print("  [PASS] update_models isolates per (provider, email)")
@@ -362,11 +371,11 @@ def test_openai_oauth_channel_key_format(m):
         "access_token": "a", "refresh_token": "b",
         "chatgpt_account_id": "acct-x", "plan_type": "plus",
     })
-    acc = om.get_account("openai:co@x.com")
+    acc = om.get_account("openai:acct-x")
     ch = m["OpenAIOAuthChannel"](acc)
-    assert ch.account_key == "openai:co@x.com", ch.account_key
-    assert ch.key == "oauth:openai:co@x.com", ch.key
-    print("  [PASS] OpenAIOAuthChannel uses three-segment key format")
+    assert ch.account_key == "openai:acct-x", ch.account_key
+    assert ch.key == "oauth:openai:acct-x", ch.key
+    print("  [PASS] OpenAIOAuthChannel uses workspace key format")
 
 
 def test_registry_get_channel_new_and_legacy_key(m):
@@ -395,16 +404,162 @@ def test_resolve_to_account_key_upgrades_plain_email(m):
     _setup(m)
     om = m["oauth_manager"]
     om.add_account({"email": "r@x.com", "provider": "openai",
-                    "access_token": "a", "refresh_token": "b"})
+                    "access_token": "a", "refresh_token": "b",
+                    "chatgpt_account_id": "acct-r"})
     ak = m["oauth_menu"]._resolve_to_account_key("r@x.com")
-    assert ak == "openai:r@x.com", ak
+    assert ak == "openai:acct-r", ak
     # 已经是 account_key 时原样返回
-    ak2 = m["oauth_menu"]._resolve_to_account_key("openai:r@x.com")
-    assert ak2 == "openai:r@x.com"
+    ak2 = m["oauth_menu"]._resolve_to_account_key("openai:acct-r")
+    assert ak2 == "openai:acct-r"
     # None 传入：原样返回 None
     assert m["oauth_menu"]._resolve_to_account_key(None) is None
     print("  [PASS] _resolve_to_account_key upgrades bare email to account_key")
 
+
+
+def test_openai_workspace_key_migration_unique_rows_and_config(m):
+    """unique email→workspace：state / logs / image / priorityOrders 一并迁移。"""
+    _setup(m)
+    config = m["config"]
+    om = m["oauth_manager"]
+    sdb = m["state_db"]
+
+    def seed_cfg(c):
+        c["oauthAccounts"] = [{
+            "email": "uniq@openai.test", "provider": "openai",
+            "access_token": "at", "refresh_token": "rt",
+            "chatgpt_account_id": "acct-uniq",
+        }]
+        c["loadBalancing"] = {
+            "priorityOrders": {
+                "openai": ["oauth:openai:uniq@openai.test"],
+                "anthropic": ["oauth:openai:uniq@openai.test"],
+            }
+        }
+        images = c.setdefault("images", {})
+        images["disabledAccounts"] = [
+            "openai:uniq@openai.test",
+            "oauth:openai:uniq@openai.test",
+            "uniq@openai.test",
+        ]
+    config.update(seed_cfg)
+
+    # state rows
+    sdb.quota_save_openai_snapshot("openai:uniq@openai.test", {"primary_used_pct": 42, "primary_window_min": 10080}, email="uniq@openai.test")
+    conn = sdb._get_conn()
+    conn.execute("INSERT INTO performance_stats (channel_key, model, last_updated) VALUES (?,?,?)", ("oauth:openai:uniq@openai.test", "gpt-5", 1))
+    conn.execute("INSERT INTO channel_errors (channel_key, model) VALUES (?,?)", ("oauth:openai:uniq@openai.test", "gpt-5"))
+    conn.execute("INSERT INTO cache_affinities (fingerprint, channel_key, model, last_used, created_at) VALUES (?,?,?,?,?)", ("fp", "oauth:openai:uniq@openai.test", "gpt-5", 1, 1))
+    conn.execute("INSERT INTO client_affinities (client_key, channel_key, model, last_used, created_at) VALUES (?,?,?,?,?)", ("client", "oauth:openai:uniq@openai.test", "gpt-5", 1, 1))
+    conn.commit()
+
+    # log rows
+    from src import log_db, image_db
+    log_db.init()
+    log_db.insert_pending("req-uniq", "1.1.1.1", "ak", "gpt-5", True, 1, 0, {}, {}, ingress_protocol="responses")
+    log_db.finish_success("req-uniq", "oauth:openai:uniq@openai.test", "oauth", "gpt-5")
+    log_db.record_retry_attempt("req-uniq", 1, "oauth:openai:uniq@openai.test", "oauth", "gpt-5", 1.0)
+
+    # image rows
+    image_db.init()
+    image_db.start_call(
+        request_id="img-uniq", api_key_name="ak", action="generate",
+        main_model="gpt-image-2", tool_model="gpt-image-2", size="1024x1024",
+        prompt_preview="p", prompt_hash="h",
+    )
+    image_db.finish_call(1, status="success", account_key="openai:uniq@openai.test", account_email="uniq@openai.test")
+    image_db.start_attempt(1, request_id="img-uniq", account_key="openai:uniq@openai.test", account_email="uniq@openai.test")
+
+    stats = om.bootstrap_openai_workspace_key_migration()
+    assert stats["mapping_count"] == 1, stats
+    assert sdb.quota_load("openai:acct-uniq")["email"] == "uniq@openai.test"
+    # quota_load 允许 legacy openai:<email> 在唯一 email 时兜底解析；底层 PK 必须已迁移。
+    assert conn.execute(
+        "SELECT COUNT(*) FROM oauth_quota_cache WHERE account_key=?",
+        ("openai:uniq@openai.test",),
+    ).fetchone()[0] == 0
+    assert all(r["channel_key"] == "oauth:openai:acct-uniq" for r in sdb.perf_load_all())
+    assert all(r["channel_key"] == "oauth:openai:acct-uniq" for r in sdb.error_load_all())
+    assert all(r["channel_key"] == "oauth:openai:acct-uniq" for r in sdb.affinity_load_all())
+    assert all(r["channel_key"] == "oauth:openai:acct-uniq" for r in sdb.client_affinity_load_all())
+
+    cfg = config.get()
+    assert cfg["oauthAccounts"][0]["workspace_id"] == "acct-uniq"
+    assert cfg["loadBalancing"]["priorityOrders"]["openai"] == ["oauth:openai:acct-uniq"]
+    assert cfg["loadBalancing"]["priorityOrders"]["anthropic"] == ["oauth:openai:acct-uniq"]
+    assert cfg["images"]["disabledAccounts"] == ["openai:acct-uniq", "oauth:openai:acct-uniq"]
+
+    lconn = log_db._get_conn()
+    assert lconn.execute("SELECT final_channel_key FROM request_log WHERE request_id=?", ("req-uniq",)).fetchone()[0] == "oauth:openai:acct-uniq"
+    assert lconn.execute("SELECT channel_key FROM retry_chain WHERE request_id=?", ("req-uniq",)).fetchone()[0] == "oauth:openai:acct-uniq"
+    iconn = image_db._get_conn()
+    assert iconn.execute("SELECT account_key FROM image_call_logs WHERE request_id=?", ("img-uniq",)).fetchone()[0] == "openai:acct-uniq"
+    assert iconn.execute("SELECT account_key FROM image_attempt_logs WHERE request_id=?", ("img-uniq",)).fetchone()[0] == "openai:acct-uniq"
+
+    # idempotent second run: same mapping scope skips state rows and config/log/image stay stable.
+    stats2 = om.bootstrap_openai_workspace_key_migration()
+    assert stats2["state"]["skipped"] is True
+    assert sdb.quota_load("openai:acct-uniq") is not None
+    print("  [PASS] openai workspace-key migration moves unique rows/config/logs/images idempotently")
+
+
+def test_openai_workspace_key_migration_later_unique_mapping_still_runs(m):
+    """早期映射已迁后，后续新增的 unique legacy mapping 仍能迁。"""
+    _setup(m)
+    config = m["config"]
+    om = m["oauth_manager"]
+    sdb = m["state_db"]
+
+    def seed_first(c):
+        c["oauthAccounts"] = [
+            {"email": "first@openai.test", "provider": "openai", "access_token": "a1", "refresh_token": "r1", "chatgpt_account_id": "acct-first"},
+        ]
+    config.update(seed_first)
+    sdb.quota_save_openai_snapshot("openai:first@openai.test", {"primary_used_pct": 1, "primary_window_min": 10080}, email="first@openai.test")
+    om.bootstrap_openai_workspace_key_migration()
+
+    def seed_second(c):
+        c["oauthAccounts"].append(
+            {"email": "second@openai.test", "provider": "openai", "access_token": "a2", "refresh_token": "r2", "chatgpt_account_id": "acct-second"}
+        )
+    config.update(seed_second)
+    sdb.quota_save_openai_snapshot("openai:second@openai.test", {"primary_used_pct": 2, "primary_window_min": 10080}, email="second@openai.test")
+
+    stats = om.bootstrap_openai_workspace_key_migration()
+    assert stats["mapping_count"] == 2, stats
+    assert stats["state"]["skipped"] is False, stats
+    assert sdb.quota_load("openai:acct-second")["email"] == "second@openai.test"
+    conn = sdb._get_conn()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM oauth_quota_cache WHERE account_key=?",
+        ("openai:second@openai.test",),
+    ).fetchone()[0] == 0
+    print("  [PASS] openai workspace-key migration can process later unique mappings")
+
+
+def test_openai_workspace_key_migration_skips_ambiguous_email(m):
+    """同邮箱多个 OpenAI workspace：legacy email row 不迁，legacy key 不解析。"""
+    _setup(m)
+    config = m["config"]
+    om = m["oauth_manager"]
+    sdb = m["state_db"]
+
+    def seed_cfg(c):
+        c["oauthAccounts"] = [
+            {"email": "amb@openai.test", "provider": "openai", "access_token": "a1", "refresh_token": "r1", "chatgpt_account_id": "acct-one"},
+            {"email": "amb@openai.test", "provider": "openai", "access_token": "a2", "refresh_token": "r2", "chatgpt_account_id": "acct-two"},
+        ]
+        c["loadBalancing"] = {"priorityOrders": {"openai": ["oauth:openai:amb@openai.test"]}}
+    config.update(seed_cfg)
+    sdb.quota_save_openai_snapshot("openai:amb@openai.test", {"primary_used_pct": 9, "primary_window_min": 10080}, email="amb@openai.test")
+
+    stats = om.bootstrap_openai_workspace_key_migration()
+    assert stats["mapping_count"] == 0, stats
+    assert sdb.quota_load("openai:amb@openai.test")["account_key"] == "openai:amb@openai.test"
+    assert config.get()["loadBalancing"]["priorityOrders"]["openai"] == ["oauth:openai:amb@openai.test"]
+    assert om.get_account("openai:amb@openai.test") is None
+    assert om.resolve_account_key("openai:acct-one") == "openai:acct-one"
+    print("  [PASS] openai workspace-key migration skips ambiguous same-email workspaces")
 
 # ==============================================================
 # flatten_usage 单位透传（2026-04-20 朋友反馈的 1%→100% bug 防回退）
@@ -517,7 +672,7 @@ def main():
         test_migration_drops_orphan_rows,
         # oauth_manager 联合键语义
         test_add_same_email_different_provider_ok,
-        test_add_same_email_same_provider_rejected,
+        test_add_same_email_openai_different_workspaces_ok,
         test_get_account_isolates_by_provider,
         test_delete_account_only_targets_one_of_same_email,
         test_set_enabled_only_targets_one_of_same_email,
@@ -529,6 +684,10 @@ def main():
         test_registry_get_channel_new_and_legacy_key,
         # TG menu
         test_resolve_to_account_key_upgrades_plain_email,
+        # OpenAI workspace-key migration
+        test_openai_workspace_key_migration_unique_rows_and_config,
+        test_openai_workspace_key_migration_later_unique_mapping_still_runs,
+        test_openai_workspace_key_migration_skips_ambiguous_email,
         # flatten_usage 单位透传（2026-04-20 朋友反馈 + sub2api 对齐）
         test_flatten_usage_one_percent_stays_one_percent,
         test_flatten_usage_matches_sub2api_typical_values,

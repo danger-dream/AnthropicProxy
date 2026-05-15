@@ -148,6 +148,39 @@ def checkpoint() -> None:
         pass
 
 
+def migrate_account_keys(mapping: dict[str, dict[str, str]]) -> dict:
+    """Rename OpenAI account keys in image call/attempt logs.
+
+    `mapping` maps old account_key to {"new": new_key, "email": display_email}.
+    """
+    stats = {"call_rows": 0, "attempt_rows": 0}
+    if not mapping:
+        return stats
+    with _lock:
+        conn = _get_conn()
+        for old_key, meta in mapping.items():
+            new_key = str(meta.get("new") or "")
+            email = str(meta.get("email") or "")
+            if not old_key or not new_key or old_key == new_key:
+                continue
+            cur = conn.execute(
+                """UPDATE image_call_logs
+                   SET account_key=?, account_email=COALESCE(NULLIF(?, ''), account_email)
+                   WHERE account_key=?""",
+                (new_key, email, old_key),
+            )
+            stats["call_rows"] += int(cur.rowcount or 0)
+            cur = conn.execute(
+                """UPDATE image_attempt_logs
+                   SET account_key=?, account_email=COALESCE(NULLIF(?, ''), account_email)
+                   WHERE account_key=?""",
+                (new_key, email, old_key),
+            )
+            stats["attempt_rows"] += int(cur.rowcount or 0)
+        conn.commit()
+    return stats
+
+
 def start_call(
     *,
     request_id: str,

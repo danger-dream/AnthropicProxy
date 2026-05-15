@@ -249,7 +249,7 @@ def test_bot_commands_and_callbacks(m):
     assert "欢迎使用" in msg["text"]
     kb = msg.get("reply_markup", {}).get("inline_keyboard", [])
     btns = [b["callback_data"] for row in kb for b in row if "callback_data" in b]
-    assert "menu:apikey" not in btns
+    assert "menu:apikey" in btns
     assert "menu:oauth" in btns
     assert "menu:loadbalancing" in btns
 

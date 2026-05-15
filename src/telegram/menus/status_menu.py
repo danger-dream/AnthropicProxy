@@ -313,7 +313,7 @@ def _render_fastest_family(fam: str, items: list, tps_map: dict) -> list[str]:
     for idx, (key, info) in enumerate(items):
         medal = medals[idx] if idx < len(medals) else f"{idx + 1}."
         ck, m = key.split("|", 1)
-        short = ck.split(":", 1)[1] if ":" in ck else ck
+        short = ui.channel_display_name(ck, with_family=False)
         ico = "🔐" if ck.startswith("oauth:") else "🔀"
         # 名称一行
         out.append(
@@ -370,7 +370,7 @@ def _concurrency_block(cc_cfg: dict) -> list[str]:
             else:
                 icon = "🟢"
         wait_part = f" · 排队 <b>{wt}</b>" if wt > 0 else ""
-        out.append(f"  {icon} <code>{ui.escape_html(ck)}</code> · {usage}{wait_part}")
+        out.append(f"  {icon} <code>{ui.escape_html(ui.channel_display_name(ck, with_family=True))}</code> · {usage}{wait_part}")
     if len(interesting) > 10:
         out.append(f"  <i>...还有 {len(interesting) - 10} 个未列出</i>")
     return out
