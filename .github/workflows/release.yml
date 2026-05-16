@@ -1,0 +1,116 @@
+name: Create GitHub Release
+
+# 触发：push 一个 vX.Y.Z 标签时，自动创建对应的 Release。
+# 也支持手动 dispatch 一次性补建（输入 tag 名）。
+#
+# 设计：
+# - Release body 优先使用 tag 自带的 annotation；若 tag 是 lightweight 则用
+#   该 tag 指向 commit 的 message。
+# - 同时附加 GitHub 内置的"Generate release notes"（自动归类 PR / commits）。
+# - prerelease 自动识别：tag 含 -rc / -alpha / -beta / -pre 时标 prerelease=true。
+# - 幂等：若同名 Release 已存在则跳过；不会覆盖手动创建的 Release。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补建 Release 的 tag（如 v0.14.0）"
+        required: true
+        type: string
+
+permissions:
+  contents: write   # 创建 Release 需要
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag name
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if [[ -z "$TAG" ]]; then
+            echo "❌ 解析 tag 失败" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # prerelease 判定
+          if [[ "$TAG" =~ -(rc|alpha|beta|pre|dev) ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout (with tags)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0      # 需要历史 commit 用来生成 body
+
+      - name: Build release body
+        id: body
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # 优先用 annotated tag 自己的 message（git for-each-ref）
+          MSG="$(git tag -l --format='%(contents)' "$TAG" || true)"
+          # lightweight tag 时 contents 为空，回退到 commit message
+          if [[ -z "$(echo "$MSG" | tr -d '[:space:]')" ]]; then
+            MSG="$(git log -1 --pretty=%B "$TAG")"
+          fi
+          # 删除 commit 头部那行 'vX.Y.Z: xxx' 标题（避免和 release 标题重复）
+          # 仅当首行以 v 开头并含冒号时去掉
+          FIRST_LINE="$(echo "$MSG" | head -n1)"
+          if [[ "$FIRST_LINE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            MSG="$(echo "$MSG" | tail -n +2)"
+            # 去掉紧随其后的空行
+            MSG="$(echo "$MSG" | sed -e '/./,$!d')"
+          fi
+          # 通过 multiline output 安全传递
+          {
+            echo "body<<__END_OF_BODY__"
+            echo "$MSG"
+            echo "__END_OF_BODY__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Release $TAG 已存在，跳过创建"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Release
+        if: steps.exist.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          BODY: ${{ steps.body.outputs.body }}
+          PRE: ${{ steps.tag.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          EXTRA_FLAGS=""
+          if [[ "$PRE" == "true" ]]; then
+            EXTRA_FLAGS="--prerelease"
+          fi
+          # --generate-notes 让 GitHub 自动归类 PR / commits 拼接到 body 末尾
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes "$BODY" \
+            --generate-notes \
+            $EXTRA_FLAGS
