@@ -14,7 +14,11 @@
 
   // ─── 下游 API Key（客户端调代理时用的 key） ───
   "apiKeys": {
-    "default": "ccp-d4aacba392d5b6a30cfb029049f02351b79414fee39e0efe"
+    "default": "ccp-d4aacba392d5b6a30cfb029049f02351b79414fee39e0efe",
+    "custom": {
+      "key": "sk-REPLACE_WITH_YOUR_CUSTOM_KEY",
+      "allowedModels": []
+    }
   },
 
   // ─── OAuth 账户列表 ───
@@ -159,6 +163,8 @@
   "stateDbPath": "state.db"
 }
 ```
+
+`apiKeys.<name>.key` 是下游客户端作为 Bearer / x-api-key 使用的密钥字符串。配置层不要求 `ccp-` 前缀，任意字符串都可；TG bot 自动生成时仍使用 `ccp-<48 hex>`，也可以在菜单里输入自定义 key。
 
 ## 2.2 字段语义详解
 
