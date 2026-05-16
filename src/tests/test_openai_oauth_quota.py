@@ -142,7 +142,7 @@ def test_quota_save_auto_normalize(m):
 def test_record_codex_snapshot_happy_path(m):
     _setup(m)
     _add_openai(m, "hook@openai.test")
-    acc = m["oauth_manager"].get_account("openai:acct-hook@openai.test")
+    acc = m["oauth_manager"].get_account("openai:hook@openai.test:acct-hook@openai.test")
     ch = m["OpenAIOAuthChannel"](acc)
     resp = _MockResp({
         "x-codex-primary-used-percent": "35",
@@ -151,7 +151,7 @@ def test_record_codex_snapshot_happy_path(m):
         "x-codex-secondary-window-minutes": "300",
     })
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
-    row = m["state_db"].quota_load("openai:acct-hook@openai.test")
+    row = m["state_db"].quota_load("openai:hook@openai.test:acct-hook@openai.test")
     assert row is not None and row["seven_day_util"] == 35.0
     print("  [PASS] _maybe_record_codex_snapshot writes on first call")
 
@@ -159,13 +159,13 @@ def test_record_codex_snapshot_happy_path(m):
 def test_record_codex_snapshot_throttle(m):
     _setup(m)
     _add_openai(m, "throttle@openai.test")
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-throttle@openai.test"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:throttle@openai.test:acct-throttle@openai.test"))
     resp1 = _MockResp({
         "x-codex-primary-used-percent": "10",
         "x-codex-primary-window-minutes": "10080",
     })
     m["failover"]._maybe_record_codex_snapshot(ch, resp1)
-    row1 = m["state_db"].quota_load("openai:acct-throttle@openai.test")
+    row1 = m["state_db"].quota_load("openai:throttle@openai.test:acct-throttle@openai.test")
     assert row1["seven_day_util"] == 10.0
     # 30s 内第二次调用：即使头里值变了也不应覆盖
     resp2 = _MockResp({
@@ -173,12 +173,12 @@ def test_record_codex_snapshot_throttle(m):
         "x-codex-primary-window-minutes": "10080",
     })
     m["failover"]._maybe_record_codex_snapshot(ch, resp2)
-    row2 = m["state_db"].quota_load("openai:acct-throttle@openai.test")
+    row2 = m["state_db"].quota_load("openai:throttle@openai.test:acct-throttle@openai.test")
     assert row2["seven_day_util"] == 10.0, f"throttle failed, got {row2['seven_day_util']}"
     # 手动穿过节流窗口：回退上次写时间到 30s 之前
-    m["failover"]._codex_snapshot_last["openai:acct-throttle@openai.test"] = time.time() - 31
+    m["failover"]._codex_snapshot_last["openai:throttle@openai.test:acct-throttle@openai.test"] = time.time() - 31
     m["failover"]._maybe_record_codex_snapshot(ch, resp2)
-    row3 = m["state_db"].quota_load("openai:acct-throttle@openai.test")
+    row3 = m["state_db"].quota_load("openai:throttle@openai.test:acct-throttle@openai.test")
     assert row3["seven_day_util"] == 99.0, "expected write after throttle window"
     print("  [PASS] _maybe_record_codex_snapshot throttles within 30s")
 
@@ -203,10 +203,10 @@ def test_record_skip_non_openai_channel(m):
 def test_record_skip_no_codex_headers(m):
     _setup(m)
     _add_openai(m, "noh@openai.test")
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-noh@openai.test"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:noh@openai.test:acct-noh@openai.test"))
     resp = _MockResp({"content-type": "text/event-stream"})  # 无任何 x-codex-*
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
-    row = m["state_db"].quota_load("openai:acct-noh@openai.test")
+    row = m["state_db"].quota_load("openai:noh@openai.test:acct-noh@openai.test")
     assert row is None, "should not write when headers carry no codex fields"
     print("  [PASS] _maybe_record_codex_snapshot skips when headers lack x-codex-*")
 
@@ -233,7 +233,7 @@ def test_oauth_menu_detail_openai_shows_provider_and_codex_usage(m):
     _setup(m)
     _add_openai(m, "ui@openai.test")
     # 写一条 codex snapshot
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-ui@openai.test"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:ui@openai.test:acct-ui@openai.test"))
     resp = _MockResp({
         "x-codex-primary-used-percent": "77",
         "x-codex-primary-window-minutes": "10080",
@@ -244,7 +244,7 @@ def test_oauth_menu_detail_openai_shows_provider_and_codex_usage(m):
 
     rec = _UiRecorder()
     m["ui"].api = rec
-    short = m["ui"].register_code("openai:acct-ui@openai.test")
+    short = m["ui"].register_code("openai:ui@openai.test:acct-ui@openai.test")
     m["oauth_menu"].on_view(42, 100, "cb", short)
     last = rec.last("editMessageText")
     assert last, "no editMessageText captured"
@@ -277,14 +277,14 @@ def test_oauth_menu_list_cached_openai_over_dynamic_threshold_auto_disables(m):
     })
     norm = m["openai_provider"].normalize_codex_snapshot(snap)
     m["state_db"].quota_save_openai_snapshot(
-        "openai:acct-cached@openai.test", snap, norm, email="cached@openai.test",
+        "openai:cached@openai.test:acct-cached@openai.test", snap, norm, email="cached@openai.test",
     )
 
     rec = _UiRecorder()
     m["ui"].api = rec
     m["oauth_menu"].show(42, 100, "cb")
 
-    acc = m["oauth_manager"].get_account("openai:acct-cached@openai.test")
+    acc = m["oauth_manager"].get_account("openai:cached@openai.test:acct-cached@openai.test")
     assert acc.get("disabled_reason") == "quota", acc
     text = rec.last("editMessageText")["text"]
     assert "🔒" in text
@@ -309,14 +309,14 @@ def test_oauth_menu_list_cached_openai_below_dynamic_threshold_kept_enabled(m):
     })
     norm = m["openai_provider"].normalize_codex_snapshot(snap)
     m["state_db"].quota_save_openai_snapshot(
-        "openai:acct-below@openai.test", snap, norm, email="below@openai.test",
+        "openai:below@openai.test:acct-below@openai.test", snap, norm, email="below@openai.test",
     )
 
     rec = _UiRecorder()
     m["ui"].api = rec
     m["oauth_menu"].show(42, 100, "cb")
 
-    acc = m["oauth_manager"].get_account("openai:acct-below@openai.test")
+    acc = m["oauth_manager"].get_account("openai:below@openai.test:acct-below@openai.test")
     assert acc.get("disabled_reason") is None, acc
     text = rec.last("editMessageText")["text"]
     assert "✅" in text
@@ -344,16 +344,16 @@ def test_oauth_menu_refresh_usage_openai_probe(m):
 
     rec = _UiRecorder()
     m["ui"].api = rec
-    short = m["ui"].register_code("openai:acct-ru@openai.test")
+    short = m["ui"].register_code("openai:ru@openai.test:acct-ru@openai.test")
     m["oauth_menu"].on_refresh_usage(42, 100, "cb", short)
 
     # Step 1 结果：force_refresh 更新了 token 三字段
-    acc = m["oauth_manager"].get_account("openai:acct-ru@openai.test")
+    acc = m["oauth_manager"].get_account("openai:ru@openai.test:acct-ru@openai.test")
     assert acc["access_token"] != "OLD-AT"
     assert acc["expired"] != "2026-01-01T00:00:00Z"
     assert acc["last_refresh"] != "2026-01-01T00:00:00Z"
     # Step 2 结果：probe_usage mockMode 写入 snapshot
-    row = m["state_db"].quota_load("openai:acct-ru@openai.test")
+    row = m["state_db"].quota_load("openai:ru@openai.test:acct-ru@openai.test")
     assert row is not None, "probe should have written quota snapshot"
     # mockMode 合成 primary=3% / secondary=1% → normalize 后 7d=3 / 5h=1
     assert row["seven_day_util"] == 3.0
@@ -390,12 +390,12 @@ def test_oauth_menu_refresh_usage_openai_auto_disables_over_quota(m):
     m["ui"].api = rec
     try:
         OpenAIOAuthChannel.probe_usage = _probe_100
-        short = m["ui"].register_code("openai:acct-limit@openai.test")
+        short = m["ui"].register_code("openai:limit@openai.test:acct-limit@openai.test")
         m["oauth_menu"].on_refresh_usage(42, 100, "cb", short)
     finally:
         OpenAIOAuthChannel.probe_usage = orig_probe
 
-    acc = m["oauth_manager"].get_account("openai:acct-limit@openai.test")
+    acc = m["oauth_manager"].get_account("openai:limit@openai.test:acct-limit@openai.test")
     assert acc.get("disabled_reason") == "quota", acc
     assert acc.get("enabled") is False
     assert acc.get("disabled_until"), acc
@@ -437,9 +437,9 @@ def test_oauth_menu_refresh_all_probes_openai(m):
     # 完成标识
     assert "用量刷新完成" in final_text
     # openai 账户 token 刷过；quota snapshot 也写入
-    acc = m["oauth_manager"].get_account("openai:acct-o@openai.test")
+    acc = m["oauth_manager"].get_account("openai:o@openai.test:acct-o@openai.test")
     assert acc["access_token"] != "OLD-OPENAI-AT"
-    row = m["state_db"].quota_load("openai:acct-o@openai.test")
+    row = m["state_db"].quota_load("openai:o@openai.test:acct-o@openai.test")
     assert row is not None and row["seven_day_util"] == 3.0
     print("  [PASS] oauth_menu refresh_all: openai force_refresh + probe both ran")
 
@@ -449,12 +449,12 @@ def test_probe_usage_writes_snapshot_in_mock_mode(m):
     _setup(m)
     _add_openai(m, "probe@openai.test")
     m["registry"].rebuild_from_config()
-    ch = m["registry"].get_channel("oauth:openai:acct-probe@openai.test")
+    ch = m["registry"].get_channel("oauth:openai:probe@openai.test:acct-probe@openai.test")
     import asyncio
     res = asyncio.run(ch.probe_usage())
     assert res["ok"] is True, res
     assert res.get("reason") == "mock"
-    row = m["state_db"].quota_load("openai:acct-probe@openai.test")
+    row = m["state_db"].quota_load("openai:probe@openai.test:acct-probe@openai.test")
     assert row is not None
     assert row["codex_primary_used_pct"] == 3.0
     assert row["codex_secondary_used_pct"] == 1.0
@@ -467,15 +467,15 @@ def test_delete_account_clears_codex_snapshot_throttle(m):
     """Commit 5 ⑥：account 删除时同步清 failover._codex_snapshot_last。"""
     _setup(m)
     _add_openai(m, "del@openai.test")
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-del@openai.test"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:del@openai.test:acct-del@openai.test"))
     resp = _MockResp({
         "x-codex-primary-used-percent": "5",
         "x-codex-primary-window-minutes": "10080",
     })
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
-    assert "openai:acct-del@openai.test" in m["failover"]._codex_snapshot_last
-    m["oauth_manager"].delete_account("openai:acct-del@openai.test")
-    assert "openai:acct-del@openai.test" not in m["failover"]._codex_snapshot_last
+    assert "openai:del@openai.test:acct-del@openai.test" in m["failover"]._codex_snapshot_last
+    m["oauth_manager"].delete_account("openai:del@openai.test:acct-del@openai.test")
+    assert "openai:del@openai.test:acct-del@openai.test" not in m["failover"]._codex_snapshot_last
     print("  [PASS] delete_account: forget_codex_snapshot clears throttle bucket")
 
 
@@ -498,7 +498,7 @@ def test_on_refresh_token_openai_uses_unified_path(m):
     # 预先设置 probe 节流桶，让 _detail_text_and_kb 里的 ensure_quota_fresh
     # 跳过真实 probe（模拟已有近期采样的场景）
     import time
-    m["oauth_manager"]._OPENAI_PROBE_LAST["openai:acct-rt@openai.test"] = time.time()
+    m["oauth_manager"]._OPENAI_PROBE_LAST["openai:rt@openai.test:acct-rt@openai.test"] = time.time()
 
     called = {"fetch_usage": 0, "probe_usage": 0}
     orig_fetch = m["oauth_manager"].fetch_usage
@@ -516,7 +516,7 @@ def test_on_refresh_token_openai_uses_unified_path(m):
     try:
         m["oauth_manager"].fetch_usage = _counting_fetch
         OpenAIOAuthChannel.probe_usage = _counting_probe
-        short = m["ui"].register_code("openai:acct-rt@openai.test")
+        short = m["ui"].register_code("openai:rt@openai.test:acct-rt@openai.test")
         m["oauth_menu"].on_refresh_token(42, 100, "cb", short)
     finally:
         m["oauth_manager"].fetch_usage = orig_fetch
@@ -535,7 +535,7 @@ def test_status_menu_quota_warnings_tags_openai(m):
     _add_openai(m, "warn@openai.test")
     # 写 warn 级别用量（85%）：高于 warnings 阈值 80%，低于 disable 阈值 95%
     # → 应被预警，但不被自动禁用（2026-04-20 响应头自动禁用接入后的正确边界）
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-warn@openai.test"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:warn@openai.test:acct-warn@openai.test"))
     resp = _MockResp({
         "x-codex-primary-used-percent": "85",
         "x-codex-primary-window-minutes": "10080",
@@ -543,7 +543,7 @@ def test_status_menu_quota_warnings_tags_openai(m):
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
 
     # 确认没被禁用
-    acc = m["oauth_manager"].get_account("openai:acct-warn@openai.test")
+    acc = m["oauth_manager"].get_account("openai:warn@openai.test:acct-warn@openai.test")
     assert acc.get("disabled_reason") is None, f"should not be auto-disabled at 85% (threshold 95%): {acc}"
 
     warnings = m["status_menu"]._quota_warnings(threshold_pct=80.0)

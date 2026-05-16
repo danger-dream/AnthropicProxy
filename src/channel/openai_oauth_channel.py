@@ -78,7 +78,7 @@ class OpenAIOAuthChannel(Channel):
         from ..oauth_ids import account_key as _account_key
         from .. import oauth_manager as _oauth_manager
         self.email = account["email"]
-        self.account_key = _account_key(account)   # openai:<workspace_id>
+        self.account_key = _account_key(account)   # openai:<email>:<workspace_id>
         self.key = f"oauth:{self.account_key}"
         self.workspace_id = str(account.get("workspace_id") or account.get("chatgpt_account_id") or "")
         self.workspace_name = str(account.get("workspace_name") or "")

@@ -91,9 +91,11 @@ def _canonical_key(acc: dict) -> str:
 def _matching_accounts_for_key(key: str) -> list[dict]:
     """Return config accounts matching either a canonical key or a legacy key.
 
-    OpenAI legacy keys are `openai:<email>`. They are accepted only by callers
-    that subsequently check ambiguity; this helper intentionally returns all
-    possible matches.
+    OpenAI canonical keys are `openai:<email>:<workspace_id>`.
+    Compatibility also accepts legacy `openai:<email>`, historical
+    `openai:<workspace_id>`/`openai:<chatgpt_account_id>`, and the short-lived
+    `openai:<email>:<workspace_id>:<chatgpt_account_id>` trial keys, returning
+    all matches so callers can reject ambiguous cases.
     """
     if not key:
         return []
@@ -107,9 +109,26 @@ def _matching_accounts_for_key(key: str) -> list[dict]:
         if exact:
             return exact
         if provider == "openai":
+            parts = identity.split(":")
+            if len(parts) >= 2:
+                email, workspace_id = parts[0], parts[1]
+                chatgpt_account_id = ":".join(parts[2:]) if len(parts) >= 3 else ""
+                return [
+                    acc for acc in accounts
+                    if _is_openai_acc(acc)
+                    and str(acc.get("email") or "") == email
+                    and (not workspace_id or _openai_workspace_id(acc) == workspace_id)
+                    and (not chatgpt_account_id or str(acc.get("chatgpt_account_id") or acc.get("workspace_id") or "") == chatgpt_account_id)
+                ]
             return [
                 acc for acc in accounts
-                if _is_openai_acc(acc) and acc.get("email") == identity
+                if _is_openai_acc(acc)
+                and (
+                    acc.get("email") == identity
+                    or _openai_workspace_id(acc) == identity
+                    or str(acc.get("chatgpt_account_id") or "") == identity
+                    or str(acc.get("workspace_id") or "") == identity
+                )
             ]
         return [
             acc for acc in accounts
@@ -203,7 +222,9 @@ def account_key_to_email(account_key: str) -> str:
         acc = None
     if acc is not None:
         return str(acc.get("email") or "")
-    _, identity = _split_ak(account_key)
+    provider, identity = _split_ak(account_key)
+    if provider == "openai" and ":" in identity:
+        return identity.split(":", 1)[0]
     return identity
 
 
@@ -1085,30 +1106,115 @@ def bootstrap_composite_key_migration() -> dict:
     return state_db.run_composite_key_migration(email_to_key)
 
 
-def _unique_openai_email_workspace_mapping(accounts: list[dict]) -> dict[str, dict[str, str]]:
-    by_email: dict[str, list[dict]] = {}
+def _openai_trial_or_composite_legacy_keys(acc: dict) -> list[str]:
+    """Legacy OpenAI keys that safely point to exactly this account.
+
+    Includes:
+      - old email key: openai:<email>
+      - temporary workspace key: openai:<workspace_id>
+      - short-lived trial key: openai:<email>:<workspace_id>:<chatgpt_account_id>
+    """
+    email = str(acc.get("email") or "")
+    workspace_id = _openai_workspace_id(acc)
+    chatgpt_account_id = str(acc.get("chatgpt_account_id") or workspace_id or "")
+    keys: list[str] = []
+    if email:
+        keys.append(f"openai:{email}")
+    if workspace_id:
+        keys.append(f"openai:{workspace_id}")
+    if email and workspace_id and chatgpt_account_id:
+        keys.append(f"openai:{email}:{workspace_id}:{chatgpt_account_id}")
+    return keys
+
+
+def _unique_openai_legacy_key_mapping(accounts: list[dict]) -> dict[str, dict[str, str]]:
+    """Build safe OpenAI legacy-key → canonical composite-key mappings.
+
+    Migrates old `openai:<email>`, temporary workspace-only
+    `openai:<workspace_id>`, and short-lived trial
+    `openai:<email>:<workspace_id>:<chatgpt_account_id>` keys when they map to
+    exactly one current account. Ambiguous legacy inputs are deliberately left in
+    place for state/log tables; priority lists can expand them separately.
+    """
+    candidates: dict[str, list[dict]] = {}
     for acc in accounts:
         if not _is_openai_acc(acc):
             continue
-        email = str(acc.get("email") or "")
-        if not email:
-            continue
-        by_email.setdefault(email, []).append(acc)
+        for key in _openai_trial_or_composite_legacy_keys(acc):
+            candidates.setdefault(key, []).append(acc)
 
     mapping: dict[str, dict[str, str]] = {}
-    for email, items in by_email.items():
-        if len(items) != 1:
+    for old_key, items in candidates.items():
+        canonical_keys = {_account_key(acc) for acc in items}
+        if len(items) != 1 or len(canonical_keys) != 1:
             continue
-        acc = items[0]
-        workspace_id = _openai_workspace_id(acc)
-        if not workspace_id:
-            continue
-        old_key = f"openai:{email}"
-        new_key = f"openai:{workspace_id}"
+        new_key = next(iter(canonical_keys))
         if old_key == new_key:
             continue
-        mapping[old_key] = {"new": new_key, "email": email}
+        acc = items[0]
+        mapping[old_key] = {"new": new_key, "email": str(acc.get("email") or "")}
     return mapping
+
+
+def _migrate_openai_quota_rows_by_email(accounts: list[dict]) -> dict:
+    """Migrate leftover quota rows when the row email uniquely identifies account.
+
+    This is intentionally quota-only: logs/state channel rows with workspace-only
+    keys can be historical/ambiguous, but a quota row carries its own email and
+    can therefore be mapped to email+workspace safely when that account exists.
+    """
+    stats = {"rows": 0, "errors": []}
+    by_pair = {
+        (str(acc.get("email") or ""), _openai_workspace_id(acc)): _account_key(acc)
+        for acc in accounts if _is_openai_acc(acc)
+    }
+    try:
+        for row in state_db.quota_load_all():
+            old_key = str(row.get("account_key") or "")
+            if not old_key.startswith("openai:"):
+                continue
+            if old_key in by_pair.values():
+                continue
+            email = str(row.get("email") or "")
+            _, identity = _split_ak(old_key)
+            # Only workspace-only rows are repaired here. Email-only rows are
+            # handled by normal mapping when unambiguous.
+            if ":" in identity or not email:
+                continue
+            new_key = by_pair.get((email, identity))
+            if not new_key or new_key == old_key:
+                continue
+            try:
+                stats["rows"] += state_db.quota_rename_account_key(old_key, new_key, email=email)
+            except Exception as exc:
+                stats["errors"].append(f"{old_key}->{new_key}: {exc}")
+    except Exception as exc:
+        stats["errors"].append(str(exc))
+    return stats
+
+
+def _openai_priority_expansion_mapping(accounts: list[dict]) -> dict[str, list[str]]:
+    """Map legacy priority channel keys to one or more canonical channel keys."""
+    by_key: dict[str, list[str]] = {}
+    for acc in accounts:
+        if not _is_openai_acc(acc):
+            continue
+        canonical = f"oauth:{_account_key(acc)}"
+        for key in _openai_trial_or_composite_legacy_keys(acc):
+            ch_key = f"oauth:{key}"
+            if ch_key == canonical:
+                continue
+            by_key.setdefault(ch_key, []).append(canonical)
+    out: dict[str, list[str]] = {}
+    for old, vals in by_key.items():
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for v in vals:
+            if v not in seen:
+                dedup.append(v); seen.add(v)
+        if dedup:
+            out[old] = dedup
+    return out
 
 
 def _openai_workspace_mapping_scope_key(mapping: dict[str, dict[str, str]]) -> str:
@@ -1119,19 +1225,20 @@ def _openai_workspace_mapping_scope_key(mapping: dict[str, dict[str, str]]) -> s
 
 
 def bootstrap_openai_workspace_key_migration() -> dict:
-    """Startup-safe migration from OpenAI email keys to workspace keys.
+    """Startup-safe migration from OpenAI legacy keys to composite keys.
 
-    Only unique OpenAI email mappings are migrated. If the same OpenAI email has
-    multiple workspaces, old `openai:<email>` rows are intentionally left in
-    place so no refresh or stats view silently picks the wrong workspace.
+    Only unique OpenAI legacy mappings are migrated. If the same email or
+    workspace id maps to multiple accounts, old rows are intentionally left in
+    place so no refresh or stats view silently picks the wrong workspace/account.
     """
     accounts = list(config.get().get("oauthAccounts", []))
-    mapping = _unique_openai_email_workspace_mapping(accounts)
+    mapping = _unique_openai_legacy_key_mapping(accounts)
     channel_mapping = {
         f"oauth:{old}": f"oauth:{meta['new']}"
         for old, meta in mapping.items()
         if meta.get("new")
     }
+    priority_expansion = _openai_priority_expansion_mapping(accounts)
 
     config_stats = {"accounts_patched": 0, "priority_entries": 0, "image_disabled_entries": 0}
 
@@ -1150,11 +1257,15 @@ def bootstrap_openai_workspace_key_migration() -> dict:
             new_arr: list[str] = []
             seen: set[str] = set()
             for key in arr:
-                new_key = channel_mapping.get(key, key)
-                if new_key not in seen:
-                    new_arr.append(new_key)
-                    seen.add(new_key)
-                if new_key != key:
+                expanded = priority_expansion.get(key)
+                if expanded is None:
+                    expanded = [channel_mapping.get(key, key)]
+                for candidate_key in expanded:
+                    new_key = str(candidate_key or "")
+                    if new_key and new_key not in seen:
+                        new_arr.append(new_key)
+                        seen.add(new_key)
+                if expanded != [key]:
                     config_stats["priority_entries"] += 1
             po[fam] = new_arr
 
@@ -1186,6 +1297,7 @@ def bootstrap_openai_workspace_key_migration() -> dict:
 
     state_scope_key = _openai_workspace_mapping_scope_key(mapping) if mapping else None
     state_stats = state_db.run_openai_workspace_key_migration(mapping, scope_key=state_scope_key)
+    quota_email_stats = _migrate_openai_quota_rows_by_email(accounts)
     log_stats: dict = {}
     image_stats: dict = {}
     try:
@@ -1205,6 +1317,7 @@ def bootstrap_openai_workspace_key_migration() -> dict:
         "channel_mapping": channel_mapping,
         "config": config_stats,
         "state": state_stats,
+        "quota_email": quota_email_stats,
         "logs": log_stats,
         "images": image_stats,
     }

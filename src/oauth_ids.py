@@ -2,10 +2,11 @@
 
 设计目标
 --------
-`email` 只是账户的**显示字段**，不是主键；真正的主键是联合键。
+`email` 对 Claude 仍是身份字段；OpenAI 的真正主键是复合键。
 Claude 仍使用 ``claude:<email>``；OpenAI 使用
-``openai:<workspace_id>``，其中 workspace_id 优先取 entry.workspace_id，
-其次取 entry.chatgpt_account_id，二者都缺失时才回退到旧的 email。
+``openai:<email>:<workspace_id>``。其中 workspace_id 优先取
+entry.workspace_id，缺失时回退 entry.chatgpt_account_id。两者都缺失时
+才回退旧的 ``openai:<email>``，保证老配置继续可用。
 
 调用约定
 --------
@@ -27,11 +28,7 @@ from .oauth import (
 
 
 def openai_workspace_id(acc: dict) -> str:
-    """OpenAI OAuth 逻辑身份。
-
-    `email` 对 OpenAI 只是展示字段；同一邮箱可以有多个 ChatGPT 工作区。
-    Parrot 使用上游原始 workspace/chatgpt account id 作为逻辑身份，不做 hash。
-    """
+    """OpenAI workspace/chatgpt account id for upstream headers and labels."""
     for key in ("workspace_id", "chatgpt_account_id"):
         value = str(acc.get(key) or "").strip()
         if value:
@@ -39,12 +36,39 @@ def openai_workspace_id(acc: dict) -> str:
     return ""
 
 
+def openai_account_identity_parts(acc: dict) -> tuple[str, str, str]:
+    """Return OpenAI identity fields: email/workspace/chatgpt.
+
+    The account key only uses email + normalized workspace id. The raw
+    chatgpt_account_id is still returned for compatibility checks and upstream
+    header selection, but it is not part of the canonical key because in current
+    OpenAI/Codex data it is an alias of the workspace/account selector.
+    """
+    email = str(acc.get("email") or "").strip()
+    workspace_id = str(acc.get("workspace_id") or acc.get("chatgpt_account_id") or "").strip()
+    chatgpt_account_id = str(acc.get("chatgpt_account_id") or workspace_id or "").strip()
+    return (email, workspace_id, chatgpt_account_id)
+
+
+def openai_composite_identity(acc: dict) -> str:
+    """OpenAI provider-local identity string.
+
+    New-format identity is `email:workspace_id`. Legacy metadata-poor accounts
+    intentionally stay `email` so old configs remain usable without a forced
+    relogin.
+    """
+    email, workspace_id, _chatgpt_account_id = openai_account_identity_parts(acc)
+    if workspace_id:
+        return f"{email}:{workspace_id}"
+    return email
+
+
 def account_identity(acc: dict) -> str:
     """账户 entry → provider 内部身份片段。"""
     provider = _normalize_provider(acc.get("provider") or _DEFAULT_PROVIDER)
     email = str(acc.get("email") or "")
     if provider == "openai":
-        return openai_workspace_id(acc) or email
+        return openai_composite_identity(acc)
     return email
 
 
@@ -96,8 +120,8 @@ def identity_from_channel_key(channel_key: str) -> str:
 def email_from_channel_key(channel_key: str) -> str:
     """兼容旧调用名。
 
-    对 Claude 返回 email；对 OpenAI 新 key 返回 workspace identity。真正需要
-    展示 email 的路径应回查 account entry。
+    对 Claude 返回 email；对 OpenAI 新 key 返回复合 identity。真正需要展示
+    email 的路径应回查 account entry。
     """
     return identity_from_channel_key(channel_key)
 

@@ -113,12 +113,12 @@ def test_fetch_usage_openai_goes_to_probe(m):
     _setup(m)
     _add_openai(m, "oa@o.io")
     m["registry"].rebuild_from_config()
-    usage = asyncio.run(m["oauth_manager"].fetch_usage("openai:acct-123"))
+    usage = asyncio.run(m["oauth_manager"].fetch_usage("openai:oa@o.io:acct-123"))
     # mockMode probe 合成 primary=3% / secondary=1% → 7d=3 / 5h=1
     assert usage["five_hour"]["utilization"] == 1.0
     assert usage["seven_day"]["utilization"] == 3.0
     # probe 标记被设置
-    assert "openai:acct-123" in m["oauth_manager"]._OPENAI_PROBE_LAST
+    assert "openai:oa@o.io:acct-123" in m["oauth_manager"]._OPENAI_PROBE_LAST
     print("  [PASS] fetch_usage(openai): calls probe_usage, returns synthesized structure")
 
 
@@ -129,17 +129,17 @@ def test_fetch_usage_openai_skips_when_passive_fresh(m):
     m["registry"].rebuild_from_config()
 
     # 模拟"刚被响应头采样过" → 写一行并把 last_passive_update_at 设成现在
-    m["state_db"].quota_patch_passive("openai:acct-123", {
+    m["state_db"].quota_patch_passive("openai:fresh@o.io:acct-123", {
         "five_hour_util": 10.0, "seven_day_util": 20.0,
     }, email="fresh@o.io")
 
     # 这时 fetch_usage 不应触发 probe（_OPENAI_PROBE_LAST 空 → 但 last_passive < 5min）
-    usage = asyncio.run(m["oauth_manager"].fetch_usage("openai:acct-123"))
+    usage = asyncio.run(m["oauth_manager"].fetch_usage("openai:fresh@o.io:acct-123"))
     # 应返回被动采样合成结果，而不是 probe 的 1/3
     assert usage["five_hour"]["utilization"] == 10.0, usage
     assert usage["seven_day"]["utilization"] == 20.0, usage
     # probe 标记未被设置（证明没真正 probe）
-    assert "openai:acct-123" not in m["oauth_manager"]._OPENAI_PROBE_LAST
+    assert "openai:fresh@o.io:acct-123" not in m["oauth_manager"]._OPENAI_PROBE_LAST
     print("  [PASS] fetch_usage(openai): skips probe when passive sample is fresh (<5min)")
 
 
@@ -150,21 +150,21 @@ def test_fetch_usage_openai_throttle_between_probes(m):
     m["registry"].rebuild_from_config()
 
     # 第一次：触发 probe
-    usage1 = asyncio.run(m["oauth_manager"].fetch_usage("openai:acct-123"))
+    usage1 = asyncio.run(m["oauth_manager"].fetch_usage("openai:thr@o.io:acct-123"))
     assert usage1["five_hour"]["utilization"] == 1.0
-    probe_time_1 = m["oauth_manager"]._OPENAI_PROBE_LAST["openai:acct-123"]
+    probe_time_1 = m["oauth_manager"]._OPENAI_PROBE_LAST["openai:thr@o.io:acct-123"]
 
     # 把 last_passive 设为很久以前，强制 passive 不新鲜；但 probe 桶新鲜 → 应跳过
     conn = m["state_db"]._get_conn()
     conn.execute(
         "UPDATE oauth_quota_cache SET last_passive_update_at=? WHERE account_key=?",
-        (0, "openai:acct-123"),
+        (0, "openai:thr@o.io:acct-123"),
     )
     conn.commit()
 
-    usage2 = asyncio.run(m["oauth_manager"].fetch_usage("openai:acct-123"))
+    usage2 = asyncio.run(m["oauth_manager"].fetch_usage("openai:thr@o.io:acct-123"))
     # 第二次应该返回 state_db 里的旧数据（合成出来的 five_hour/seven_day），不触发新 probe
-    probe_time_2 = m["oauth_manager"]._OPENAI_PROBE_LAST["openai:acct-123"]
+    probe_time_2 = m["oauth_manager"]._OPENAI_PROBE_LAST["openai:thr@o.io:acct-123"]
     assert probe_time_2 == probe_time_1, "probe should NOT have been triggered (throttle)"
     print("  [PASS] fetch_usage(openai): throttle bucket blocks rapid probes")
 
@@ -174,11 +174,11 @@ def test_delete_account_clears_openai_probe_bucket(m):
     _setup(m)
     _add_openai(m, "del@o.io")
     m["registry"].rebuild_from_config()
-    asyncio.run(m["oauth_manager"].fetch_usage("openai:acct-123"))
-    assert "openai:acct-123" in m["oauth_manager"]._OPENAI_PROBE_LAST
+    asyncio.run(m["oauth_manager"].fetch_usage("openai:del@o.io:acct-123"))
+    assert "openai:del@o.io:acct-123" in m["oauth_manager"]._OPENAI_PROBE_LAST
 
-    m["oauth_manager"].delete_account("openai:acct-123")
-    assert "openai:acct-123" not in m["oauth_manager"]._OPENAI_PROBE_LAST
+    m["oauth_manager"].delete_account("openai:del@o.io:acct-123")
+    assert "openai:del@o.io:acct-123" not in m["oauth_manager"]._OPENAI_PROBE_LAST
     print("  [PASS] delete_account: openai probe bucket cleared")
 
 
@@ -195,7 +195,7 @@ def test_quota_monitor_processes_openai_accounts(m):
 
     # 手动把 OpenAI probe 桶预置：表示刚 probe 过，这样 fetch_usage 节流
     # → 走 quota_load 返回空 → quota_monitor_once 视为 "ok:..."
-    m["oauth_manager"]._OPENAI_PROBE_LAST["openai:acct-123"] = time.time()
+    m["oauth_manager"]._OPENAI_PROBE_LAST["openai:thr@o.io:acct-123"] = time.time()
 
     outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
     # 两个账号都应被处理，不再出现 "skipped:openai_uses_headers"
@@ -312,7 +312,7 @@ def test_anthropic_auth_error_not_touched(m):
 def test_openai_auto_disable_primary_over_threshold(m):
     _setup(m)
     _add_openai(m, "opr@o.io")
-    acc = m["oauth_manager"].get_account("openai:acct-123")
+    acc = m["oauth_manager"].get_account("openai:opr@o.io:acct-123")
     ch = m["OpenAIOAuthChannel"](acc)
 
     resp = _FakeResp({
@@ -324,7 +324,7 @@ def test_openai_auto_disable_primary_over_threshold(m):
     })
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
 
-    acc_after = m["oauth_manager"].get_account("openai:acct-123")
+    acc_after = m["oauth_manager"].get_account("openai:opr@o.io:acct-123")
     assert acc_after["disabled_reason"] == "quota", acc_after
     assert acc_after["enabled"] is False
     print("  [PASS] openai: primary 98% (>=95) → auto-disabled")
@@ -333,7 +333,7 @@ def test_openai_auto_disable_primary_over_threshold(m):
 def test_openai_no_auto_disable_below_threshold(m):
     _setup(m)
     _add_openai(m, "ook@o.io")
-    acc = m["oauth_manager"].get_account("openai:acct-123")
+    acc = m["oauth_manager"].get_account("openai:ook@o.io:acct-123")
     ch = m["OpenAIOAuthChannel"](acc)
     resp = _FakeResp({
         "x-codex-primary-used-percent": "50",
@@ -342,7 +342,7 @@ def test_openai_no_auto_disable_below_threshold(m):
         "x-codex-secondary-window-minutes": "300",
     })
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
-    acc_after = m["oauth_manager"].get_account("openai:acct-123")
+    acc_after = m["oauth_manager"].get_account("openai:ook@o.io:acct-123")
     assert acc_after.get("disabled_reason") is None
     print("  [PASS] openai: 50/20% → no auto-disable")
 
@@ -356,7 +356,7 @@ def test_openai_auto_disable_respects_custom_threshold(m):
     m["config"].update(patch)
 
     _add_openai(m, "thresh@o.io")
-    acc = m["oauth_manager"].get_account("openai:acct-123")
+    acc = m["oauth_manager"].get_account("openai:thresh@o.io:acct-123")
     ch = m["OpenAIOAuthChannel"](acc)
     # 85% > 80% → 应该禁用
     resp = _FakeResp({
@@ -364,7 +364,7 @@ def test_openai_auto_disable_respects_custom_threshold(m):
         "x-codex-primary-window-minutes": "10080",
     })
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
-    acc_after = m["oauth_manager"].get_account("openai:acct-123")
+    acc_after = m["oauth_manager"].get_account("openai:thresh@o.io:acct-123")
     assert acc_after["disabled_reason"] == "quota"
     print("  [PASS] openai: custom disableThresholdPercent=80 honored")
 
@@ -373,15 +373,15 @@ def test_openai_user_disabled_not_touched(m):
     """user 主动禁用的账号不被响应头超限覆盖。"""
     _setup(m)
     _add_openai(m, "ud@o.io")
-    m["oauth_manager"].set_enabled("openai:acct-123", False, reason="user")
-    acc = m["oauth_manager"].get_account("openai:acct-123")
+    m["oauth_manager"].set_enabled("openai:ud@o.io:acct-123", False, reason="user")
+    acc = m["oauth_manager"].get_account("openai:ud@o.io:acct-123")
     ch = m["OpenAIOAuthChannel"](acc)
     resp = _FakeResp({
         "x-codex-primary-used-percent": "99",
         "x-codex-primary-window-minutes": "10080",
     })
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
-    acc_after = m["oauth_manager"].get_account("openai:acct-123")
+    acc_after = m["oauth_manager"].get_account("openai:ud@o.io:acct-123")
     assert acc_after["disabled_reason"] == "user"
     print("  [PASS] openai: user-disabled reason preserved")
 

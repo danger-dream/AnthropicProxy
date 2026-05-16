@@ -310,7 +310,7 @@ def test_channel_model_passthrough(m):
         # 包含：新模型 (gpt-5.5) / codex 变体 / 带 reasoning 后缀的别名
         "models": ["gpt-5.5", "gpt-5.1-codex", "gpt-5.4-high"],
     })
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-alias"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:alias@openai.test:acct-alias"))
     for name in ("gpt-5.5", "gpt-5.1-codex", "gpt-5.4-high"):
         assert ch.supports_model(name) == name, f"{name} should be supported"
     # 不在账户列表里的仍然拒绝
@@ -357,9 +357,9 @@ def test_transform_model_passthrough(m):
 def test_channel_basic(m):
     _setup(m)
     _add_openai_acc(m)
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-123"))
-    assert ch.key == "oauth:openai:acct-123"
-    assert ch.account_key == "openai:acct-123"
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    assert ch.key == "oauth:openai:o@openai.test:acct-123"
+    assert ch.account_key == "openai:o@openai.test:acct-123"
     assert ch.type == "oauth"
     assert ch.protocol == "openai-responses"
     assert ch.cc_mimicry is False
@@ -384,7 +384,7 @@ def test_channel_default_models_fallback(m):
         "chatgpt_account_id": "acct",
         # 故意不给 models
     })
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:no-models@x:acct"))
     models = ch.list_client_models()
     # 默认 5 个：gpt-5.2 / gpt-5.2-codex / gpt-5.3-codex / gpt-5.4 / gpt-5.5
     expected = {"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"}
@@ -401,7 +401,7 @@ def test_channel_default_models_fallback(m):
 def test_channel_responses_ingress(m):
     _setup(m)
     _add_openai_acc(m)
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-123"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
     body = {"model": "gpt-5.1", "input": "hi", "stream": False, "temperature": 0.3}
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1",
                                                 ingress_protocol="responses"))
@@ -427,7 +427,7 @@ def test_channel_responses_ingress(m):
 def test_channel_chat_ingress_translator(m):
     _setup(m)
     _add_openai_acc(m)
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-123"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
     body = {
         "model": "gpt-5.1",
         "messages": [{"role": "user", "content": "hi"}],
@@ -456,7 +456,7 @@ def test_channel_previous_response_id_rejected(m):
     """OAuth Codex HTTP SSE route store=false：previous_response_id 不允许直透。"""
     _setup(m)
     _add_openai_acc(m)
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-123"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
     try:
         asyncio.run(ch.build_upstream_request(
             {"model": "gpt-5.1", "input": "continue", "previous_response_id": "resp_1"},
@@ -471,7 +471,7 @@ def test_channel_previous_response_id_rejected(m):
 def test_channel_anthropic_ingress_rejected(m):
     _setup(m)
     _add_openai_acc(m)
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-123"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
     try:
         asyncio.run(ch.build_upstream_request(
             {"model": "gpt-5.1", "input": "hi"}, "gpt-5.1",
@@ -511,7 +511,7 @@ def test_registry_dispatches_by_provider(m):
     m["registry"].rebuild_from_config()
     chs = {ch.key: ch for ch in m["registry"].all_channels()}
     claude = chs["oauth:claude:c@claude.test"]
-    openai = chs["oauth:openai:acct-123"]
+    openai = chs["oauth:openai:o@openai.test:acct-123"]
     assert isinstance(claude, m["OAuthChannel"]), type(claude).__name__
     assert isinstance(openai, m["OpenAIOAuthChannel"]), type(openai).__name__
     assert claude.protocol == "anthropic"
@@ -524,15 +524,15 @@ def test_openai_oauth_channel_max_concurrent(m):
     om = m["oauth_manager"]
     m["config"].update(lambda c: c.setdefault("concurrency", {}).__setitem__("defaultMaxConcurrent", 0))
     _add_openai_acc(m, email="limited@openai.test")
-    om.update_max_concurrent("openai:acct-123", 2)
+    om.update_max_concurrent("openai:limited@openai.test:acct-123", 2)
 
     m["registry"].rebuild_from_config()
-    ch = m["registry"].get_channel("oauth:openai:acct-123")
+    ch = m["registry"].get_channel("oauth:openai:limited@openai.test:acct-123")
     assert isinstance(ch, m["OpenAIOAuthChannel"]), type(ch).__name__
     assert ch.max_concurrent == 2
 
     from src import concurrency
-    assert concurrency._get_channel_max("oauth:openai:acct-123") == 2
+    assert concurrency._get_channel_max("oauth:openai:limited@openai.test:acct-123") == 2
     print("  [PASS] OpenAI OAuth channel honors maxConcurrent")
 
 
@@ -540,7 +540,7 @@ def test_session_id_isolation_with_prompt_cache_key(m):
     """Commit 4: 下游 prompt_cache_key + api_key_name 派生上游 session_id。"""
     _setup(m)
     _add_openai_acc(m)
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-123"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
     body_a = {
         "model": "gpt-5.1",
         "input": "hi",
@@ -575,7 +575,7 @@ def test_session_id_isolation_disabled(m):
             "openai", {})["isolateSessionId"] = False
     m["config"].update(_off)
 
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-123"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
     body = {
         "model": "gpt-5.1", "input": "hi",
         "prompt_cache_key": "chat-abc", "_api_key_name": "alice",
@@ -595,7 +595,7 @@ def test_force_codex_cli_switch(m):
     """forceCodexCLI=True（默认）写死 codex UA；=False 则不设 UA。"""
     _setup(m)
     _add_openai_acc(m)
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:acct-123"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
 
     # 默认 True
     body = {"model": "gpt-5.1", "input": "hi"}

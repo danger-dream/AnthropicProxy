@@ -292,13 +292,13 @@ def test_add_account_openai_provider(m):
         "plan_type": "pro",
         "subscription_expires_at": "2026-06-01T00:00:00+00:00",
     })
-    acc = om.get_account("openai:acct-123")
+    acc = om.get_account("openai:foo@openai.test:acct-123")
     assert acc["provider"] == "openai"
     assert acc["chatgpt_account_id"] == "acct-123"
     assert acc["plan_type"] == "pro"
     assert acc["subscription_expires_at"] == "2026-06-01T00:00:00+00:00"
     assert acc["id_token"] == "header.payload.sig"
-    assert om.provider_of("openai:acct-123") == "openai"
+    assert om.provider_of("openai:foo@openai.test:acct-123") == "openai"
     print("  [PASS] add_account(provider=openai) saves openai-specific fields")
 
 
@@ -379,7 +379,7 @@ def test_refresh_notice_openai_wording(m):
         "access_token": "x", "refresh_token": "x",
         "chatgpt_account_id": "acct-1",
     })
-    txt = om._build_refresh_notice("openai:acct-1", usage_flat=None)
+    txt = om._build_refresh_notice("openai:a@x.com:acct-1", usage_flat=None)
     assert "响应头" in txt, txt
     assert "获取失败" not in txt
     # Claude 账户仍走老文案
@@ -437,7 +437,7 @@ def test_fetch_usage_openai_goes_through_probe(m):
     # 未 rebuild 注册 → 应抛 RuntimeError
     import asyncio
     try:
-        asyncio.run(om.fetch_usage("openai:acct-x"))
+        asyncio.run(om.fetch_usage("openai:x@openai.test:acct-x"))
         assert False, "expected RuntimeError (channel not registered)"
     except RuntimeError as exc:
         assert "not registered" in str(exc), str(exc)
@@ -445,11 +445,11 @@ def test_fetch_usage_openai_goes_through_probe(m):
     # rebuild 后 fetch_usage 应走 probe → 返回合成 dict
     from src.channel import registry as _registry
     _registry.rebuild_from_config()
-    usage = asyncio.run(om.fetch_usage("openai:acct-x"))
+    usage = asyncio.run(om.fetch_usage("openai:x@openai.test:acct-x"))
     assert "five_hour" in usage and "seven_day" in usage
     # ensure_quota_fresh 对 openai 新路径：若 probe 节流桶已更新则跳过，正常返回 False（被节流）
     # 这里刚 probe 过 → 下一次 ensure_quota_fresh 应被 openai probe 节流跳过
-    ok = asyncio.run(om.ensure_quota_fresh("openai:acct-x", timeout_s=1.0))
+    ok = asyncio.run(om.ensure_quota_fresh("openai:x@openai.test:acct-x", timeout_s=1.0))
     # 在 quotaMonitor.enabled 默认场景下可能返回 False（被 _should_skip_access_refresh）
     # 或 True（正常执行）——都可接受，不做硬断言
     print("  [PASS] fetch_usage openai: unified path (probe + synthesized dict)")

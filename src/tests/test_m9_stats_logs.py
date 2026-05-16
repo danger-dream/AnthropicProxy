@@ -356,7 +356,7 @@ def test_logs_detail_short_expired(m):
 
 def test_openai_workspace_id_hidden_in_stats_and_logs(m):
     _setup(m)
-    raw_key = "oauth:openai:acct-raw-hidden"
+    raw_key = "oauth:openai:o@openai.test:acct-raw-hidden"
     _insert_success(m, "OID1", "k1", "gpt-5.1", raw_key, "oauth")
 
     rec = _install_recorder(m)

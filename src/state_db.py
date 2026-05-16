@@ -440,6 +440,21 @@ def rename_oauth_identity(old_account_key: str, new_account_key: str, *,
                     (new_account_key,),
                 ).fetchone()
                 if new is not None:
+                    old_ts = max(int(old["fetched_at"] or 0), int(old["last_passive_update_at"] or 0))
+                    new_ts = max(int(new["fetched_at"] or 0), int(new["last_passive_update_at"] or 0))
+                    if old_ts > new_ts:
+                        cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
+                        values = [
+                            new_account_key if c == "account_key"
+                            else email if c == "email" and email is not None
+                            else old[c]
+                            for c in cols
+                        ]
+                        assignments = ",".join([f"{c}=?" for c in cols])
+                        conn.execute(
+                            f"UPDATE oauth_quota_cache SET {assignments} WHERE account_key=?",
+                            values + [new_account_key],
+                        )
                     conn.execute(
                         "DELETE FROM oauth_quota_cache WHERE account_key=?",
                         (old_account_key,),
@@ -489,11 +504,13 @@ def openai_workspace_key_migration_scope_done(scope_key: str) -> bool:
 
 def run_openai_workspace_key_migration(old_to_new: dict[str, dict[str, str]], *,
                                         scope_key: str | None = None) -> dict:
-    """Idempotently migrate OpenAI state keys from email to workspace identity.
+    """Idempotently migrate OpenAI state keys from legacy to composite identity.
 
-    `old_to_new` maps old account_key (`openai:<email>`) to a dict containing
-    `new` (`openai:<workspace_id>`) and `email`. The caller only includes unique
-    email mappings, so ambiguous email rows are deliberately left untouched.
+    `old_to_new` maps old account_key (`openai:<email>` or historical
+    `openai:<workspace_id>` / `openai:<email>:<workspace_id>:<chatgpt_account_id>`)
+    to a dict containing `new` (`openai:<email>:<workspace_id>`) and display `email`.
+    The caller only includes unique mappings, so ambiguous rows are deliberately
+    left untouched.
     """
     stats = {
         "quota_rows": 0,
@@ -538,6 +555,21 @@ def run_openai_workspace_key_migration(old_to_new: dict[str, dict[str, str]], *,
                         (new_key,),
                     ).fetchone()
                     if new is not None:
+                        old_ts = max(int(old["fetched_at"] or 0), int(old["last_passive_update_at"] or 0))
+                        new_ts = max(int(new["fetched_at"] or 0), int(new["last_passive_update_at"] or 0))
+                        if old_ts > new_ts:
+                            cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
+                            values = [
+                                new_key if c == "account_key"
+                                else email if c == "email"
+                                else old[c]
+                                for c in cols
+                            ]
+                            assignments = ",".join([f"{c}=?" for c in cols])
+                            conn.execute(
+                                f"UPDATE oauth_quota_cache SET {assignments} WHERE account_key=?",
+                                values + [new_key],
+                            )
                         conn.execute(
                             "DELETE FROM oauth_quota_cache WHERE account_key=?",
                             (old_key,),

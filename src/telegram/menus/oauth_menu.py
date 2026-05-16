@@ -26,7 +26,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from ... import affinity, config, cooldown, load_balancing, log_db, oauth_errors, oauth_manager, state_db
-from ...oauth_ids import account_key as _account_key, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
+from ...oauth_ids import account_key as _account_key, openai_account_identity_parts as _openai_identity_parts, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
 from ...oauth import openai as openai_provider
 from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
 from .. import states, ui
@@ -1627,14 +1627,20 @@ def _find_openai_account_by_email(email: str) -> dict | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def _find_openai_account_by_workspace(entry: dict) -> dict | None:
-    wanted = _openai_workspace_id(entry)
-    if not wanted:
+def _find_openai_account_by_identity(entry: dict) -> dict | None:
+    """Find an existing OpenAI account by the full email+workspace identity."""
+    email, workspace_id, chatgpt_account_id = _openai_identity_parts(entry)
+    if not (workspace_id or chatgpt_account_id):
         return None
     for acc in oauth_manager.list_accounts():
         if oauth_manager.provider_of(acc) != "openai":
             continue
-        if _openai_workspace_id(acc) == wanted:
+        acc_email, acc_workspace_id, acc_chatgpt_account_id = _openai_identity_parts(acc)
+        if (
+            acc_email == email
+            and acc_workspace_id == workspace_id
+            and acc_chatgpt_account_id == chatgpt_account_id
+        ):
             return acc
     return None
 
@@ -1648,7 +1654,7 @@ def _find_openai_existing_for_entry(entry: dict) -> dict | None:
     no workspace/chatgpt account id.
     """
     if _openai_workspace_id(entry):
-        return _find_openai_account_by_workspace(entry)
+        return _find_openai_account_by_identity(entry)
     return _find_openai_account_by_email(entry.get("email", ""))
 
 

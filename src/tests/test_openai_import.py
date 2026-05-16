@@ -125,7 +125,7 @@ def test_import_duplicate_both_valid_keeps_existing(m):
 
     assert action == "skipped"
     assert "现有 token 有效" in msg
-    acc = om.get_account("openai:acct-same")
+    acc = om.get_account("openai:same@example.com:acct-same")
     assert acc is not None
     # 验证现有账号仍可用且没有被替换为导入 token。
     assert acc["refresh_token"] != "new-valid-refresh-token-yyyyyyyy"
@@ -149,8 +149,8 @@ def test_import_same_email_different_workspace_adds_new_account(m):
     action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(personal_entry)
 
     assert action == "added"
-    assert om.get_account("openai:acct-team") is not None
-    assert om.get_account("openai:acct-personal") is not None
+    assert om.get_account("openai:same@example.com:acct-team") is not None
+    assert om.get_account("openai:same@example.com:acct-personal") is not None
     accounts = [a for a in om.list_accounts() if a.get("email") == "same@example.com"]
     assert len(accounts) == 2
 
@@ -186,7 +186,7 @@ def test_import_duplicate_existing_invalid_replaces_with_imported(m, monkeypatch
 
     assert action == "replaced"
     assert "现有 token 无效" in msg
-    acc = om.get_account("openai:acct-same")
+    acc = om.get_account("openai:same@example.com:acct-same")
     assert acc is not None
     assert acc["refresh_token"] == "new-good-refresh-token-yyyyyyyy"
 
@@ -221,7 +221,7 @@ def test_import_candidate_invalid_new_keeps_valid_existing(m, monkeypatch):
     assert status == "skipped"
     assert email == "same@example.com"
     assert "现有 token 有效" in msg
-    acc = om.get_account("openai:acct-same")
+    acc = om.get_account("openai:same@example.com:acct-same")
     assert acc is not None
     assert acc["refresh_token"] == "old-good-refresh-token-xxxxxxxx"
 
@@ -246,12 +246,12 @@ def test_finish_openai_add_saves_only_current_workspace_identity(m):
 
     oauth_menu._finish_openai_add(42, tok, source="login")
 
-    acc = om.get_account("openai:acct-team")
+    acc = om.get_account("openai:same@example.com:acct-team")
     assert acc is not None
     assert acc["chatgpt_account_id"] == "acct-team"
     assert acc["organization_id"] == "org-team"
     assert acc["plan_type"] == "team"
-    assert om.get_account("openai:acct-personal") is None
+    assert om.get_account("openai:same@example.com:acct-personal") is None
     sent = rec.last("sendMessage")
     assert sent and "OpenAI OAuth 账户已添加" in sent["text"]
     assert "Team Space" in sent["text"]
@@ -273,10 +273,10 @@ def test_same_email_different_workspace_adds_separate_openai_account(m):
     oauth_menu._finish_openai_add(42, personal_tok, source="login")
     oauth_menu._finish_openai_add(42, team_tok, source="login")
 
-    assert om.get_account("openai:acct-personal") is not None
-    assert om.get_account("openai:acct-team") is not None
-    assert om.get_account("openai:acct-personal")["refresh_token"].startswith("rt-personal-")
-    assert om.get_account("openai:acct-team")["refresh_token"].startswith("rt-team-")
+    assert om.get_account("openai:same@example.com:acct-personal") is not None
+    assert om.get_account("openai:same@example.com:acct-team") is not None
+    assert om.get_account("openai:same@example.com:acct-personal")["refresh_token"].startswith("rt-personal-")
+    assert om.get_account("openai:same@example.com:acct-team")["refresh_token"].startswith("rt-team-")
 
 
 def test_openai_import_text_preview_sets_confirm_state(m):
