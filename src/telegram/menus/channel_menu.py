@@ -365,6 +365,7 @@ def _detail_text_and_kb(name: str) -> tuple[Optional[str], Optional[dict]]:
     lines += [
         f"🎭 CC 伪装: <code>{'开启' if ch.cc_mimicry else '关闭'}</code>",
         f"🌡 剔除 temperature: <code>{'开启' if getattr(ch, 'omit_temperature', False) else '关闭'}</code>",
+        f"🧠 剔除 thinking: <code>{'开启' if getattr(ch, 'omit_thinking', False) else '关闭'}</code>",
         f"⚡ 并发上限: <code>{getattr(ch, 'max_concurrent', 0) or '默认'}</code>",
         f"{'✅' if enabled else '⬛'} 状态: <code>{'enabled' if enabled else (ch.disabled_reason or 'disabled')}</code>",
         "",
@@ -1211,6 +1212,12 @@ def on_edit_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
         if omit_temp
         else "🌡 切换剔除 temperature（当前: 关）"
     )
+    omit_think = bool(getattr(ch, "omit_thinking", False))
+    think_label = (
+        "🧠 切换剔除 thinking（当前: 开）"
+        if omit_think
+        else "🧠 切换剔除 thinking（当前: 关）"
+    )
     protocol = _protocol_of(ch)
     rows = [
         [ui.btn("✏ 名称",   f"ch:ename:{short}"),
@@ -1222,6 +1229,7 @@ def on_edit_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
         [ui.btn(f"🔌 切换协议（当前: {_PROTOCOL_LABEL.get(protocol, protocol)}）",
                 f"ch:eproto:{short}")],
         [ui.btn(omit_label, f"ch:eomit:{short}")],
+        [ui.btn(think_label, f"ch:ethink:{short}")],
     ]
     # openai-* 家族下 CC 伪装按钮无效（内部强制 False），隐藏以减少困惑
     if protocol == "anthropic":
@@ -1428,6 +1436,25 @@ def on_edit_omit_temperature_toggle(
     current = bool(getattr(ch, "omit_temperature", False))
     try:
         registry.update_api_channel(name, {"omitTemperature": not current})
+    except Exception as exc:
+        ui.answer_cb(cb_id, "切换失败")
+        ui.send(chat_id, f"❌ 切换失败: {ui.escape_html(str(exc))}")
+        return
+    ui.answer_cb(cb_id, "已切换")
+    on_edit_menu(chat_id, message_id, "-", short)
+
+
+def on_edit_omit_thinking_toggle(
+    chat_id: int, message_id: int, cb_id: str, short: str,
+) -> None:
+    name = ui.resolve_code(short)
+    ch = registry.get_channel(f"api:{name}") if name else None
+    if ch is None:
+        ui.answer_cb(cb_id, "渠道不存在")
+        return
+    current = bool(getattr(ch, "omit_thinking", False))
+    try:
+        registry.update_api_channel(name, {"omitThinking": not current})
     except Exception as exc:
         ui.answer_cb(cb_id, "切换失败")
         ui.send(chat_id, f"❌ 切换失败: {ui.escape_html(str(exc))}")
@@ -1653,6 +1680,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         on_edit_cc_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:eomit:"):
         on_edit_omit_temperature_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:ethink:"):
+        on_edit_omit_thinking_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:emax:"):
         on_edit_max_concurrent(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:eproto:"):

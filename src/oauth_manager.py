@@ -1479,9 +1479,11 @@ def delete_account(account_key: str) -> None:
     load_balancing.sync_channel_removed(ch_key)
     state_db.perf_delete(ch_key)
     state_db.error_delete(ch_key)
-    state_db.affinity_delete_by_channel(ch_key)
+    # 走内存 + state.db 双清接口，避免只清硬盘留下内存脏亲和。
+    from . import affinity as _affinity
+    _affinity.delete_by_channel(ch_key)
     try:
-        state_db.client_affinity_delete_by_channel(ch_key)
+        _affinity.client_delete_by_channel(ch_key)
     except Exception:
         pass
     state_db.quota_delete(cleanup_key)

@@ -900,7 +900,9 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str, pag
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    affinity.delete_by_channel(f"oauth:{ak}")
+    ch_key = f"oauth:{ak}"
+    affinity.delete_by_channel(ch_key)
+    affinity.client_delete_by_channel(ch_key)
     ui.answer_cb(cb_id, "已清亲和")
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:

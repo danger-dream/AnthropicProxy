@@ -228,6 +228,7 @@ def add_api_channel(entry: dict) -> dict:
             "models": list(entry.get("models") or []),
             "cc_mimicry": bool(entry.get("cc_mimicry", default_cc)),
             "omitTemperature": bool(entry.get("omitTemperature", False)),
+            "omitThinking": bool(entry.get("omitThinking", False)),
             "maxConcurrent": int(entry.get("maxConcurrent", 0) or 0),
             "enabled": bool(entry.get("enabled", True)),
             "disabled_reason": None,
@@ -330,6 +331,8 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
             target["cc_mimicry"] = bool(patch["cc_mimicry"])
         if "omitTemperature" in patch:
             target["omitTemperature"] = bool(patch["omitTemperature"])
+        if "omitThinking" in patch:
+            target["omitThinking"] = bool(patch["omitThinking"])
         if "protocol" in patch:
             target["protocol"] = new_proto
             # 切换到 openai-* 时强制关闭 CC 伪装；切回 anthropic 保留用户原设置（若无则 True）

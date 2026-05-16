@@ -125,6 +125,29 @@ def delete_by_channel(channel_key: str) -> None:
     state_db.affinity_delete_by_channel(channel_key)
 
 
+def delete_by_protocol(protocol_family: str) -> int:
+    """按协议家族（anthropic/openai）清理 fp 亲和。返回清理数量。
+
+    用渠道注册表把所有该家族的 channel_key 找出来，逐个调
+    `state_db.affinity_delete_by_channel`，避免内存表里再额外存 protocol 字段。
+    """
+    from . import load_balancing
+    from .channel import registry
+    keys = {
+        ch.key for ch in registry.all_channels()
+        if load_balancing.family_for_channel(ch) == protocol_family
+    }
+    if not keys:
+        return 0
+    with _lock:
+        targets = [k for k, v in _entries.items() if v["channel_key"] in keys]
+        for k in targets:
+            _entries.pop(k, None)
+    for ch_key in keys:
+        state_db.affinity_delete_by_channel(ch_key)
+    return len(targets)
+
+
 def rename_channel(old_key: str, new_key: str) -> None:
     if old_key == new_key:
         return
@@ -253,6 +276,25 @@ def client_delete_by_channel(channel_key: str) -> None:
         for k in keys:
             _client_entries.pop(k, None)
     state_db.client_affinity_delete_by_channel(channel_key)
+
+
+def client_delete_by_protocol(protocol_family: str) -> int:
+    """按协议家族清理 client 亲和。返回清理数量。"""
+    from . import load_balancing
+    from .channel import registry
+    keys = {
+        ch.key for ch in registry.all_channels()
+        if load_balancing.family_for_channel(ch) == protocol_family
+    }
+    if not keys:
+        return 0
+    with _client_lock:
+        targets = [k for k, v in _client_entries.items() if v["channel_key"] in keys]
+        for k in targets:
+            _client_entries.pop(k, None)
+    for ch_key in keys:
+        state_db.client_affinity_delete_by_channel(ch_key)
+    return len(targets)
 
 
 def client_rename_channel(old_key: str, new_key: str) -> None:

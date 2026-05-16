@@ -13,7 +13,7 @@ import math
 import re
 from typing import Optional
 
-from ... import config, load_balancing
+from ... import affinity, config, load_balancing
 from ...channel import registry
 from ...oauth_ids import provider_from_channel_key
 from .. import states, ui
@@ -150,6 +150,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
         lines.extend(["", "请选择要调整的协议类型"])
         rows.append([ui.btn("🅰 Anthropic 协议", "lb:fam:anthropic")])
         rows.append([ui.btn("🅾 OpenAI 协议", "lb:fam:openai")])
+        rows.append([ui.btn("🧹 清除全部亲和", "lb:aff_all")])
     rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
     return "\n".join(lines), ui.inline_kb(rows)
 
@@ -209,7 +210,8 @@ def _edit_text_and_kb(family: str, draft: list[str], selected: set[int]) -> tupl
             ui.btn("⬇ 下移", "lb:mv:down"),
         ])
     rows.append([ui.btn("还原", "lb:reset"), ui.btn("保存设置", "lb:save")])
-    rows.append([ui.btn("批量设置", "lb:bulk")])
+    rows.append([ui.btn("批量设置", "lb:bulk"),
+                 ui.btn("🧹 清除本协议全部亲和", f"lb:aff_fam:{family}")])
     rows.append([ui.btn("◀ 返回主菜单", "menu:main"), ui.btn("取消", "lb:cancel")])
     return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
 
@@ -489,6 +491,66 @@ def _bulk_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
     _show_edit(chat_id, message_id, cb_id)
 
 
+# ─── 清除亲和（二次确认） ─────────────────────────────────────────
+
+def _aff_confirm_all(chat_id: int, message_id: int, cb_id: str) -> None:
+    fp_total = affinity.count()
+    cli_total = affinity.client_count()
+    ui.answer_cb(cb_id)
+    ui.edit(
+        chat_id, message_id,
+        (
+            "⚠️ 确认清除【<b>全部协议</b>】的所有亲和绑定？\n"
+            f"当前内存计数：fp <b>{fp_total}</b> 、 client <b>{cli_total}</b>\n"
+            "此操作会同时清 fp 亲和与 client 软亲和，下一次调度将从头选。"
+        ),
+        reply_markup=ui.inline_kb([
+            [ui.btn("✅ 确认清除全部", "lb:aff_all_exec"),
+             ui.btn("❌ 取消", "menu:loadbalancing")],
+        ]),
+    )
+
+
+def _aff_exec_all(chat_id: int, message_id: int, cb_id: str) -> None:
+    fp_total = affinity.count()
+    cli_total = affinity.client_count()
+    affinity.delete_all()
+    affinity.client_delete_all()
+    ui.answer_cb(cb_id, f"已清 fp {fp_total}、client {cli_total}")
+    show(chat_id, message_id)
+
+
+def _aff_confirm_family(chat_id: int, message_id: int, cb_id: str, family: str) -> None:
+    if family not in load_balancing.FAMILIES:
+        ui.answer_cb(cb_id, "无效协议类型")
+        return
+    ui.answer_cb(cb_id)
+    ui.edit(
+        chat_id, message_id,
+        (
+            f"⚠️ 确认清除【<b>{_FAMILY_LABELS.get(family, family)}</b>】的所有亲和绑定？\n"
+            "仅清除本协议下所有渠道的 fp 亲和 + client 软亲和。"
+        ),
+        reply_markup=ui.inline_kb([
+            [ui.btn("✅ 确认清除", f"lb:aff_fam_exec:{family}"),
+             ui.btn("❌ 取消", f"lb:fam:{family}")],
+        ]),
+    )
+
+
+def _aff_exec_family(chat_id: int, message_id: int, cb_id: str, family: str) -> None:
+    if family not in load_balancing.FAMILIES:
+        ui.answer_cb(cb_id, "无效协议类型")
+        return
+    fp_cnt = affinity.delete_by_protocol(family)
+    cli_cnt = affinity.client_delete_by_protocol(family)
+    ui.answer_cb(cb_id, f"已清 fp {fp_cnt}、client {cli_cnt}")
+    # 清完后重新进入该协议的编辑页（重新拉 draft，避免重复 answer cb）
+    draft = _normalized_keys(family)
+    _set_edit_state(chat_id, family, draft)
+    _show_edit(chat_id, message_id, cb_id=None)
+
+
 # ─── 路由 ─────────────────────────────────────────────────────────
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
@@ -516,4 +578,12 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         _bulk_retry(chat_id, message_id, cb_id); return True
     if data == "lb:bulk_cancel":
         _bulk_cancel(chat_id, message_id, cb_id); return True
+    if data == "lb:aff_all":
+        _aff_confirm_all(chat_id, message_id, cb_id); return True
+    if data == "lb:aff_all_exec":
+        _aff_exec_all(chat_id, message_id, cb_id); return True
+    if data.startswith("lb:aff_fam:"):
+        _aff_confirm_family(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("lb:aff_fam_exec:"):
+        _aff_exec_family(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     return False

@@ -77,6 +77,10 @@ class ApiChannel(Channel):
         # 新模型（如 claude-opus-4-7）废弃了 temperature 参数，传任何值都会 400。
         # 默认 False，保持现网行为不变；按渠道开启。
         self.omit_temperature = bool(entry.get("omitTemperature", False))
+        # 是否在向上游发送前剔除 thinking 字段（含相关 beta header）。
+        # 部分第三方 Claude 中转把 thinking.enabled 当不支持参数 → 400。
+        # 默认 False；按渠道开启。
+        self.omit_thinking = bool(entry.get("omitThinking", False))
         # ApiChannel 只处理 anthropic 协议；openai-* 会被 registry factory 分派到
         # src/openai/channel/api_channel.py::OpenAIApiChannel。这里做防御性 assert
         # 保证配置中的 protocol 与实际类一致，避免误配置造成难查 bug。
@@ -112,18 +116,33 @@ class ApiChannel(Channel):
             payload, dynamic_map = cc_mimicry.transform_request(body_with_model, email="")
             if self.omit_temperature:
                 payload.pop("temperature", None)
+            if self.omit_thinking:
+                payload.pop("thinking", None)
+                # thinking 关掉后 context_management.clear_thinking_* 也没意义
+                cm = payload.get("context_management")
+                if isinstance(cm, dict):
+                    edits = [e for e in (cm.get("edits") or [])
+                             if not (isinstance(e, dict) and str(e.get("type", "")).startswith("clear_thinking_"))]
+                    if edits:
+                        cm["edits"] = edits
+                    else:
+                        payload.pop("context_management", None)
             signed = cc_mimicry.sign_body(payload)
+            betas = [b for b in cc_mimicry.BETAS
+                     if not self.omit_thinking or "thinking" not in b]
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}",
                 "anthropic-version": "2023-06-01",
-                "anthropic-beta": ",".join(cc_mimicry.BETAS),
+                "anthropic-beta": ",".join(betas),
                 "User-Agent": cc_mimicry.CLI_USER_AGENT,
             }
         else:
             payload = standard.standard_transform(body_with_model)
             if self.omit_temperature:
                 payload.pop("temperature", None)
+            if self.omit_thinking:
+                payload.pop("thinking", None)
             signed = standard.serialize(payload)
             headers = {
                 "Content-Type": "application/json",
