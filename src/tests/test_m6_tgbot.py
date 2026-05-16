@@ -137,8 +137,21 @@ def test_apikey_add_flow(m):
     assert sts.get_state(100)["action"] == "ak_add_name"
     assert rec.last("editMessageText") is not None
 
-    # 合法名称输入 → 写入 config + 清状态 + 发送两条消息（key 显示 + 主菜单）
+    # 合法名称输入 → 进入生成方式选择，不立即写入 config
     ak.on_add_name_input(100, "my-app.01")
+    assert "my-app.01" not in m["config"].get()["apiKeys"]
+    assert sts.get_state(100)["action"] == "ak_add_key_input"
+    choice = rec.last("sendMessage")
+    assert choice and "生成方式" in choice["text"]
+    auto_cb = [
+        b["callback_data"]
+        for row in choice["reply_markup"]["inline_keyboard"]
+        for b in row
+        if b.get("callback_data", "").startswith("ak:add_auto:")
+    ][0]
+
+    # 选择自动生成 → 写入 config + 清状态 + 回显 key
+    ak.handle_callback(100, 50, "cb-auto", auto_cb)
     keys = m["config"].get()["apiKeys"]
     assert "my-app.01" in keys
     # 新结构：apiKeys[name] 是 dict {key, allowedModels}
@@ -148,7 +161,6 @@ def test_apikey_add_flow(m):
     assert len(entry["key"]) == 4 + 48  # ccp- + 48 hex
     assert entry["allowedModels"] == []   # 默认无限制
     assert sts.get_state(100) is None
-    # 两次 sendMessage
     assert len(rec.by_method("sendMessage")) >= 1
     print("  [PASS] apikey add flow (valid)")
 
@@ -295,9 +307,13 @@ def test_bot_state_dispatch(m):
     sts.set_state(42, "ak_add_name")
     # 发送一条文本
     bot._handle_message({"chat": {"id": 42}, "text": "via-state"})
-    # 应写入 config
-    assert "via-state" in m["config"].get()["apiKeys"]
-    # 状态被清
+    # 名称输入后进入密钥输入状态，不立即写入 config
+    assert "via-state" not in m["config"].get()["apiKeys"]
+    assert sts.get_state(42)["action"] == "ak_add_key_input"
+
+    # 再输入自定义 key 后写入 config 并清状态
+    bot._handle_message({"chat": {"id": 42}, "text": "custom-key-42"})
+    assert m["config"].get()["apiKeys"]["via-state"]["key"] == "custom-key-42"
     assert sts.get_state(42) is None
     print("  [PASS] bot text dispatches to active state handler")
 

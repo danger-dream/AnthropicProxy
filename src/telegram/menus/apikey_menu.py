@@ -4,7 +4,13 @@ callback_data 前缀：`ak:...`
 
 交互树：
   列表                      ak: list (= menu:apikey)
+  ├─ 添加名称                ak:add
+  │    ├─ 自动生成            ak:add_auto:<short>
+  │    └─ 自定义输入          ak:add_custom:<short>
   └─ 详情                   ak:view:<short>
+       ├─ 重新生成 key       ak:regen:<short>
+       │    └─ 确认覆盖       ak:regen_exec:<short>
+       ├─ 自定义新 key       ak:rekey:<short>
        ├─ 编辑允许模型       ak:perm:<short>
        │    ├─ 切换单个       ak:pt:<short>:<idx>
        │    ├─ 清空（=不限制） ak:pclr:<short>
@@ -21,6 +27,8 @@ callback_data 前缀：`ak:...`
 
 状态机:
   ak_add_name: 等待用户输入新 Key 名称
+  ak_add_key_input: 等待用户输入新 Key 的自定义密钥
+  ak_rekey_input: 等待用户输入已有 Key 的自定义新密钥
 """
 
 from __future__ import annotations
@@ -55,6 +63,7 @@ def _key_month_stats(name: str) -> Optional[dict]:
 
 _KEY_PREFIX = "ccp-"
 _NAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-\.]{1,64}$")
+_CUSTOM_KEY_PATTERN = re.compile(r"^[A-Za-z0-9\-_.~+/=]{8,256}$")
 
 
 # ─── 工具 ─────────────────────────────────────────────────────────
@@ -88,6 +97,89 @@ def _fmt_allowed(allowed: list[str]) -> str:
     if not allowed:
         return "🎯 允许: <b>全部模型</b>（无限制）"
     return f"🎯 允许: <b>{len(allowed)}</b> 个模型"
+
+
+def _all_api_key_values(exclude_name: Optional[str] = None) -> list[str]:
+    values: list[str] = []
+    for name, entry in (config.get().get("apiKeys") or {}).items():
+        if exclude_name is not None and name == exclude_name:
+            continue
+        if isinstance(entry, str):
+            key_value = entry
+        elif isinstance(entry, dict):
+            key_value = entry.get("key", "")
+        else:
+            key_value = ""
+        if key_value:
+            values.append(key_value)
+    return values
+
+
+def _validate_custom_key(key: str, existing_keys: list[str]) -> Optional[str]:
+    if len(key) < 8:
+        return "key 太短，至少 8 个字符。"
+    if len(key) > 256:
+        return "key 太长，最多 256 个字符。"
+    if not _CUSTOM_KEY_PATTERN.fullmatch(key):
+        return "key 含非法字符。仅允许可见 ASCII 字母数字和 -_.~+/=，不允许空格、换行或控制字符。"
+    if key in existing_keys:
+        return "key 已被其他 key 使用，请换一个。"
+    return None
+
+
+def _new_generated_key() -> str:
+    return f"{_KEY_PREFIX}{secrets.token_hex(24)}"
+
+
+def _create_api_key_entry(name: str, api_key: str) -> None:
+    def _mutate(cfg):
+        cfg.setdefault("apiKeys", {})[name] = {
+            "key": api_key,
+            "allowedModels": [],
+            "allowImages": False,
+        }
+    config.update(_mutate)
+
+
+def _set_api_key_value(name: str, api_key: str) -> bool:
+    updated = False
+
+    def _mutate(cfg):
+        nonlocal updated
+        keys = cfg.setdefault("apiKeys", {})
+        entry = keys.get(name)
+        if isinstance(entry, str):
+            keys[name] = {"key": api_key, "allowedModels": []}
+            updated = True
+        elif isinstance(entry, dict):
+            entry["key"] = api_key
+            updated = True
+    config.update(_mutate)
+    return updated
+
+
+def _send_created(chat_id: int, name: str, api_key: str) -> None:
+    ui.send_result(
+        chat_id,
+        "✅ <b>API Key 已创建</b>\n\n"
+        f"名称: <b>{ui.escape_html(name)}</b>\n"
+        f"Key: <code>{ui.escape_html(api_key)}</code>\n\n"
+        "<i>默认不限制模型。可在 API Key 详情页配置「允许模型」白名单。</i>",
+        back_label="◀ 返回 API Key 管理",
+        back_callback="menu:apikey",
+    )
+
+
+def _send_rekeyed(chat_id: int, name: str, api_key: str) -> None:
+    ui.send_result(
+        chat_id,
+        "✅ <b>API Key 已更新</b>\n\n"
+        f"名称: <b>{ui.escape_html(name)}</b>\n"
+        f"新 Key: <code>{ui.escape_html(api_key)}</code>\n\n"
+        "⚠ 下游客户端需要更新为新 key。",
+        back_label="◀ 返回 API Key 管理",
+        back_callback="menu:apikey",
+    )
 
 
 # ─── 允许协议相关常量 ─────────────────────────────────────────────
@@ -231,6 +323,8 @@ def _render_detail(name: str) -> tuple[Optional[str], Optional[dict]]:
     short = _short_of(name)
     img_label = "🖼 禁用图片接口" if entry.get("allowImages") else "🖼 允许图片接口"
     rows = [
+        [ui.btn("🔁 重新生成 key", f"ak:regen:{short}"),
+         ui.btn("✏ 自定义新 key", f"ak:rekey:{short}")],
         [ui.btn("🎯 编辑允许模型", f"ak:perm:{short}")],
         [ui.btn("🔌 编辑允许协议", f"ak:proto:{short}")],
         [ui.btn(img_label, f"ak:img:{short}")],
@@ -275,26 +369,147 @@ def on_add_name_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, f"❌ 名称 <code>{ui.escape_html(name)}</code> 已存在，请换一个：")
         return
 
-    api_key = f"{_KEY_PREFIX}{secrets.token_hex(24)}"
-
-    def _mutate(cfg):
-        cfg.setdefault("apiKeys", {})[name] = {
-            "key": api_key,
-            "allowedModels": [],
-            "allowImages": False,
-        }
-    config.update(_mutate)
-    states.pop_state(chat_id)
-
-    ui.send_result(
+    states.set_state(chat_id, "ak_add_key_input", {"name": name})
+    short = _short_of(name)
+    ui.send(
         chat_id,
-        "✅ <b>API Key 已创建</b>\n\n"
-        f"名称: <b>{ui.escape_html(name)}</b>\n"
-        f"Key: <code>{ui.escape_html(api_key)}</code>\n\n"
-        "<i>默认不限制模型。可在 API Key 详情页配置「允许模型」白名单。</i>",
-        back_label="◀ 返回 API Key 管理",
-        back_callback="menu:apikey",
+        "请选择 API Key 密钥生成方式：\n\n"
+        f"名称: <b>{ui.escape_html(name)}</b>",
+        reply_markup=ui.inline_kb([
+            [ui.btn("🎲 自动生成", f"ak:add_auto:{short}")],
+            [ui.btn("✏ 自定义输入", f"ak:add_custom:{short}")],
+            [ui.btn("❌ 取消", "menu:apikey")],
+        ]),
     )
+
+
+def on_add_auto(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    state = states.get_state(chat_id)
+    name = (state or {}).get("data", {}).get("name")
+    if not state or state.get("action") != "ak_add_key_input" or _name_of(short) != name:
+        ui.answer_cb(cb_id, "会话已过期")
+        show(chat_id, message_id)
+        return
+    if name in (config.get().get("apiKeys") or {}):
+        ui.answer_cb(cb_id, "名称已存在")
+        states.set_state(chat_id, "ak_add_name")
+        ui.edit(chat_id, message_id, f"❌ 名称 <code>{ui.escape_html(name)}</code> 已存在，请重新输入名称：")
+        return
+
+    api_key = _new_generated_key()
+    _create_api_key_entry(name, api_key)
+    states.pop_state(chat_id)
+    ui.answer_cb(cb_id, "已创建")
+    _send_created(chat_id, name, api_key)
+
+
+def on_add_custom(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    state = states.get_state(chat_id)
+    name = (state or {}).get("data", {}).get("name")
+    if not state or state.get("action") != "ak_add_key_input" or _name_of(short) != name:
+        ui.answer_cb(cb_id, "会话已过期")
+        show(chat_id, message_id)
+        return
+    ui.answer_cb(cb_id)
+    ui.edit(
+        chat_id, message_id,
+        "请输入自定义 key 密钥（8-256 字符）：\n\n"
+        "允许可见 ASCII 字母数字和 <code>-_.~+/=</code>；不允许空格、换行或控制字符。",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "menu:apikey")]]),
+    )
+
+
+def on_add_key_input(chat_id: int, text: str) -> None:
+    state = states.get_state(chat_id)
+    name = (state or {}).get("data", {}).get("name")
+    if not state or state.get("action") != "ak_add_key_input" or not name:
+        ui.send(chat_id, "⚠ 会话已过期，请重新添加。")
+        states.pop_state(chat_id)
+        return
+    if name in (config.get().get("apiKeys") or {}):
+        ui.send(chat_id, f"❌ 名称 <code>{ui.escape_html(name)}</code> 已存在，请重新添加。")
+        states.pop_state(chat_id)
+        return
+    api_key = text or ""
+    err = _validate_custom_key(api_key, _all_api_key_values())
+    if err:
+        ui.send(chat_id, f"❌ {ui.escape_html(err)}\n请重新输入：")
+        return
+
+    _create_api_key_entry(name, api_key)
+    states.pop_state(chat_id)
+    _send_created(chat_id, name, api_key)
+
+
+def on_regen_confirm(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    name = _name_of(short)
+    entry = _get_entry(name) if name else None
+    if entry is None:
+        ui.edit(chat_id, message_id, "⚠ 未找到该 Key（可能已被删除）",
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回", "menu:apikey")]]))
+        return
+    ui.edit(
+        chat_id, message_id,
+        f"确认为 <b>{ui.escape_html(name)}</b> 重新生成 key？\n\n"
+        "⚠ 当前 key 会被覆盖，下游客户端需要更新。",
+        reply_markup=ui.inline_kb([[
+            ui.btn("✅ 确认重新生成", f"ak:regen_exec:{short}"),
+            ui.btn("❌ 取消", f"ak:view:{short}"),
+        ]]),
+    )
+
+
+def on_regen_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    name = _name_of(short)
+    if not name or _get_entry(name) is None:
+        ui.answer_cb(cb_id, "未找到 Key")
+        show(chat_id, message_id)
+        return
+    api_key = _new_generated_key()
+    _set_api_key_value(name, api_key)
+    ui.answer_cb(cb_id, "已重新生成")
+    _send_rekeyed(chat_id, name, api_key)
+
+
+def on_rekey_enter(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    name = _name_of(short)
+    entry = _get_entry(name) if name else None
+    if entry is None:
+        ui.answer_cb(cb_id, "未找到 Key")
+        show(chat_id, message_id)
+        return
+    states.set_state(chat_id, "ak_rekey_input", {"name": name, "short": short})
+    ui.answer_cb(cb_id)
+    ui.edit(
+        chat_id,
+        message_id,
+        f"请输入 <b>{ui.escape_html(name)}</b> 的自定义新 key（8-256 字符）：\n\n"
+        "允许可见 ASCII 字母数字和 <code>-_.~+/=</code>；不允许空格、换行或控制字符。",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", f"ak:view:{short}")]]),
+    )
+
+
+def on_rekey_input(chat_id: int, text: str) -> None:
+    state = states.get_state(chat_id)
+    data = (state or {}).get("data", {})
+    name = data.get("name")
+    if not state or state.get("action") != "ak_rekey_input" or not name:
+        ui.send(chat_id, "⚠ 会话已过期，请重新操作。")
+        states.pop_state(chat_id)
+        return
+    if _get_entry(name) is None:
+        ui.send(chat_id, "⚠ 未找到该 Key（可能已被删除）。")
+        states.pop_state(chat_id)
+        return
+    api_key = text or ""
+    err = _validate_custom_key(api_key, _all_api_key_values(exclude_name=name))
+    if err:
+        ui.send(chat_id, f"❌ {ui.escape_html(err)}\n请重新输入：")
+        return
+    _set_api_key_value(name, api_key)
+    states.pop_state(chat_id)
+    _send_rekeyed(chat_id, name, api_key)
 
 
 # ─── 删除（二次确认） ────────────────────────────────────────────
@@ -664,8 +879,23 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "ak:add":
         on_add(chat_id, message_id, cb_id)
         return True
+    if data.startswith("ak:add_auto:"):
+        on_add_auto(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:add_custom:"):
+        on_add_custom(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
     if data.startswith("ak:view:"):
         on_view(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:regen_exec:"):
+        on_regen_exec(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:regen:"):
+        on_regen_confirm(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:rekey:"):
+        on_rekey_enter(chat_id, message_id, cb_id, data.split(":", 2)[2])
         return True
     if data.startswith("ak:del_exec:"):
         on_del_exec(chat_id, message_id, cb_id, data.split(":", 2)[2])
@@ -721,5 +951,11 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
     """返回 True 表示本模块消费了该输入。"""
     if action == "ak_add_name":
         on_add_name_input(chat_id, text)
+        return True
+    if action == "ak_add_key_input":
+        on_add_key_input(chat_id, text)
+        return True
+    if action == "ak_rekey_input":
+        on_rekey_input(chat_id, text)
         return True
     return False
