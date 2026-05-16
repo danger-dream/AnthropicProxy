@@ -119,7 +119,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "oauth_refresh_failed": True, # OAuth Token 自动刷新失败（标 auth_error）
             "no_channels": True,          # 无可用渠道（503）
             "openai_store_save_failed": True,  # OpenAI previous_response_id Store 写入失败
+            "status_alert": True,         # 上游 status page（Claude/OpenAI/Cloudflare）事件
+            "app_update": True,           # Parrot 本身的新版本上线提醒
         },
+    },
+    # ─── 上游 status page 监控 ─────────────────────────────────
+    # 监控 Claude / OpenAI / Cloudflare 的 statuspage incidents，
+    # 出问题/恢复时第一时间通过 TG 推送（事件键: status_alert）。
+    "statusMonitor": {
+        "enabled": True,
+        "intervalSeconds": 60,
+        "targets": ["claude", "openai", "cloudflare"],
+        "minImpact": "minor",  # none < maintenance < minor < major < critical
+    },
+    # ─── Parrot 自身版本更新检查 ─────────────────────────────
+    # 后台定时拉 GitHub Releases，发现新版本 (semver > 当前) 时通过 TG 推送
+    # + 主菜单底部 banner 提示。`ignoredVersions` 由 TG 操作写入。
+    "updateChecker": {
+        "enabled": True,
+        "intervalSeconds": 3600,
+        "includePrerelease": True,
+        "repo": "danger-dream/Parrot",
+        "ignoredVersions": [],
     },
     "cchMode": "disabled",
     "cchStaticValue": "00000",

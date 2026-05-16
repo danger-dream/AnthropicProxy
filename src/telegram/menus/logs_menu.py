@@ -50,6 +50,28 @@ def _page_rows(page: int) -> tuple[list[dict], int, int, int]:
     return rows, total, page, total_pages
 
 
+def _maybe_suffix_status_banner(text: str) -> str:
+    """在文本底部追加 banner：上游故障 + 新版本可用（任一存在即拼到末尾）。"""
+    extras: list[str] = []
+    try:
+        from ... import status_monitor
+        line = status_monitor.get_active_summary()
+        if line:
+            extras.append(line)
+    except Exception:
+        pass
+    try:
+        from ... import update_checker
+        line = update_checker.get_update_banner()
+        if line:
+            extras.append(line)
+    except Exception:
+        pass
+    if not extras:
+        return text
+    return text + "\n\n" + "\n".join(extras)
+
+
 def _render_list(rows: list[dict], *, page: int = 1, total: int | None = None, total_pages: int | None = None) -> str:
     total = len(rows) if total is None else int(total or 0)
     total_pages = max(1, int(total_pages or 1))
@@ -170,13 +192,13 @@ def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int =
     if cb_id is not None:
         ui.answer_cb(cb_id)
     rows, total, page, total_pages = _page_rows(page)
-    ui.edit(chat_id, message_id, ui.truncate(_render_list(rows, page=page, total=total, total_pages=total_pages)),
+    ui.edit(chat_id, message_id, ui.truncate(_maybe_suffix_status_banner(_render_list(rows, page=page, total=total, total_pages=total_pages))),
             reply_markup=_list_kb(rows, page=page, total_pages=total_pages))
 
 
 def send_new(chat_id: int) -> None:
     rows, total, page, total_pages = _page_rows(1)
-    ui.send(chat_id, ui.truncate(_render_list(rows, page=page, total=total, total_pages=total_pages)),
+    ui.send(chat_id, ui.truncate(_maybe_suffix_status_banner(_render_list(rows, page=page, total=total, total_pages=total_pages))),
             reply_markup=_list_kb(rows, page=page, total_pages=total_pages))
 
 

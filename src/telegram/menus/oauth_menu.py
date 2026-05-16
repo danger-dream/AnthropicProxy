@@ -486,6 +486,28 @@ def _callback_payload(short: str, page: int, filter_key: str = _FILTER_ALL) -> s
     return f"{short}:{max(1, p)}:{filter_key}"
 
 
+def _maybe_suffix_status_banner(text: str) -> str:
+    """在文本底部追加 banner：上游故障 + 新版本可用（任一存在即拼到末尾）。"""
+    extras: list[str] = []
+    try:
+        from ... import status_monitor
+        line = status_monitor.get_active_summary()
+        if line:
+            extras.append(line)
+    except Exception:
+        pass
+    try:
+        from ... import update_checker
+        line = update_checker.get_update_banner()
+        if line:
+            extras.append(line)
+    except Exception:
+        pass
+    if not extras:
+        return text
+    return text + "\n\n" + "\n".join(extras)
+
+
 def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str, dict]:
     accounts_all = oauth_manager.list_accounts()
     filter_key = _normalize_filter(filter_key)
@@ -605,7 +627,7 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
         rows.append([ui.btn(f"🧹 清除所有账户错误（{len(cd_keys_any)} 个）", clear_cb)])
     rows.append([ui.btn("🖼 图片生成", "img:show"), ui.btn("🧨 移除失效", "oa:invalid:list")])
     rows.append([ui.btn("🧩 OAuth 默认模型", "odm:show"), ui.btn("◀ 返回主菜单", "menu:main")])
-    return ui.truncate(text), ui.inline_kb(rows)
+    return ui.truncate(_maybe_suffix_status_banner(text)), ui.inline_kb(rows)
 
 
 def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1, filter_key: str = _FILTER_ALL) -> None:

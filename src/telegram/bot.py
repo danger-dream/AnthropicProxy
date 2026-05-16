@@ -23,7 +23,7 @@ from . import states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
     logs_menu, mapping_menu, oauth_defaults_menu, oauth_menu, stats_menu,
-    status_menu, system_menu,
+    status_alert_menu, status_menu, system_menu, update_menu,
 )
 from .menus import main as main_menu
 
@@ -258,6 +258,14 @@ def _handle_callback(cb: dict) -> None:
     if logs_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
+    # 故障订阅菜单
+    if status_alert_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
+
+    # 版本更新菜单
+    if update_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
+
     # 系统设置菜单
     if system_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
@@ -313,6 +321,10 @@ def _handle_message(msg: dict) -> None:
             return
         if load_balancing_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by load_balancing_menu (action={action})")
+            return
+        if status_alert_menu.handle_text_state(chat_id, action, text):
+            return
+        if update_menu.handle_text_state(chat_id, action, text):
             return
         if system_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by system_menu (action={action})")

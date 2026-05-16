@@ -631,6 +631,28 @@ def _kb(period: str, dim: str) -> dict:
 
 # ─── 编排 + 入口 ─────────────────────────────────────────────────
 
+def _maybe_suffix_status_banner(text: str) -> str:
+    """在文本底部追加 banner：上游故障 + 新版本可用（任一存在即拼到末尾）。"""
+    extras: list[str] = []
+    try:
+        from ... import status_monitor
+        line = status_monitor.get_active_summary()
+        if line:
+            extras.append(line)
+    except Exception:
+        pass
+    try:
+        from ... import update_checker
+        line = update_checker.get_update_banner()
+        if line:
+            extras.append(line)
+    except Exception:
+        pass
+    if not extras:
+        return text
+    return text + "\n\n" + "\n".join(extras)
+
+
 def _compose(period: str, dim: str) -> tuple[str, dict]:
     """统一渲染：返回 (text, kb)。失败时返回错误页 (text, kb)。"""
     if period not in _VALID_PERIODS:
@@ -696,7 +718,7 @@ def view(chat_id: int, message_id: int, cb_id: str,
          period: str = "0", dim: str = "all") -> None:
     ui.answer_cb(cb_id)
     text, kb = _compose(period, dim)
-    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    ui.edit(chat_id, message_id, _maybe_suffix_status_banner(text), reply_markup=kb)
 
 
 def show(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -706,7 +728,7 @@ def show(chat_id: int, message_id: int, cb_id: str) -> None:
 def send_new(chat_id: int) -> None:
     """命令入口：直接 send 一条新消息。"""
     text, kb = _compose("0", "all")
-    ui.send(chat_id, text, reply_markup=kb)
+    ui.send(chat_id, _maybe_suffix_status_banner(text), reply_markup=kb)
 
 
 # ─── 路由 ─────────────────────────────────────────────────────────

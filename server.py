@@ -28,7 +28,7 @@ from src import (
     __version__,
     affinity, auth, config, cooldown, errors, failover,
     fingerprint, image_db, log_db, model_mapping, notifier, oauth_manager, probe,
-    public_ip, scheduler, scorer, state_db, upstream,
+    public_ip, scheduler, scorer, state_db, status_monitor, update_checker, upstream,
 )
 from src.channel import registry
 from src.client_ip import get_client_ip
@@ -223,6 +223,8 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
     _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
     _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
+    _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
+    _background_tasks.append(asyncio.create_task(update_checker.update_loop()))
     _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
 
     try:

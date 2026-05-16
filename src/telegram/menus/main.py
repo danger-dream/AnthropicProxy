@@ -190,6 +190,28 @@ def _lifetime_stats_block() -> list[str]:
     return lines
 
 
+def _maybe_suffix_status_banner(text: str) -> str:
+    """在文本底部追加 banner：上游故障 + 新版本可用（任一存在即拼到末尾）。"""
+    extras: list[str] = []
+    try:
+        from ... import status_monitor
+        line = status_monitor.get_active_summary()
+        if line:
+            extras.append(line)
+    except Exception:
+        pass
+    try:
+        from ... import update_checker
+        line = update_checker.get_update_banner()
+        if line:
+            extras.append(line)
+    except Exception:
+        pass
+    if not extras:
+        return text
+    return text + "\n\n" + "\n".join(extras)
+
+
 def _compose_text() -> str:
     cfg = config.get()
     empty = (
@@ -198,8 +220,8 @@ def _compose_text() -> str:
         and not (cfg.get("apiKeys") or {})
     )
     if empty:
-        return _first_run_banner()
-    return _overview()
+        return _maybe_suffix_status_banner(_first_run_banner())
+    return _maybe_suffix_status_banner(_overview())
 
 
 def show(chat_id: int) -> None:

@@ -57,6 +57,8 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("🔔 通知设置", "sys:show:notif")],
         [ui.btn("🛡 首包黑名单", "sys:show:blacklist"),
          ui.btn("⚡ 并发限制", "sys:show:concurrency")],
+        [ui.btn("📡 故障订阅", "menu:status_alert"),
+         ui.btn("🆕 版本更新", "menu:update")],
         [ui.btn("◀ 返回主菜单", "menu:main")],
     ])
     return text, kb
