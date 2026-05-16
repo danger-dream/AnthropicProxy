@@ -180,7 +180,7 @@ def _extract_org_id_from_token(token: str | None) -> str:
 def _extract_plan_type(account: dict) -> str:
     acct = account.get("account")
     if isinstance(acct, dict):
-        plan = acct.get("plan_type")
+        plan = acct.get("plan_type") or acct.get("subscription_plan")
         if isinstance(plan, str) and plan:
             return plan
     ent = account.get("entitlement")
@@ -200,7 +200,7 @@ def _extract_subscription_expires_at(account: dict) -> str:
     return ""
 
 
-def _extract_account_workspace_id(account: dict) -> str:
+def _extract_account_workspace_id(account: dict, *, account_id: str = "") -> str:
     for key in ("workspace_id", "chatgpt_account_id", "account_id"):
         value = account.get(key)
         if isinstance(value, str) and value:
@@ -211,6 +211,17 @@ def _extract_account_workspace_id(account: dict) -> str:
             value = acct.get(key)
             if isinstance(value, str) and value:
                 return value
+    workspace = account.get("workspace")
+    if isinstance(workspace, dict):
+        for key in ("workspace_id", "chatgpt_account_id", "account_id", "id"):
+            value = workspace.get(key)
+            if isinstance(value, str) and value:
+                return value
+    # accounts/check 的 accounts 通常是 workspace/account id → payload 的映射，
+    # 真实 workspace id 可能只出现在映射 key 上；但 org-* key 是组织 id，
+    # 不能拿来当 chatgpt-account-id。
+    if account_id and not str(account_id).startswith("org-"):
+        return str(account_id)
     return ""
 
 
@@ -218,7 +229,7 @@ def _extract_workspace_name(account: dict) -> str:
     for obj in (account.get("workspace"), account.get("account"), account):
         if not isinstance(obj, dict):
             continue
-        for key in ("workspace_name", "name", "title"):
+        for key in ("workspace_name", "account_name", "display_name", "name", "title"):
             value = obj.get(key)
             if isinstance(value, str) and value:
                 return value
@@ -245,55 +256,57 @@ def _infer_workspace_type(*, plan_type: str = "", account: dict | None = None,
 
 
 def _extract_email_from_account(account: dict) -> str:
-    acct = account.get("account")
-    if isinstance(acct, dict):
-        email = acct.get("email")
-        if isinstance(email, str) and email:
-            return email
-    user = account.get("user")
-    if isinstance(user, dict):
-        email = user.get("email")
+    for obj in (account, account.get("account"), account.get("user"), account.get("profile")):
+        if not isinstance(obj, dict):
+            continue
+        email = obj.get("email")
         if isinstance(email, str) and email:
             return email
     return ""
 
 
-def _account_check_candidate(account: dict) -> dict:
+def _account_check_candidate(account: dict, *, account_id: str = "") -> dict:
     plan_type = _extract_plan_type(account)
-    workspace_id = _extract_account_workspace_id(account)
+    workspace_id = _extract_account_workspace_id(account, account_id=account_id)
     org_id = str(account.get("organization_id") or account.get("org_id") or "")
+    if not org_id:
+        for obj in (account.get("account"), account.get("workspace")):
+            if not isinstance(obj, dict):
+                continue
+            org_id = str(obj.get("organization_id") or obj.get("org_id") or "")
+            if org_id:
+                break
     if not org_id and str(account.get("id") or "").startswith("org-"):
         org_id = str(account.get("id") or "")
+    if not org_id and str(account_id or "").startswith("org-"):
+        org_id = str(account_id or "")
     return {
         "workspace_id": workspace_id,
+        "chatgpt_account_id": workspace_id,
         "workspace_name": _extract_workspace_name(account),
         "workspace_type": _infer_workspace_type(plan_type=plan_type, account=account),
         "organization_id": org_id,
         "plan_type": plan_type,
         "subscription_expires_at": _extract_subscription_expires_at(account),
         "email": _extract_email_from_account(account),
+        "is_default": bool((account.get("account") or {}).get("is_default"))
+        if isinstance(account.get("account"), dict) else False,
     }
 
 
 def _candidate_matches(info: dict, *, workspace_id: str = "", org_id: str = "") -> bool:
     if workspace_id and str(info.get("workspace_id") or "") == workspace_id:
         return True
+    if workspace_id and str(info.get("chatgpt_account_id") or "") == workspace_id:
+        return True
     if org_id and str(info.get("organization_id") or "") == org_id:
         return True
     return False
 
 
-def fetch_accounts_check_sync(access_token: str, *, org_id: str | None = None,
-                              workspace_id: str | None = None) -> dict | None:
-    """调用 ChatGPT accounts/check 补全 plan / subscription 信息。
-
-    这是 best-effort 辅助能力：失败、结构不符合预期、无 plan 时均返回 None，
-    调用方继续使用 id_token 里的信息，不影响 token 刷新主流程。
-    """
+def _fetch_accounts_check_payload_sync(access_token: str) -> dict | None:
     if not access_token or _mock_mode_enabled():
         return None
-    org_id = str(org_id or _extract_org_id_from_token(access_token) or "")
-    workspace_id = str(workspace_id or "")
     try:
         resp = httpx.get(
             ACCOUNTS_CHECK_URL,
@@ -307,49 +320,100 @@ def fetch_accounts_check_sync(access_token: str, *, org_id: str | None = None,
             timeout=_ACCOUNTS_CHECK_TIMEOUT,
         )
         resp.raise_for_status()
-        payload = resp.json()
+        return resp.json()
     except Exception:
         return None
 
+
+def _accounts_check_candidates(payload: dict, *, email: str | None = None) -> list[dict]:
+    """把 accounts/check payload 规范化为候选列表。
+
+    仅供选择“当前 token 对应 workspace”的补全信息使用；不会在保存层全量展开。
+    """
     accounts = payload.get("accounts") if isinstance(payload, dict) else None
     if not isinstance(accounts, dict):
-        return None
+        return []
 
+    wanted_email = str(email or "").strip().lower()
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw_id, raw in accounts.items():
+        if not isinstance(raw, dict):
+            continue
+        info = _account_check_candidate(raw, account_id=str(raw_id or ""))
+        cand_email = str(info.get("email") or "").strip().lower()
+        if wanted_email and cand_email and cand_email != wanted_email:
+            continue
+        # 至少要有一个可用识别字段；否则上层无法安全匹配当前 workspace。
+        if not (info.get("workspace_id") or info.get("organization_id") or info.get("plan_type")):
+            continue
+        key = (
+            str(info.get("workspace_id") or ""),
+            str(info.get("organization_id") or ""),
+            str(info.get("plan_type") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(info)
+    return out
+
+
+def _select_accounts_check_candidate(candidates: list[dict], *, workspace_id: str = "",
+                                     org_id: str = "") -> dict | None:
+    identity_given = bool(workspace_id or org_id)
     if workspace_id:
-        for raw in accounts.values():
-            if not isinstance(raw, dict):
-                continue
-            info = _account_check_candidate(raw)
+        for info in candidates:
             if _candidate_matches(info, workspace_id=workspace_id, org_id=""):
                 return info
 
     if org_id:
-        raw = accounts.get(org_id)
-        if isinstance(raw, dict):
-            info = _account_check_candidate(raw)
-            if info.get("plan_type"):
+        for info in candidates:
+            if _candidate_matches(info, workspace_id="", org_id=org_id):
                 return info
+
+    # 如果当前 token 已带 workspace/org 身份，但 accounts/check 没匹配上，
+    # 不要 fallback 到 default/paid/any，避免把 Personal 的 plan/name 错写到 Team。
+    if identity_given:
+        return None
 
     default_c: dict | None = None
     paid_c: dict | None = None
     any_c: dict | None = None
-    for raw in accounts.values():
-        if not isinstance(raw, dict):
-            continue
-        info = _account_check_candidate(raw)
+    for info in candidates:
         if not info.get("plan_type"):
             continue
         if _candidate_matches(info, workspace_id=workspace_id, org_id=org_id):
             return info
         if any_c is None:
             any_c = info
-        acct = raw.get("account")
-        if isinstance(acct, dict) and acct.get("is_default") is True:
+        if info.get("is_default") is True:
             default_c = info
         if str(info.get("plan_type") or "").lower() != "free" and paid_c is None:
             paid_c = info
 
     return default_c or paid_c or any_c
+
+
+def fetch_accounts_check_sync(access_token: str, *, org_id: str | None = None,
+                              workspace_id: str | None = None,
+                              email: str | None = None) -> dict | None:
+    """调用 ChatGPT accounts/check 补全 plan / subscription 信息。
+
+    这是 best-effort 辅助能力：失败、结构不符合预期、无 plan 时均返回 None，
+    调用方继续使用 id_token 里的信息，不影响 token 刷新主流程。
+    """
+    org_id = str(org_id or _extract_org_id_from_token(access_token) or "")
+    workspace_id = str(workspace_id or "")
+    payload = _fetch_accounts_check_payload_sync(access_token)
+    if not payload:
+        return None
+    candidates = _accounts_check_candidates(payload, email=email)
+    if not candidates:
+        return None
+    return _select_accounts_check_candidate(
+        candidates, workspace_id=workspace_id, org_id=org_id,
+    )
 
 
 def enrich_token_response_sync(data: dict, *, workspace_id: str | None = None,
@@ -358,8 +422,9 @@ def enrich_token_response_sync(data: dict, *, workspace_id: str | None = None,
     if not isinstance(data, dict) or not data.get("access_token"):
         return data
 
-    selected_org_id = org_id or ""
+    selected_org_id = org_id or _extract_org_id_from_token(data.get("access_token")) or ""
     selected_workspace_id = workspace_id or ""
+    selected_email = ""
     if data.get("id_token"):
         try:
             info = extract_user_info(decode_id_token(data["id_token"]))
@@ -367,20 +432,24 @@ def enrich_token_response_sync(data: dict, *, workspace_id: str | None = None,
             selected_workspace_id = selected_workspace_id or str(
                 info.get("workspace_id") or info.get("chatgpt_account_id") or ""
             )
+            selected_email = str(info.get("email") or "")
         except Exception:
             selected_org_id = selected_org_id or ""
     info = fetch_accounts_check_sync(
         data.get("access_token", ""),
         org_id=selected_org_id,
         workspace_id=selected_workspace_id,
+        email=selected_email,
     )
     if not info:
         return data
 
     enriched = dict(data)
     for key in (
-        "workspace_id", "workspace_name", "workspace_type", "organization_id",
-        "plan_type", "subscription_expires_at", "email",
+        # chatgpt_account_id/workspace_id 必须来自 token/id_token 本身；
+        # accounts/check 只用于按当前 identity 补 plan/name/subscription，不能改主键。
+        "workspace_name", "workspace_type",
+        "organization_id", "plan_type", "subscription_expires_at", "email",
     ):
         val = info.get(key)
         if val:

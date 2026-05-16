@@ -1561,6 +1561,8 @@ def _openai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict
         datetime.now(timezone.utc) + timedelta(seconds=expires_in)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    workspace_id = tok.get("workspace_id") or info.get("workspace_id") or info.get("chatgpt_account_id", "")
+    chatgpt_account_id = tok.get("chatgpt_account_id") or workspace_id or info.get("chatgpt_account_id", "")
     entry = {
         "email": email,
         "provider": "openai",
@@ -1574,8 +1576,8 @@ def _openai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict
         "disabled_until": None,
         "models": [],
         "id_token": id_token,
-        "chatgpt_account_id": info.get("chatgpt_account_id", ""),
-        "workspace_id": tok.get("workspace_id") or info.get("workspace_id") or info.get("chatgpt_account_id", ""),
+        "chatgpt_account_id": chatgpt_account_id,
+        "workspace_id": workspace_id,
         "workspace_name": tok.get("workspace_name") or info.get("workspace_name", ""),
         "workspace_type": tok.get("workspace_type") or info.get("workspace_type", ""),
         "organization_id": tok.get("organization_id") or info.get("organization_id", ""),
@@ -1592,6 +1594,7 @@ def _openai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict
         "workspace_type": entry.get("workspace_type", ""),
     }
     return entry, meta
+
 
 
 def _refresh_openai_rt_to_entry(refresh_token: str, *, email_hint: str = "",
@@ -1657,26 +1660,38 @@ def _upsert_openai_account_entry(entry: dict, *, preserve_existing_settings: boo
         return False
     target_key = _account_key(target)
     replaced = False
+    appended = False
 
     def mutate(cfg):
-        nonlocal replaced
+        nonlocal replaced, appended
         accounts = cfg.setdefault("oauthAccounts", [])
         for acc in accounts:
             if _account_key(acc) != target_key:
                 continue
             keep_models = acc.get("models")
             keep_max = acc.get("maxConcurrent")
+            # 替换已有账号时，保留账号的手动启停/配额禁用状态；token/metadata 更新。
+            keep_enabled = acc.get("enabled")
+            keep_disabled_reason = acc.get("disabled_reason")
+            keep_disabled_until = acc.get("disabled_until")
             acc.update(entry)
             if preserve_existing_settings:
                 if keep_models is not None:
                     acc["models"] = keep_models
                 if keep_max is not None:
                     acc["maxConcurrent"] = keep_max
+                if keep_enabled is not None:
+                    acc["enabled"] = keep_enabled
+                acc["disabled_reason"] = keep_disabled_reason
+                acc["disabled_until"] = keep_disabled_until
             replaced = True
             return
         accounts.append(entry)
+        appended = True
 
     config.update(mutate)
+    if appended:
+        load_balancing.sync_channel_added(f"oauth:{_account_key(entry)}", "openai")
     return replaced
 
 
@@ -1709,7 +1724,7 @@ def _save_openai_entry_with_duplicate_policy(entry: dict) -> tuple[str, str]:
 
 
 def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
-    """共用保存路径：从 id_token 解 email 等 → 按重复策略保存 → 回报。"""
+    """共用保存路径：从 token 解 email/workspace → 按重复策略保存 → 回报。"""
     try:
         entry, meta = _openai_token_to_entry(tok)
         action, action_msg = _save_openai_entry_with_duplicate_policy(entry)
@@ -1885,7 +1900,9 @@ def _import_candidate_with_policy(item: dict) -> tuple[str, str, str]:
     entry, meta, import_err = _refresh_openai_rt_to_entry(rt, email_hint=email_hint)
     if entry is not None:
         action, msg = _save_openai_entry_with_duplicate_policy(entry)
-        return action, meta.get("email") or entry.get("email") or email_hint, msg
+        workspace = meta.get("workspace_name") or meta.get("workspace_type") or "workspace"
+        plan = meta.get("plan_type") or "?"
+        return action, meta.get("email") or entry.get("email") or email_hint, f"{workspace} / {plan}；{msg}"
 
     # 新 token 无效时，还没有可信 workspace identity，只能做 legacy 兜底：
     # 同邮箱恰好一个账号时，验证现有 token；多 workspace 时 _find_openai_account_by_email

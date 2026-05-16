@@ -226,6 +226,59 @@ def test_import_candidate_invalid_new_keeps_valid_existing(m, monkeypatch):
     assert acc["refresh_token"] == "old-good-refresh-token-xxxxxxxx"
 
 
+def test_finish_openai_add_saves_only_current_workspace_identity(m):
+    _setup(m)
+    oauth_menu = m["oauth_menu"]
+    provider = m["openai_provider"]
+    om = m["oauth_manager"]
+    rec = m["ui"].api
+
+    tok = provider._mock_token_response("same@example.com", workspace_id="acct-team", org_id="org-team")
+    tok["refresh_token"] = "rt-same-" + "x" * 40
+    tok.update({
+        "chatgpt_account_id": "acct-team",
+        "workspace_id": "acct-team",
+        "workspace_name": "Team Space",
+        "workspace_type": "team",
+        "organization_id": "org-team",
+        "plan_type": "team",
+    })
+
+    oauth_menu._finish_openai_add(42, tok, source="login")
+
+    acc = om.get_account("openai:acct-team")
+    assert acc is not None
+    assert acc["chatgpt_account_id"] == "acct-team"
+    assert acc["organization_id"] == "org-team"
+    assert acc["plan_type"] == "team"
+    assert om.get_account("openai:acct-personal") is None
+    sent = rec.last("sendMessage")
+    assert sent and "OpenAI OAuth 账户已添加" in sent["text"]
+    assert "Team Space" in sent["text"]
+
+
+def test_same_email_different_workspace_adds_separate_openai_account(m):
+    _setup(m)
+    oauth_menu = m["oauth_menu"]
+    provider = m["openai_provider"]
+    om = m["oauth_manager"]
+
+    personal_tok = provider._mock_token_response("same@example.com", workspace_id="acct-personal", org_id="org-personal")
+    personal_tok["refresh_token"] = "rt-personal-" + "x" * 40
+    personal_tok.update({"chatgpt_account_id": "acct-personal", "workspace_id": "acct-personal", "plan_type": "plus"})
+    team_tok = provider._mock_token_response("same@example.com", workspace_id="acct-team", org_id="org-team")
+    team_tok["refresh_token"] = "rt-team-" + "y" * 40
+    team_tok.update({"chatgpt_account_id": "acct-team", "workspace_id": "acct-team", "plan_type": "team"})
+
+    oauth_menu._finish_openai_add(42, personal_tok, source="login")
+    oauth_menu._finish_openai_add(42, team_tok, source="login")
+
+    assert om.get_account("openai:acct-personal") is not None
+    assert om.get_account("openai:acct-team") is not None
+    assert om.get_account("openai:acct-personal")["refresh_token"].startswith("rt-personal-")
+    assert om.get_account("openai:acct-team")["refresh_token"].startswith("rt-team-")
+
+
 def test_openai_import_text_preview_sets_confirm_state(m):
     _setup(m)
     oauth_menu = m["oauth_menu"]

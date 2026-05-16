@@ -217,6 +217,50 @@ def test_accounts_check_extracts_plan_and_subscription(m):
         m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", True))
     print("  [PASS] accounts/check: extracts plan + subscription_expires_at")
 
+def test_accounts_check_selects_current_workspace_by_identity(m):
+    """accounts/check: 只选择当前 token identity 对应 workspace 作为补全信息。"""
+    p = m["openai_provider"]
+    old_get = p.httpx.get
+
+    class Resp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {
+                "accounts": {
+                    "acct-personal": {
+                        "account": {"email": "same@example.com", "plan_type": "plus", "is_default": True, "name": "Personal"},
+                        "entitlement": {"subscription_plan": "plus"},
+                    },
+                    "acct-team": {
+                        "account": {"email": "same@example.com", "plan_type": "team", "name": "Team Space"},
+                        "entitlement": {"subscription_plan": "team", "expires_at": "2026-06-01T00:00:00+00:00"},
+                    },
+                    "acct-other": {
+                        "account": {"email": "other@example.com", "plan_type": "team", "name": "Other Team"},
+                    },
+                }
+            }
+
+    def fake_get(url, *, headers=None, timeout=None):
+        assert url == p.ACCOUNTS_CHECK_URL
+        return Resp()
+
+    old_disable_env = _ap_os.environ.pop("DISABLE_OAUTH_NETWORK_CALLS", None)
+    try:
+        p.httpx.get = fake_get
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", False))
+        chosen = p.fetch_accounts_check_sync("at", workspace_id="acct-team", email="same@example.com")
+        assert chosen["workspace_id"] == "acct-team"
+        assert chosen["workspace_name"] == "Team Space"
+        assert chosen["plan_type"] == "team"
+    finally:
+        if old_disable_env is not None:
+            _ap_os.environ["DISABLE_OAUTH_NETWORK_CALLS"] = old_disable_env
+        p.httpx.get = old_get
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", True))
+    print("  [PASS] accounts/check: selects current workspace by identity")
+
 
 # ─── state_db schema 迁移 ────────────────────────────────────────
 

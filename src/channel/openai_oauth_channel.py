@@ -101,7 +101,8 @@ class OpenAIOAuthChannel(Channel):
         except (TypeError, ValueError):
             self.max_concurrent = 0
 
-        # Codex 请求必备 meta（缺失也允许注册，build 时再校验）
+        # Codex workspace meta。老版本账号可能没有该字段：继续沿用旧行为，
+        # 不主动发送 chatgpt-account-id；只有新增/重登同邮箱多 workspace 时才需要补齐。
         self.chatgpt_account_id = str(
             account.get("workspace_id") or account.get("chatgpt_account_id") or ""
         )
@@ -155,11 +156,6 @@ class OpenAIOAuthChannel(Channel):
                 "OpenAIOAuthChannel only serves openai-chat / openai-responses "
                 f"ingress; got {ingress_protocol!r}. Scheduler family filter "
                 "should have excluded this channel for anthropic ingress."
-            )
-        if not self.chatgpt_account_id:
-            raise ValueError(
-                f"OpenAI OAuth account {self.email!r} missing chatgpt_account_id; "
-                "re-login via TG bot to refresh metadata."
             )
 
         # Step A: 准备 Responses shape
@@ -271,8 +267,6 @@ class OpenAIOAuthChannel(Channel):
                 state_db.quota_save_openai_snapshot(self.account_key, snap, normalized, email=self.email)
             return {"ok": True, "reason": "mock"}
 
-        if not self.chatgpt_account_id:
-            return {"ok": False, "reason": "missing chatgpt_account_id"}
 
         # 构造最小探测请求体。走 build_upstream_request 能顺带用到 codex
         # transform（store=false / stream=true / 模型规范化 / instructions 兜底 / ...）
@@ -343,13 +337,14 @@ class OpenAIOAuthChannel(Channel):
             # Host 头：httpx 通常会按 URL 自动设置，这里显式兜底保险
             "host": "chatgpt.com",
             "authorization": f"Bearer {access_token}",
-            "chatgpt-account-id": self.chatgpt_account_id,
             "openai-beta": "responses=experimental",
             "originator": "codex_cli_rs",
             "version": CODEX_CLI_VERSION,
             "accept": "text/event-stream",
             "content-type": "application/json",
         }
+        if self.chatgpt_account_id:
+            headers["chatgpt-account-id"] = self.chatgpt_account_id
         # forceCodexCLI=True（默认）→ 强制伪装 UA；False 则不设，交给 httpx 默认
         if prov_cfg.get("forceCodexCLI", True):
             headers["user-agent"] = CODEX_CLI_USER_AGENT

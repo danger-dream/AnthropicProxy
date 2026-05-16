@@ -530,6 +530,20 @@ def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
             if acc is not None:
                 name = str(acc.get("email") or "?")
                 provider = oauth_manager.provider_of(acc)
+                if provider == "openai":
+                    same_email_count = sum(
+                        1 for item in oauth_manager.list_accounts()
+                        if oauth_manager.provider_of(item) == "openai"
+                        and str(item.get("email") or "") == name
+                    )
+                    if same_email_count > 1:
+                        workspace = str(
+                            acc.get("workspace_name")
+                            or acc.get("workspace_type")
+                            or acc.get("plan_type")
+                            or "workspace"
+                        )
+                        name = f"{name} · {workspace}"
             else:
                 name = oauth_manager.account_key_to_email(account_key) or "?"
                 provider = oauth_manager.provider_of(account_key)

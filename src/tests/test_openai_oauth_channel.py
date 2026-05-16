@@ -11,7 +11,7 @@
       * responses ingress 透传 + 强制改造 + 完整 headers
       * chat ingress 先走 chat_to_responses.translate_request 再 codex transform
       * anthropic ingress 直接抛（本家族兼容，不跨家族）
-      * chatgpt_account_id 缺失时校验错误
+      * 老版本缺 chatgpt_account_id 时继续不带该 header 请求
   - supports_model / list_client_models 覆盖账户 models 与默认 codex 列表
 
 所有 OAuth 网络调用被 mockMode 兜住（DISABLE_OAUTH_NETWORK_CALLS=1）。
@@ -483,19 +483,17 @@ def test_channel_anthropic_ingress_rejected(m):
     print("  [PASS] channel: anthropic ingress rejected with ValueError")
 
 
-def test_channel_missing_chatgpt_account_id(m):
+def test_channel_missing_chatgpt_account_id_legacy_keeps_working(m):
     _setup(m)
     _add_openai_acc(m, email="no-acct@x", chatgpt_account_id="")
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:no-acct@x"))
-    try:
-        asyncio.run(ch.build_upstream_request(
-            {"model": "gpt-5.1", "input": "hi"}, "gpt-5.1",
-            ingress_protocol="responses",
-        ))
-        raise AssertionError("expected ValueError")
-    except ValueError as exc:
-        assert "chatgpt_account_id" in str(exc)
-    print("  [PASS] channel: missing chatgpt_account_id → build fails clearly")
+    req = asyncio.run(ch.build_upstream_request(
+        {"model": "gpt-5.1", "input": "hi"}, "gpt-5.1",
+        ingress_protocol="responses",
+    ))
+    assert "chatgpt-account-id" not in req.headers
+    assert req.headers["authorization"].startswith("Bearer ")
+    print("  [PASS] channel: legacy missing chatgpt_account_id keeps working without header")
 
 
 # ─── registry 分派 ───────────────────────────────────────────────
@@ -662,7 +660,7 @@ def main():
         test_channel_chat_ingress_translator,
         test_channel_previous_response_id_rejected,
         test_channel_anthropic_ingress_rejected,
-        test_channel_missing_chatgpt_account_id,
+        test_channel_missing_chatgpt_account_id_legacy_keeps_working,
         test_registry_dispatches_by_provider,
         test_openai_oauth_channel_max_concurrent,
         test_session_id_isolation_with_prompt_cache_key,
