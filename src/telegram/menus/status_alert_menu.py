@@ -180,7 +180,7 @@ def _on_interval_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "❌ 需要 ≥10 的整数，请重新输入：")
         return
     _update_cfg({"intervalSeconds": v})
-    states.clear_state(chat_id)
+    states.pop_state(chat_id)
     ui.send(chat_id, f"✅ 轮询间隔已更新为 <code>{v}s</code>")
     send_new(chat_id)
 

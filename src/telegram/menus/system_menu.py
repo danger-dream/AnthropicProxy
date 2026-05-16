@@ -999,7 +999,7 @@ def _on_cc_queue_wait_input(chat_id: int, text: str) -> None:
     def _mut(c):
         c.setdefault("concurrency", {})["queueWaitSeconds"] = v
     config.update(_mut)
-    states.clear_state(chat_id)
+    states.pop_state(chat_id)
     ui.send(chat_id, f"✅ 队列等待已更新为 <code>{v}s</code>")
     send_new(chat_id)
 
@@ -1027,7 +1027,7 @@ def _on_cc_default_max_input(chat_id: int, text: str) -> None:
     def _mut(c):
         c.setdefault("concurrency", {})["defaultMaxConcurrent"] = v
     config.update(_mut)
-    states.clear_state(chat_id)
+    states.pop_state(chat_id)
     label = "不限" if v == 0 else str(v)
     ui.send(chat_id, f"✅ 默认最大并发数已更新为 <code>{label}</code>")
     send_new(chat_id)

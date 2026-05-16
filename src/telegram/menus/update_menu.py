@@ -153,7 +153,7 @@ def _on_interval_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "❌ 需要 ≥300 的整数（最小 5 分钟），请重新输入：")
         return
     _update_cfg({"intervalSeconds": v})
-    states.clear_state(chat_id)
+    states.pop_state(chat_id)
     ui.send(chat_id, f"✅ 检查间隔已更新为 <code>{v}s</code>")
     send_new(chat_id)
 
