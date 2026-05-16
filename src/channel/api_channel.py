@@ -73,6 +73,10 @@ class ApiChannel(Channel):
             self.max_concurrent = int(entry.get("maxConcurrent", 0) or 0)
         except (TypeError, ValueError):
             self.max_concurrent = 0
+        # 是否在向上游发送前剔除 temperature 字段。部分第三方 Claude 中转对
+        # 新模型（如 claude-opus-4-7）废弃了 temperature 参数，传任何值都会 400。
+        # 默认 False，保持现网行为不变；按渠道开启。
+        self.omit_temperature = bool(entry.get("omitTemperature", False))
         # ApiChannel 只处理 anthropic 协议；openai-* 会被 registry factory 分派到
         # src/openai/channel/api_channel.py::OpenAIApiChannel。这里做防御性 assert
         # 保证配置中的 protocol 与实际类一致，避免误配置造成难查 bug。
@@ -106,6 +110,8 @@ class ApiChannel(Channel):
         dynamic_map: Optional[dict] = None
         if self.cc_mimicry:
             payload, dynamic_map = cc_mimicry.transform_request(body_with_model, email="")
+            if self.omit_temperature:
+                payload.pop("temperature", None)
             signed = cc_mimicry.sign_body(payload)
             headers = {
                 "Content-Type": "application/json",
@@ -116,6 +122,8 @@ class ApiChannel(Channel):
             }
         else:
             payload = standard.standard_transform(body_with_model)
+            if self.omit_temperature:
+                payload.pop("temperature", None)
             signed = standard.serialize(payload)
             headers = {
                 "Content-Type": "application/json",

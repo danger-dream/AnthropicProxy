@@ -669,3 +669,12 @@ if len(text) > 3900:
 - `back_main`
 
 当名称/模型/email 含冒号或长度超标时，callback_data 中使用 hash 短码（4 字节），服务端用一个短码表映射回实际名。避免直接拼名称导致截断或歧义。
+
+### 🌡 剔除 temperature
+
+渠道编辑页新增「🌡 切换剔除 temperature」开关，默认关闭。
+
+- 开启后，向该渠道上游发送请求前会从 payload 中删除 `temperature` 字段（包括 CC 伪装路径硬编码的 `temperature: 1` 与标准透传路径来自客户端的值）。
+- 适用于：第三方 Claude 中转对新模型废弃 `temperature` 参数（典型报错 `temperature is deprecated for this model`）。
+- 只对当前渠道生效，其他渠道仍按原行为透传 temperature。
+

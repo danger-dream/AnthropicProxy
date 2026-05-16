@@ -58,7 +58,9 @@
       ],
       "enabled": true,
       "disabled_reason": null,       // null | "user"（API 渠道不会触发 quota）
-      "cc_mimicry": true             // 默认 true，用户可切换
+      "cc_mimicry": true,            // 默认 true，用户可切换
+      "omitTemperature": false        // 默认 false。开启后向上游发送前剔除 temperature 字段，
+                                       // 兼容废弃 temperature 的第三方中转（如某些 claude-opus-4-7 转发）
     }
   ],
 
