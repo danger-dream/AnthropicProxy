@@ -15,16 +15,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 import time
-import urllib.error
-import urllib.request
 from typing import Optional
 
 from packaging.version import InvalidVersion, Version
 
-from . import __version__, config, notifier, state_db
+from . import __version__, config, network, notifier, state_db
 
 
 # ─── 配置 ────────────────────────────────────────────────────────
@@ -195,18 +192,15 @@ def get_update_banner() -> Optional[str]:
 
 
 def _http_get_json(url: str, timeout: int = 15):
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "parrot-update-checker/0.1",
-        "Accept": "application/vnd.github+json",
-    })
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+        resp = network.get_sync(url, timeout=timeout, headers={
+            "User-Agent": "parrot-update-checker/0.1",
+            "Accept": "application/vnd.github+json",
+        })
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
         print(f"[update_checker] fetch failed: {url} -> {exc}")
-        return None
-    except (ValueError, json.JSONDecodeError) as exc:
-        print(f"[update_checker] parse failed: {url} -> {exc}")
         return None
 
 

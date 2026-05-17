@@ -27,7 +27,7 @@ import hashlib
 import json
 from typing import Optional
 
-from .. import config, oauth_manager
+from .. import config, network, oauth_manager
 from ..openai.transform import (
     chat_to_responses,
     codex_oauth_transform,
@@ -287,7 +287,7 @@ class OpenAIOAuthChannel(Channel):
 
         import httpx
         try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
+            async with network.async_client(timeout=timeout_s) as client:
                 # stream 模式：拿到响应头即可，不消费 body 直接关流
                 # （上游会继续生成一小段 token 直到发现连接关闭，算作探测成本）
                 async with client.stream(

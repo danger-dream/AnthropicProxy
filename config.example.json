@@ -50,6 +50,37 @@
     "idle": 120,
     "total": 600
   },
+  "network": {
+    "dns": {
+      "servers": [
+        "8.8.8.8"
+      ],
+      "bootstrapFromSystem": true,
+      "bootstrapped": false,
+      "timeoutSeconds": 3,
+      "cacheTtlSeconds": 300
+    },
+    "socks5": {
+      "enabled": false,
+      "url": ""
+    },
+    "monitor": {
+      "enabled": true,
+      "intervalSeconds": 60,
+      "timeoutSeconds": 5,
+      "dns": false,
+      "socks5": false,
+      "channels": {
+        "enabled": false,
+        "byKey": {}
+      },
+      "core": {
+        "openai": false,
+        "claude": false,
+        "cloudflare": false
+      }
+    }
+  },
   "errorWindows": [
     1,
     3,
@@ -99,7 +130,8 @@
       "oauth_refreshed": true,
       "oauth_refresh_failed": true,
       "no_channels": true,
-      "openai_store_save_failed": true
+      "openai_store_save_failed": true,
+      "network_monitor": true
     }
   },
   "cchMode": "disabled",

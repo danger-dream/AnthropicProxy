@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 import httpx
 
-from .. import cache_display
+from .. import cache_display, network
 
 
 # ─── 全局配置 ─────────────────────────────────────────────────────
@@ -69,7 +69,7 @@ def is_admin(chat_id) -> bool:
 # ─── httpx 会话 ───────────────────────────────────────────────────
 
 def _make_session() -> httpx.Client:
-    return httpx.Client(
+    return network.sync_client(
         timeout=httpx.Timeout(connect=10.0, read=50.0, write=10.0, pool=10.0),
         limits=httpx.Limits(max_connections=5, max_keepalive_connections=2, keepalive_expiry=30),
         http2=False,

@@ -19,9 +19,8 @@ from typing import Awaitable, Callable, Optional
 
 import httpx
 
-from . import config, cooldown
+from . import config, cooldown, network
 from .channel import registry
-from .channel.api_channel import ApiChannel
 from .channel.base import Channel
 
 
@@ -150,7 +149,7 @@ async def probe_channel_model(
     # 用临时 client（独立于服务端主 client 的连接池；避免主池长连接影响 probe 结果）
     # 关键：httpx.Timeout(timeout) 只保证每个阶段（connect/read/write）单独不超过 timeout，
     # 不是总时长。用 asyncio.wait_for 再加一层总时长硬性限制，确保真的不超过 timeout 秒。
-    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+    async with network.async_client(timeout=httpx.Timeout(timeout)) as client:
         try:
             resp = await asyncio.wait_for(
                 client.post(
@@ -201,8 +200,6 @@ async def probe_with_progress(
 
     每 progress_interval 秒调用一次 progress_cb（若非 None）。
     """
-    t0 = time.time()
-
     async def _ticker():
         """每 interval 秒报一次进度。"""
         sec = progress_interval

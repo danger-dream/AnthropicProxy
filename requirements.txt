@@ -1,5 +1,6 @@
 fastapi>=0.110
 uvicorn>=0.29
-httpx>=0.27
+httpx[socks]>=0.27
 xxhash>=3.4
+dnspython>=2.6
 packaging>=23

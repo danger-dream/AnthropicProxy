@@ -285,16 +285,16 @@ async def test_proactive_refresh_network_failure_does_not_mark_auth_error(m):
         }]
     cfg.update(_setup)
 
-    # 猴补 httpx.post 让它抛异常
+    # 猴补统一网络层，让 token 刷新路径抛网络异常
     import httpx as _httpx
-    orig_post = _httpx.post
+    orig_post = m["oauth_manager"].network.post_sync
     def raising_post(*a, **kw):
         raise _httpx.ConnectError("simulated network down")
-    _httpx.post = raising_post
+    m["oauth_manager"].network.post_sync = raising_post
     try:
         outcomes = await m["oauth_manager"].proactive_refresh_once(refresh_threshold_seconds=600)
     finally:
-        _httpx.post = orig_post
+        m["oauth_manager"].network.post_sync = orig_post
 
     assert outcomes["bad@test.com"].startswith("failed:claude_oauth_network_error"), outcomes
     bad = next(a for a in m["config"].get()["oauthAccounts"] if a["email"] == "bad@test.com")
@@ -323,15 +323,15 @@ async def test_proactive_refresh_401_marks_auth_error(m):
     cfg.update(_setup)
 
     import httpx as _httpx
-    orig_post = _httpx.post
+    orig_post = m["oauth_manager"].network.post_sync
     def response_401(*a, **kw):
         req = _httpx.Request("POST", "https://api.anthropic.com/v1/oauth/token")
         return _httpx.Response(401, request=req, json={"error": "invalid_grant"})
-    _httpx.post = response_401
+    m["oauth_manager"].network.post_sync = response_401
     try:
         outcomes = await m["oauth_manager"].proactive_refresh_once(refresh_threshold_seconds=600)
     finally:
-        _httpx.post = orig_post
+        m["oauth_manager"].network.post_sync = orig_post
 
     assert outcomes["expired@test.com"].startswith("failed:claude_token_401"), outcomes
     bad = next(a for a in m["config"].get()["oauthAccounts"] if a["email"] == "expired@test.com")

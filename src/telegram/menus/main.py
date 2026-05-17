@@ -207,6 +207,13 @@ def _maybe_suffix_status_banner(text: str) -> str:
             extras.append(line)
     except Exception:
         pass
+    try:
+        from ... import network_monitor
+        line = network_monitor.active_summary()
+        if line:
+            extras.append(line)
+    except Exception:
+        pass
     if not extras:
         return text
     return text + "\n\n" + "\n".join(extras)

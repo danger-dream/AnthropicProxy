@@ -72,6 +72,37 @@
     "total": 600                     // 单次请求总时长
   },
 
+  // ─── 出站网络设置 ───
+  "network": {
+    "dns": {
+      "servers": ["8.8.8.8"],        // 出站域名解析使用的 DNS；可配置多个。支持 IP/域名、dot://、https://.../dns-query；DNS 服务器域名本身用系统 DNS 解析
+      "bootstrapFromSystem": true,    // 首次启动时从系统 /etc/resolv.conf 同步一次
+      "bootstrapped": false,          // 同步完成后自动置 true，后续不再自动覆盖
+      "timeoutSeconds": 3,
+      "cacheTtlSeconds": 300
+    },
+    "socks5": {
+      "enabled": false,
+      "url": ""                       // socks5://host:port / tcp://host:port / host:port
+    },
+    "monitor": {
+      "enabled": true,                 // 网络健康检测总开关
+      "intervalSeconds": 60,           // 检测间隔；最小 5 秒
+      "timeoutSeconds": 5,
+      "dns": false,                    // 定时检测 DNS 解析
+      "socks5": false,                 // 定时检测 SOCKS5 代理可用性
+      "channels": {
+        "enabled": false,              // 渠道连接性检测总开关
+        "byKey": {}                    // 每个渠道单独开关，如 {"api:foo": true}
+      },
+      "core": {
+        "openai": false,
+        "claude": false,
+        "cloudflare": false
+      }
+    }
+  },
+
   // ─── 错误冷却阶梯（分钟，0 = 永久拉黑） ───
   "errorWindows": [1, 3, 5, 10, 15, 0],
 

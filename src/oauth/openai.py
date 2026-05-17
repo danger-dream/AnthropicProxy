@@ -26,7 +26,7 @@ import time
 from typing import Any
 from urllib.parse import urlencode
 
-import httpx
+from .. import network
 
 
 # ─── OAuth 常量（与 sub2api 对齐，来源 Codex CLI 官方）────────────
@@ -148,7 +148,7 @@ def build_login_url(code_challenge: str, state: str,
 
 def _post_token_form(data: dict) -> dict:
     """同步 POST form-urlencoded 到 token 端点。"""
-    resp = httpx.post(
+    resp = network.post_sync(
         TOKEN_URL,
         data=data,
         headers={
@@ -308,7 +308,7 @@ def _fetch_accounts_check_payload_sync(access_token: str) -> dict | None:
     if not access_token or _mock_mode_enabled():
         return None
     try:
-        resp = httpx.get(
+        resp = network.get_sync(
             ACCOUNTS_CHECK_URL,
             headers={
                 "authorization": f"Bearer {access_token}",
@@ -663,24 +663,23 @@ def normalize_codex_snapshot(snap: dict) -> dict:
     s_win = snap.get("secondary_window_min")
 
     use_5h_from_primary = False
-    use_7d_from_primary = False
     if p_win is not None and s_win is not None:
         if p_win < s_win:
             use_5h_from_primary = True
         else:
-            use_7d_from_primary = True
+            pass
     elif p_win is not None:
         if p_win <= 360:
             use_5h_from_primary = True
         else:
-            use_7d_from_primary = True
+            pass
     elif s_win is not None:
         if s_win <= 360:
-            use_7d_from_primary = True   # secondary 是 5h → primary 侧归 7d
+            pass   # secondary 是 5h → primary 侧归 7d
         else:
             use_5h_from_primary = True
     else:
-        use_7d_from_primary = True        # 两边都没有 window_min：回落
+        pass        # 两边都没有 window_min：回落
 
     if use_5h_from_primary:
         five_util, five_reset = snap.get("primary_used_pct"), snap.get("primary_reset_sec")

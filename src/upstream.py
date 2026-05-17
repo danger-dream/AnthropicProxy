@@ -15,6 +15,8 @@ from typing import Any, Optional
 
 import httpx
 
+from . import network
+
 
 _client: Optional[httpx.AsyncClient] = None
 
@@ -24,7 +26,7 @@ def create_client() -> httpx.AsyncClient:
     global _client
     if _client is not None:
         return _client
-    _client = httpx.AsyncClient(
+    _client = network.async_client(
         timeout=httpx.Timeout(connect=15.0, read=330.0, write=30.0, pool=15.0),
         limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
         http2=False,
@@ -43,6 +45,28 @@ async def close_client() -> None:
     if _client is not None:
         await _client.aclose()
         _client = None
+
+
+def reset_client_sync() -> None:
+    """Drop shared upstream client after network config changes.
+
+    If called while an event loop is running, close in the background; otherwise
+    close synchronously with asyncio.run. New requests lazily create a fresh
+    client with the latest network settings.
+    """
+    global _client
+    old = _client
+    _client = None
+    if old is None:
+        return
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        import asyncio
+        asyncio.run(old.aclose())
+    else:
+        loop.create_task(old.aclose())
 
 
 def set_client(client: httpx.AsyncClient) -> None:

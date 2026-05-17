@@ -106,6 +106,18 @@ def _schema_sql() -> str:
       extra_util       REAL,
       raw_data         TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS network_check_status (
+      key          TEXT PRIMARY KEY,
+      label        TEXT NOT NULL,
+      category     TEXT NOT NULL,
+      ok           INTEGER NOT NULL,
+      detail       TEXT,
+      latency_ms   INTEGER,
+      checked_at   INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_network_check_category ON network_check_status(category);
+    CREATE INDEX IF NOT EXISTS idx_network_check_ok ON network_check_status(ok);
     """
 
 
@@ -678,6 +690,57 @@ def checkpoint() -> None:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+# ─── network_check_status ───────────────────────────────────────
+
+def network_check_save(row: dict[str, Any]) -> None:
+    with _write_lock:
+        _get_conn().execute(
+            """INSERT OR REPLACE INTO network_check_status
+               (key, label, category, ok, detail, latency_ms, checked_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                str(row.get("key") or ""),
+                str(row.get("label") or row.get("key") or ""),
+                str(row.get("category") or "other"),
+                1 if row.get("ok") else 0,
+                str(row.get("detail") or ""),
+                row.get("latency_ms"),
+                int(row.get("checked_at") or now_ms()),
+            ),
+        )
+        _get_conn().commit()
+
+
+def network_check_load(key: str) -> dict | None:
+    row = _get_conn().execute(
+        "SELECT * FROM network_check_status WHERE key=?", (key,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def network_check_load_all() -> list[dict]:
+    rows = _get_conn().execute(
+        "SELECT * FROM network_check_status ORDER BY category, key",
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def network_check_delete(key: str) -> None:
+    with _write_lock:
+        _get_conn().execute("DELETE FROM network_check_status WHERE key=?", (key,))
+        _get_conn().commit()
+
+
+def network_check_delete_stale(live_keys: set[str]) -> None:
+    with _write_lock:
+        conn = _get_conn()
+        rows = conn.execute("SELECT key FROM network_check_status").fetchall()
+        for r in rows:
+            if r["key"] not in live_keys:
+                conn.execute("DELETE FROM network_check_status WHERE key=?", (r["key"],))
+        conn.commit()
 
 
 # ─── performance_stats ────────────────────────────────────────────

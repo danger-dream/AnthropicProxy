@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src import (
     __version__,
     affinity, auth, config, cooldown, errors, failover,
-    fingerprint, image_db, log_db, model_mapping, notifier, oauth_manager, probe,
+    fingerprint, image_db, log_db, model_mapping, network, network_monitor, notifier, oauth_manager, probe,
     public_ip, scheduler, scorer, state_db, status_monitor, update_checker, upstream,
 )
 from src.channel import registry
@@ -112,6 +112,10 @@ async def _affinity_cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 出站网络层必须最先初始化，确保后续 OAuth/TG/status/update 等请求都走统一 DNS/代理。
+    network.init()
+    network.bootstrap_system_dns_once()
+
     # 持久化层
     state_db.init()
     log_db.init()
@@ -224,6 +228,7 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
     _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
     _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
+    _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(update_checker.update_loop()))
     _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
 
@@ -287,7 +292,6 @@ async def health():
         for ch in chs:
             if not ch.enabled or ch.disabled_reason:
                 continue
-            cd_entries = cooldown.active_entries()
             models = getattr(ch, "models", [])
             # 有至少一个模型未冷却
             if ch.type == "oauth":

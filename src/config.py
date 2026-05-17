@@ -47,6 +47,40 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "idle": 120,    # chunk 之间最长空闲；上游推理慢需要更宽松
         "total": 600,
     },
+    # ─── 出站网络设置 ─────────────────────────────────────────
+    # DNS 默认 8.8.8.8；首次启动时若 bootstrapFromSystem=true 且 bootstrapped=false，
+    # 会从系统 /etc/resolv.conf 同步一次并写回 config，之后不再自动覆盖用户设置。
+    # SOCKS5 启用后，所有 HTTP 出站请求走 SOCKS5；目标域名交给 SOCKS5 代理端，
+    # 只有 SOCKS5 服务器地址本身是域名时才用这里的 DNS 解析。
+    "network": {
+        "dns": {
+            "servers": ["8.8.8.8"],
+            "bootstrapFromSystem": True,
+            "bootstrapped": False,
+            "timeoutSeconds": 3,
+            "cacheTtlSeconds": 300,
+        },
+        "socks5": {
+            "enabled": False,
+            "url": "",
+        },
+        "monitor": {
+            "enabled": True,
+            "intervalSeconds": 60,   # 最小 5 秒；UI 会校验
+            "timeoutSeconds": 5,
+            "dns": False,
+            "socks5": False,
+            "channels": {
+                "enabled": False,
+                "byKey": {},         # {"api:name": true, "oauth:...": false}
+            },
+            "core": {
+                "openai": False,
+                "claude": False,
+                "cloudflare": False,
+            },
+        },
+    },
     # 渠道并发限制（2026-04-22 新增）
     # 每个渠道同一时刻最多多少个在途请求；满了则在候选渠道里排队等位。
     # queueWaitSeconds 到了仍无位置 → 客户端收到 429 rate_limit_error。
@@ -121,6 +155,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "openai_store_save_failed": True,  # OpenAI previous_response_id Store 写入失败
             "status_alert": True,         # 上游 status page（Claude/OpenAI/Cloudflare）事件
             "app_update": True,           # Parrot 本身的新版本上线提醒
+            "network_monitor": True,      # Parrot 自身网络健康检测失败/恢复
         },
     },
     # ─── 上游 status page 监控 ─────────────────────────────────

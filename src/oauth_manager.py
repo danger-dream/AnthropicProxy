@@ -25,9 +25,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import httpx
-
-from . import cache_display, config, load_balancing, notifier, oauth_errors, state_db
+from . import cache_display, config, load_balancing, network, notifier, oauth_errors, state_db
 from .oauth import (
     DEFAULT_PROVIDER as _DEFAULT_PROVIDER,
     VALID_PROVIDERS as _VALID_PROVIDERS,
@@ -367,7 +365,7 @@ def _save_token_fields(account_key: str, new: dict) -> None:
 
 def _do_refresh_http(refresh_token: str) -> dict:
     """真实请求 Anthropic token endpoint。"""
-    resp = httpx.post(
+    resp = network.post_sync(
         OAUTH_TOKEN_URL,
         json={
             "grant_type": "refresh_token",
@@ -525,7 +523,7 @@ def _mock_usage() -> dict:
 def _profile_sync(access_token: str) -> dict:
     if mock_mode_enabled():
         return _mock_profile()
-    resp = httpx.get(
+    resp = network.get_sync(
         OAUTH_PROFILE_URL,
         headers={
             "Authorization": f"Bearer {access_token}",
@@ -548,7 +546,7 @@ def _usage_sync(access_token: str) -> dict:
     """
     if mock_mode_enabled():
         return _mock_usage()
-    resp = httpx.get(
+    resp = network.get_sync(
         OAUTH_USAGE_URL,
         headers={
             "Accept": "application/json, text/plain, */*",
@@ -1606,7 +1604,7 @@ def exchange_code(code: str, code_verifier: str, state: str) -> dict:
             "refresh_token": "mock-refresh-" + secrets.token_hex(8),
             "expires_in": 28800,
         }
-    resp = httpx.post(
+    resp = network.post_sync(
         OAUTH_TOKEN_URL,
         json={
             "grant_type": "authorization_code",

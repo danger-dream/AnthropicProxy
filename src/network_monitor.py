@@ -1,0 +1,435 @@
+"""Network health monitor.
+
+Runs lightweight connectivity checks for DNS, SOCKS5, configured API channels,
+and core upstreams. Notifications are edge-triggered:
+- ok/unknown -> failed: send one failure notification
+- failed -> ok: send one recovery notification
+Persistent status is stored in state.db so menus can show banners and details.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import socket
+import time
+from dataclasses import dataclass
+from typing import Iterable, Optional
+from urllib.parse import urlparse
+
+import httpx
+
+from . import config, network, notifier, state_db
+from .channel import registry
+from .channel.url_utils import resolve_upstream_url
+
+
+def _has_family_account(family: str) -> bool:
+    """检查 config 中是否存在该家族的可用账号或 API 渠道。
+    family: "anthropic" | "openai" | "cloudflare"
+    cloudflare 没有账号概念，永远返回 True（仅靠用户开关控制）。
+    """
+    if family == "cloudflare":
+        return True
+    try:
+        cfg_data = config.get()
+    except Exception:
+        return False
+    # 看 OAuth 账号
+    for acc in cfg_data.get("oauthAccounts", []) or []:
+        prov = (acc.get("provider") or "").lower()
+        if family == "openai" and prov == "openai":
+            return True
+        if family == "anthropic" and prov in ("", "anthropic", "claude"):
+            return True
+    # 看 API 渠道（按 protocol 推断家族）
+    for entry in cfg_data.get("channels", []) or []:
+        proto = (entry.get("protocol") or "anthropic").lower()
+        if family == "openai" and proto.startswith("openai"):
+            return True
+        if family == "anthropic" and not proto.startswith("openai"):
+            return True
+    return False
+
+
+def prune_orphan_channel_toggles() -> int:
+    """清掉 monitor.channels.byKey 中已不存在的 channel key。返回清理数量。"""
+    try:
+        live = {ch.key for ch in registry.all_channels()}
+    except Exception:
+        return 0
+    removed_count = 0
+
+    def _mutator(cfg_data: dict) -> None:
+        nonlocal removed_count
+        mon = ((cfg_data.setdefault("network", {})).setdefault("monitor", {}))
+        ch_cfg = mon.setdefault("channels", {"enabled": False, "byKey": {}})
+        by_key = ch_cfg.setdefault("byKey", {})
+        cleaned = {k: v for k, v in by_key.items() if k in live}
+        removed_count = len(by_key) - len(cleaned)
+        if removed_count:
+            ch_cfg["byKey"] = cleaned
+
+    try:
+        config.update(_mutator)
+    except Exception:
+        return 0
+    return removed_count
+
+
+@dataclass
+class CheckResult:
+    key: str
+    label: str
+    category: str
+    ok: bool
+    detail: str = ""
+    latency_ms: int | None = None
+
+
+_CORE_TARGETS: dict[str, tuple[str, str]] = {
+    "openai": ("OpenAI", "https://api.openai.com/"),
+    "claude": ("Claude", "https://api.anthropic.com/"),
+    "cloudflare": ("Cloudflare", "https://www.cloudflare.com/cdn-cgi/trace"),
+}
+
+_DNS_TARGETS = (
+    ("chatgpt.com", "ChatGPT"),
+    ("api.anthropic.com", "Claude/Anthropic"),
+    ("api.telegram.org", "Telegram"),
+    ("api.github.com", "GitHub"),
+)
+
+_SOCKS5_TEST_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+_loop_task: asyncio.Task | None = None
+
+
+def cfg() -> dict:
+    raw = (config.get().get("network") or {}).get("monitor") or {}
+    interval = int(raw.get("intervalSeconds", 60) or 60)
+    if interval < 5:
+        interval = 5
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "intervalSeconds": interval,
+        "dns": bool(raw.get("dns", False)),
+        "socks5": bool(raw.get("socks5", False)),
+        "channels": raw.get("channels") or {"enabled": False, "byKey": {}},
+        "core": raw.get("core") or {"openai": False, "claude": False, "cloudflare": False},
+        "timeoutSeconds": max(1.0, float(raw.get("timeoutSeconds", 5) or 5)),
+    }
+
+
+def _monitor_cfg_mut(c: dict) -> dict:
+    net = c.setdefault("network", {})
+    mon = net.setdefault("monitor", {})
+    mon.setdefault("enabled", True)
+    mon.setdefault("intervalSeconds", 60)
+    mon.setdefault("dns", False)
+    mon.setdefault("socks5", False)
+    mon.setdefault("channels", {"enabled": False, "byKey": {}})
+    mon.setdefault("core", {"openai": False, "claude": False, "cloudflare": False})
+    mon.setdefault("timeoutSeconds", 5)
+    return mon
+
+
+def update_settings(mutator) -> None:
+    def _mut(c: dict) -> None:
+        mon = _monitor_cfg_mut(c)
+        mutator(mon)
+        try:
+            mon["intervalSeconds"] = max(5, int(mon.get("intervalSeconds", 60) or 60))
+        except Exception:
+            mon["intervalSeconds"] = 60
+    config.update(_mut)
+
+
+def set_channel_enabled(channel_key: str, enabled: bool) -> None:
+    def _mut(mon: dict) -> None:
+        ch = mon.setdefault("channels", {"enabled": False, "byKey": {}})
+        ch.setdefault("byKey", {})[channel_key] = bool(enabled)
+    update_settings(_mut)
+
+
+def channel_enabled(channel_key: str, *, default: bool = False) -> bool:
+    ch_cfg = cfg().get("channels") or {}
+    by_key = ch_cfg.get("byKey") or {}
+    return bool(by_key.get(channel_key, default))
+
+
+def enabled_channel_keys() -> set[str]:
+    ch_cfg = cfg().get("channels") or {}
+    if not bool(ch_cfg.get("enabled", False)):
+        return set()
+    by_key = ch_cfg.get("byKey") or {}
+    return {str(k) for k, v in by_key.items() if v}
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _result_row(res: CheckResult) -> dict:
+    return {
+        "key": res.key,
+        "label": res.label,
+        "category": res.category,
+        "ok": bool(res.ok),
+        "detail": res.detail or "",
+        "latency_ms": res.latency_ms,
+        "checked_at": _now_ms(),
+    }
+
+
+def _format_result(res: CheckResult) -> str:
+    if res.ok:
+        suffix = f" · {res.latency_ms}ms" if res.latency_ms is not None else ""
+        return f"✅ {res.label}{suffix}"
+    detail = f"：{res.detail}" if res.detail else ""
+    return f"❌ {res.label}{detail}"
+
+
+def _notify_transition(res: CheckResult, prev: Optional[dict]) -> None:
+    prev_ok = None if prev is None else bool(prev.get("ok"))
+    if prev_ok is False and res.ok:
+        notifier.notify_event(
+            "network_monitor",
+            f"✅ <b>网络检测恢复</b>\n{notifier.escape_html(_format_result(res))}",
+        )
+    elif prev_ok is not False and not res.ok:
+        notifier.notify_event(
+            "network_monitor",
+            f"⚠️ <b>网络检测失败</b>\n{notifier.escape_html(_format_result(res))}",
+        )
+
+
+def _save_result(res: CheckResult) -> None:
+    prev = state_db.network_check_load(res.key)
+    _notify_transition(res, prev)
+    state_db.network_check_save(_result_row(res))
+
+
+def _dns_check(timeout: float) -> CheckResult:
+    t0 = time.time()
+    failures: list[str] = []
+    for host, label in _DNS_TARGETS:
+        try:
+            network.resolve_host(host, timeout=timeout, use_cache=False)
+        except Exception as exc:
+            failures.append(f"{host}: {str(exc)[:120]}")
+    latency = int((time.time() - t0) * 1000)
+    return CheckResult(
+        key="dns",
+        label="DNS 解析",
+        category="dns",
+        ok=not failures,
+        detail="; ".join(failures[:4]),
+        latency_ms=latency,
+    )
+
+
+async def _socks5_check(timeout: float) -> CheckResult:
+    s5 = network.socks5_cfg()
+    raw = str(s5.get("url") or "").strip()
+    if not (bool(s5.get("enabled")) and raw):
+        return CheckResult(
+            key="socks5",
+            label="SOCKS5 代理",
+            category="socks5",
+            ok=False,
+            detail="SOCKS5 未配置或未启用",
+        )
+    try:
+        norm = network.normalize_socks5_url(raw)
+    except Exception as exc:
+        return CheckResult("socks5", "SOCKS5 代理", "socks5", False, f"配置错误: {exc}")
+    t0 = time.time()
+    try:
+        if not network._is_ip_literal(norm.host) and norm.host != "localhost":
+            network.resolve_host(norm.host, timeout=timeout, use_cache=False)
+        async with httpx.AsyncClient(
+            proxy=norm.url,
+            trust_env=False,
+            http2=False,
+            timeout=httpx.Timeout(connect=timeout, read=timeout, write=timeout, pool=timeout),
+            follow_redirects=False,
+        ) as client:
+            resp = await client.get(_SOCKS5_TEST_URL, headers={"User-Agent": "parrot-network-monitor/0.1"})
+            ok = resp.status_code < 500
+            detail = "" if ok else f"HTTP {resp.status_code}"
+    except Exception as exc:
+        ok = False
+        detail = str(exc)[:180]
+    latency = int((time.time() - t0) * 1000)
+    return CheckResult("socks5", "SOCKS5 代理", "socks5", ok, detail, latency)
+
+
+def _tcp_connect(host: str, port: int, timeout: float) -> int:
+    t0 = time.time()
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    last_exc: Exception | None = None
+    for family, socktype, proto, _canon, sockaddr in infos:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            return int((time.time() - t0) * 1000)
+        except Exception as exc:
+            last_exc = exc
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    if last_exc:
+        raise last_exc
+    raise OSError("no address")
+
+
+def _parse_host_port(url: str) -> tuple[str, int]:
+    p = urlparse(url)
+    if not p.hostname:
+        raise ValueError("URL 缺少 host")
+    if p.port:
+        return p.hostname, int(p.port)
+    if p.scheme == "http":
+        return p.hostname, 80
+    return p.hostname, 443
+
+
+def _channel_probe_url(ch) -> str:
+    if getattr(ch, "type", "") == "oauth":
+        if getattr(ch, "protocol", "anthropic") == "openai-responses":
+            return "https://chatgpt.com/backend-api/codex/responses"
+        return "https://api.anthropic.com/api/oauth/usage"
+    base = str(getattr(ch, "base_url", "") or "")
+    api_path = getattr(ch, "api_path", None)
+    proto = getattr(ch, "protocol", "anthropic")
+    default = "/v1/messages"
+    if proto == "openai-chat":
+        default = "/v1/chat/completions"
+    elif proto == "openai-responses":
+        default = "/v1/responses"
+    return resolve_upstream_url(base, api_path, default)
+
+
+def _channel_check(ch, timeout: float) -> CheckResult:
+    label = f"渠道 {getattr(ch, 'display_name', getattr(ch, 'key', 'unknown'))}"
+    key = f"channel:{ch.key}"
+    try:
+        url = _channel_probe_url(ch)
+        host, port = _parse_host_port(url)
+        latency = _tcp_connect(host, port, timeout)
+        return CheckResult(key, label, "channel", True, f"{host}:{port}", latency)
+    except Exception as exc:
+        return CheckResult(key, label, "channel", False, str(exc)[:180])
+
+
+def _core_check(name: str, timeout: float) -> CheckResult:
+    label, url = _CORE_TARGETS[name]
+    try:
+        host, port = _parse_host_port(url)
+        latency = _tcp_connect(host, port, timeout)
+        return CheckResult(f"core:{name}", label, "core", True, f"{host}:{port}", latency)
+    except Exception as exc:
+        return CheckResult(f"core:{name}", label, "core", False, str(exc)[:180])
+
+
+async def run_once(*, save: bool = True) -> list[CheckResult]:
+    c = cfg()
+    if not c.get("enabled", True):
+        return []
+    timeout = float(c.get("timeoutSeconds", 5) or 5)
+    out: list[CheckResult] = []
+
+    if c.get("dns"):
+        out.append(await asyncio.to_thread(_dns_check, timeout))
+    if c.get("socks5"):
+        out.append(await _socks5_check(timeout))
+
+    ch_cfg = c.get("channels") or {}
+    if bool(ch_cfg.get("enabled", False)):
+        # 先清理孤儿 toggle，避免删掉渠道后 byKey 中残留检测
+        prune_orphan_channel_toggles()
+        keys = enabled_channel_keys()
+        for ch in registry.all_channels():
+            if ch.key not in keys:
+                continue
+            # 只检测 API 渠道；OAuth 类型不在网络检测范围内
+            if getattr(ch, "type", "") != "api":
+                continue
+            if not getattr(ch, "enabled", True) or getattr(ch, "disabled_reason", None):
+                continue
+            out.append(await asyncio.to_thread(_channel_check, ch, timeout))
+
+    core = c.get("core") or {}
+    # core: openai → openai 家族, claude → anthropic 家族, cloudflare → 无家族（总是允许）
+    _core_family = {"openai": "openai", "claude": "anthropic", "cloudflare": "cloudflare"}
+    for name in ("openai", "claude", "cloudflare"):
+        if not core.get(name):
+            continue
+        fam = _core_family[name]
+        if not _has_family_account(fam):
+            # 没有对应家族账号/渠道，跳过（避免给用户无意义的失败告警）
+            continue
+        out.append(await asyncio.to_thread(_core_check, name, timeout))
+
+    if save:
+        for res in out:
+            _save_result(res)
+    return out
+
+
+async def monitor_loop() -> None:
+    while True:
+        try:
+            c = cfg()
+            interval = int(c.get("intervalSeconds", 60) or 60)
+            if c.get("enabled", True):
+                await run_once(save=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[network_monitor] loop failed: {exc}")
+            interval = 60
+        await asyncio.sleep(max(5, interval))
+
+
+def start_loop() -> asyncio.Task:
+    global _loop_task
+    if _loop_task is not None and not _loop_task.done():
+        return _loop_task
+    _loop_task = asyncio.create_task(monitor_loop())
+    return _loop_task
+
+
+def active_failures() -> list[dict]:
+    return [r for r in state_db.network_check_load_all() if not bool(r.get("ok"))]
+
+
+def active_summary() -> Optional[str]:
+    rows = active_failures()
+    if not rows:
+        return None
+    counts: dict[str, int] = {}
+    for r in rows:
+        cat = str(r.get("category") or "other")
+        counts[cat] = counts.get(cat, 0) + 1
+    labels = {
+        "dns": "DNS",
+        "socks5": "SOCKS5",
+        "channel": "渠道",
+        "core": "核心上游",
+    }
+    parts = [f"{labels.get(k, k)} × {v}" for k, v in counts.items()]
+    return "🔴 <b>网络异常</b>: " + " · ".join(parts) + " — 进入「⚙ 系统设置 → 🌐 网络设置 → 🩺 网络检测」查看详情"
+
+
+def format_results(results: Iterable[CheckResult]) -> str:
+    lines = ["🩺 <b>网络检测结果</b>", ""]
+    any_row = False
+    for res in results:
+        any_row = True
+        lines.append(notifier.escape_html(_format_result(res)))
+    if not any_row:
+        lines.append("<i>未启用任何检测项。</i>")
+    return "\n".join(lines)

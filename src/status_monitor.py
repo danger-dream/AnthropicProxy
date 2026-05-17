@@ -19,15 +19,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import sqlite3
 import threading
 import time
-import urllib.error
-import urllib.request
 from typing import Optional
 
-from . import config, notifier, state_db
+from . import config, network, notifier, state_db
 
 
 # ─── 目标定义 ────────────────────────────────────────────────────
@@ -339,15 +335,16 @@ def get_active_summary() -> Optional[str]:
 
 
 def _http_get_json(url: str, timeout: int = 15) -> Optional[dict]:
-    req = urllib.request.Request(url, headers={"User-Agent": "parrot-status-monitor/0.1"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+        resp = network.get_sync(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "parrot-status-monitor/0.1"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
         print(f"[status_monitor] fetch failed: {url} -> {exc}")
-        return None
-    except (ValueError, json.JSONDecodeError) as exc:
-        print(f"[status_monitor] parse failed: {url} -> {exc}")
         return None
 
 

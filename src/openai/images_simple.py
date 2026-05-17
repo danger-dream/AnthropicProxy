@@ -26,7 +26,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from .. import auth, config, errors, image_db, oauth_manager, state_db
+from .. import auth, config, errors, image_db, network, oauth_manager, state_db
 from ..oauth import normalize_provider
 from ..oauth import openai as openai_provider
 from ..oauth_ids import account_key as make_account_key
@@ -338,7 +338,7 @@ async def _call_upstream_once(account_row: dict, payload: dict, *, timeout_s: in
 
     try:
         timeout = httpx.Timeout(connect=15.0, read=float(timeout_s), write=30.0, pool=15.0)
-        async with httpx.AsyncClient(timeout=timeout, http2=False) as client:
+        async with network.async_client(timeout=timeout, http2=False) as client:
             async with client.stream("POST", CODEX_RESPONSES_URL, headers=headers, content=body) as resp:
                 _update_codex_quota(ak, email, resp.headers)
                 if resp.status_code >= 400:

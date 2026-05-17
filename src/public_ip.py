@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
-import httpx
+from . import network
 
 
 _PUBLIC_IP: Optional[str] = None
@@ -29,7 +29,7 @@ def _do_fetch() -> None:
     global _PUBLIC_IP, _fetched
     for url in _ENDPOINTS:
         try:
-            resp = httpx.get(url, timeout=_HTTP_TIMEOUT, headers={"User-Agent": _UA})
+            resp = network.get_sync(url, timeout=_HTTP_TIMEOUT, headers={"User-Agent": _UA})
             if resp.status_code != 200:
                 continue
             ip = resp.text.strip()
