@@ -516,6 +516,25 @@ docker compose up -d
 
 > 或重跑一次一键脚本（选 `Upgrade` 模式），等价。
 
+Telegram「⚙ 系统设置 → 🆕 版本更新」发现新版本后，也会显示「⬆️ 立即更新」按钮。点击后会先展示确认页，确认后在后台执行升级命令并通过 Telegram 推送执行状态。默认命令等价于：
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+如需自定义部署目录或命令，可在 `data/config.json` 中设置：
+
+```json
+{
+  "updateChecker": {
+    "updateCommand": "docker compose pull && docker compose up -d",
+    "workingDirectory": "/opt/parrot"
+  }
+}
+```
+
+`workingDirectory` 留空时使用 Parrot 进程当前工作目录。请确保该目录包含正确的 `docker-compose.yml`，且运行 Parrot 的用户具备 Docker 权限。
+
 ### 日志
 
 ```bash

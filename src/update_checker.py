@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from packaging.version import InvalidVersion, Version
 
@@ -35,6 +37,18 @@ def _cfg() -> dict:
         "includePrerelease": bool(uc.get("includePrerelease", True)),
         "repo": str(uc.get("repo") or "danger-dream/Parrot").strip(),
         "ignoredVersions": list(uc.get("ignoredVersions") or []),
+        "updateCommand": str(uc.get("updateCommand") or "docker compose pull && docker compose up -d").strip(),
+        "workingDirectory": str(uc.get("workingDirectory") or "").strip(),
+    }
+
+
+def get_update_command_config() -> dict:
+    """Return the command/cwd used by the Telegram manual update action."""
+    cfg = _cfg()
+    cwd = cfg["workingDirectory"] or os.getcwd()
+    return {
+        "command": cfg["updateCommand"],
+        "workingDirectory": cwd,
     }
 
 
@@ -186,6 +200,104 @@ def get_update_banner() -> Optional[str]:
         f"<code>{notifier.escape_html(latest)}</code> — "
         "进入「⚙ 系统设置 → 🆕 版本更新」查看详情"
     )
+
+
+# ─── 手动升级执行器 ───────────────────────────────────────────────
+
+_manual_update_lock = threading.Lock()
+_manual_update_running = False
+
+
+def is_manual_update_running() -> bool:
+    with _manual_update_lock:
+        return _manual_update_running
+
+
+def _set_manual_update_running(value: bool) -> None:
+    global _manual_update_running
+    with _manual_update_lock:
+        _manual_update_running = value
+
+
+def _clip_output(text: str, limit: int = 2600) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:].lstrip() + "\n…（仅显示最后部分日志）"
+
+
+def _format_manual_update_result(returncode: int, output: str) -> str:
+    clipped = _clip_output(output)
+    if returncode == 0:
+        head = "✅ <b>Parrot 更新命令执行完成</b>"
+    else:
+        head = f"❌ <b>Parrot 更新命令失败</b>（退出码 <code>{returncode}</code>）"
+    if not clipped:
+        return head
+    return f"{head}\n\n<pre>{notifier.escape_html(clipped)}</pre>"
+
+
+def _run_manual_update(command: str, cwd: str, notify: Callable[[str], None]) -> None:
+    try:
+        notify(
+            "⬆️ <b>开始执行 Parrot 更新命令</b>\n\n"
+            f"目录: <code>{notifier.escape_html(cwd)}</code>\n"
+            f"命令: <code>{notifier.escape_html(command)}</code>"
+        )
+        proc = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=900,
+        )
+        notify(_format_manual_update_result(proc.returncode, proc.stdout or ""))
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        notify(
+            "❌ <b>Parrot 更新命令超时</b>（900s）\n\n"
+            f"<pre>{notifier.escape_html(_clip_output(output))}</pre>"
+        )
+    except Exception as exc:
+        notify(f"❌ <b>Parrot 更新命令启动失败</b>: <code>{notifier.escape_html(str(exc))}</code>")
+    finally:
+        _set_manual_update_running(False)
+
+
+def start_manual_update(notify: Callable[[str], None]) -> tuple[bool, str]:
+    """Start the configured update command in a background thread.
+
+    Returns (started, message). The caller is responsible for checking that a
+    non-ignored newer release exists before invoking this function.
+    """
+    with _manual_update_lock:
+        global _manual_update_running
+        if _manual_update_running:
+            return False, "已有更新任务正在执行"
+        _manual_update_running = True
+
+    cmd_cfg = get_update_command_config()
+    command = cmd_cfg["command"]
+    cwd = cmd_cfg["workingDirectory"]
+    if not command:
+        _set_manual_update_running(False)
+        return False, "未配置 updateChecker.updateCommand"
+    if not os.path.isdir(cwd):
+        _set_manual_update_running(False)
+        return False, f"工作目录不存在: {cwd}"
+
+    t = threading.Thread(
+        target=_run_manual_update,
+        args=(command, cwd, notify),
+        name="parrot-manual-update",
+        daemon=True,
+    )
+    t.start()
+    return True, "更新任务已在后台启动"
 
 
 # ─── HTTP 抓取 ───────────────────────────────────────────────────

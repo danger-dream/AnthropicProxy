@@ -134,6 +134,15 @@
       "network_monitor": true
     }
   },
+  "updateChecker": {
+    "enabled": true,
+    "intervalSeconds": 3600,
+    "includePrerelease": true,
+    "repo": "danger-dream/Parrot",
+    "ignoredVersions": [],
+    "updateCommand": "docker compose pull && docker compose up -d",
+    "workingDirectory": ""
+  },
   "cchMode": "disabled",
   "cchStaticValue": "00000",
   "oauthDefaultModels": [

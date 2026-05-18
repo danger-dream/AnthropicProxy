@@ -176,6 +176,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "includePrerelease": True,
         "repo": "danger-dream/Parrot",
         "ignoredVersions": [],
+        # Telegram「立即更新」确认后执行的部署命令。默认适配 README 的
+        # Docker Compose 升级流程；源码/自定义部署可改成自己的脚本。
+        "updateCommand": "docker compose pull && docker compose up -d",
+        # 命令执行目录；留空时使用当前进程工作目录。
+        "workingDirectory": "",
     },
     "cchMode": "disabled",
     "cchStaticValue": "00000",
