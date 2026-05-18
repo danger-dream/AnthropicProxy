@@ -4,6 +4,7 @@
 功能：
 - 显示当前版本 / 最新版本 / 发布时间 / changelog 摘要
 - 立即检查（同步阻塞拉一次）
+- 发现新版本时确认后一键执行部署升级命令
 - 忽略此版本（加入 ignoredVersions）/ 清空忽略列表
 - 设置：总开关 / 间隔 / 是否含 prerelease
 """
@@ -24,6 +25,16 @@ def _update_cfg(patch: dict) -> None:
     def _mut(c):
         c.setdefault("updateChecker", {}).update(patch)
     config.update(_mut)
+
+
+def _available_update_version() -> Optional[str]:
+    cfg = _cfg()
+    ignored = set(cfg.get("ignoredVersions") or [])
+    st = update_checker.get_cached() or {}
+    latest = st.get("latest_version")
+    if latest and update_checker._has_newer(latest) and latest not in ignored:
+        return latest
+    return None
 
 
 def _format_main_text() -> str:
@@ -100,6 +111,7 @@ def _format_kb() -> dict:
         if latest in ignored:
             rows.append([ui.btn(f"✅ 取消忽略 {latest}", f"upd:unignore:{latest}")])
         else:
+            rows.append([ui.btn(f"⬆️ 立即更新到 {latest}", "upd:update_confirm")])
             rows.append([ui.btn(f"🔕 忽略 {latest}", f"upd:ignore:{latest}")])
     if ignored:
         rows.append([ui.btn(f"🧹 清空忽略列表（{len(ignored)}）", "upd:clear_ignored")])
@@ -115,6 +127,38 @@ def show(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
 
 def send_new(chat_id: int) -> None:
     ui.send(chat_id, ui.truncate(_format_main_text()), reply_markup=_format_kb())
+
+
+def _format_update_confirm_text(version: str) -> str:
+    cmd_cfg = update_checker.get_update_command_config()
+    command = cmd_cfg["command"]
+    cwd = cmd_cfg["workingDirectory"]
+    return "\n".join([
+        "⬆️ <b>确认立即更新 Parrot？</b>",
+        "",
+        f"目标版本: <code>{ui.escape_html(version)}</code>",
+        f"工作目录: <code>{ui.escape_html(cwd)}</code>",
+        f"将执行命令: <code>{ui.escape_html(command or '未配置')}</code>",
+        "",
+        "风险提示:",
+        "• 会拉取新 Docker 镜像并重建服务；Telegram Bot 可能短暂离线。",
+        "• 请确认工作目录包含正确的 docker-compose.yml，且当前运行环境有 Docker 权限。",
+        "• 命令输出只会截断显示，完整日志请到服务器查看。",
+    ])
+
+
+def _show_update_confirm(chat_id: int, message_id: int, cb_id: str) -> None:
+    version = _available_update_version()
+    if not version:
+        ui.answer_cb(cb_id, "当前没有可更新版本")
+        show(chat_id, message_id)
+        return
+    ui.answer_cb(cb_id)
+    rows = [
+        [ui.btn("✅ 确认执行更新", "upd:update_run")],
+        [ui.btn("❌ 取消", "menu:update")],
+    ]
+    ui.edit(chat_id, message_id, _format_update_confirm_text(version), reply_markup=ui.inline_kb(rows))
 
 
 # ─── 操作 ────────────────────────────────────────────────────────
@@ -168,6 +212,30 @@ def _refresh(chat_id: int, message_id: int, cb_id: str) -> None:
     show(chat_id, message_id)
 
 
+def _run_update(chat_id: int, message_id: int, cb_id: str) -> None:
+    version = _available_update_version()
+    if not version:
+        ui.answer_cb(cb_id, "当前没有可更新版本")
+        show(chat_id, message_id)
+        return
+
+    def _notify(text: str) -> None:
+        ui.send(chat_id, ui.truncate(text))
+
+    started, msg = update_checker.start_manual_update(_notify)
+    if not started:
+        ui.answer_cb(cb_id, msg, show_alert=True)
+        show(chat_id, message_id)
+        return
+    ui.answer_cb(cb_id, msg)
+    ui.edit(
+        chat_id, message_id,
+        "⬆️ <b>更新任务已在后台启动</b>\n\n"
+        "执行中会继续通过 Telegram 发送状态。服务重建期间 Bot 可能短暂离线。",
+        reply_markup=ui.inline_kb([[ui.btn("◀ 返回版本更新", "menu:update")]]),
+    )
+
+
 def _ignore_version(chat_id: int, message_id: int, cb_id: str, version: str) -> None:
     if not version:
         ui.answer_cb(cb_id, "版本号为空")
@@ -206,6 +274,10 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         _edit_interval(chat_id, message_id, cb_id); return True
     if data == "upd:refresh":
         _refresh(chat_id, message_id, cb_id); return True
+    if data == "upd:update_confirm":
+        _show_update_confirm(chat_id, message_id, cb_id); return True
+    if data == "upd:update_run":
+        _run_update(chat_id, message_id, cb_id); return True
     if data.startswith("upd:ignore:"):
         _ignore_version(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("upd:unignore:"):
