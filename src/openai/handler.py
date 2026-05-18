@@ -393,7 +393,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     if result.affinity_hit:
         await asyncio.to_thread(log_db.update_pending, request_id, affinity_hit=1)
 
-    if not result.candidates:
+    if not result:
         msg = f"No available upstream channels for model: {model} (ingress={ingress_protocol})"
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
@@ -417,10 +417,12 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         return errors.json_error_openai(status, err_type, msg)
 
     ts = time.strftime("%H:%M:%S", time.localtime(start_time))
-    chosen = result.candidates[0][0].key
+    _first_list = result.candidates or result.saturated
+    chosen = _first_list[0][0].key if _first_list else "?"
+    sat_note = " queued" if (not result.candidates and result.saturated) else ""
     print(f"[{ts}] {client_ip} {key_name} → {ingress_protocol}:{model} "
           f"(msgs={msg_count}, tools={tool_count}) "
-          f"{'★' if result.affinity_hit else ''}first={chosen}")
+          f"{'★' if result.affinity_hit else ''}first={chosen}{sat_note}")
 
     # 7. failover
     try:
