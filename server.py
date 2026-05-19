@@ -417,6 +417,24 @@ async def proxy_images_edit(request: Request):
     return await handle_edit(request)
 
 
+@app.post("/v1/images/generations")
+async def proxy_images_generations_legacy(request: Request):
+    """OpenAI legacy Images API compatibility endpoint.
+
+    Accepts the classic /v1/images/generations payload (prompt/model/n/size/response_format)
+    and internally uses Parrot's local image generation flow.
+    """
+    from src.openai.images_simple import handle_generate
+    return await handle_generate(request)
+
+
+@app.post("/images/generations")
+async def proxy_images_generations_legacy_no_v1(request: Request):
+    """OpenAI legacy Images API compatibility endpoint without /v1 prefix."""
+    from src.openai.images_simple import handle_generate
+    return await handle_generate(request)
+
+
 @app.post("/v1/messages")
 async def proxy_messages(request: Request):
     start_time = time.time()
