@@ -337,13 +337,24 @@ def _core_check(name: str, timeout: float) -> CheckResult:
 async def run_once(*, save: bool = True) -> list[CheckResult]:
     c = cfg()
     if not c.get("enabled", True):
+        # 总开关关了：清掉 state.db 里所有遗留状态，避免主菜单 banner 永久红
+        if save:
+            try:
+                state_db.network_check_delete_stale(set())
+            except Exception as exc:
+                print(f"[network_monitor] stale cleanup failed: {exc}")
         return []
     timeout = float(c.get("timeoutSeconds", 5) or 5)
     out: list[CheckResult] = []
+    # 本轮预期会被检测的 key 集合：跑完后用它清理 state.db 里不再被检测的残留
+    # （删账户/删渠道/关开关后，对应 key 不再进 run_once，需主动清旧 ok=false 记录）
+    expected_keys: set[str] = set()
 
     if c.get("dns"):
+        expected_keys.add("dns")
         out.append(await asyncio.to_thread(_dns_check, timeout))
     if c.get("socks5"):
+        expected_keys.add("socks5")
         out.append(await _socks5_check(timeout))
 
     ch_cfg = c.get("channels") or {}
@@ -359,6 +370,7 @@ async def run_once(*, save: bool = True) -> list[CheckResult]:
                 continue
             if not getattr(ch, "enabled", True) or getattr(ch, "disabled_reason", None):
                 continue
+            expected_keys.add(f"channel:{ch.key}")
             out.append(await asyncio.to_thread(_channel_check, ch, timeout))
 
     core = c.get("core") or {}
@@ -371,11 +383,18 @@ async def run_once(*, save: bool = True) -> list[CheckResult]:
         if not _has_family_account(fam):
             # 没有对应家族账号/渠道，跳过（避免给用户无意义的失败告警）
             continue
+        expected_keys.add(f"core:{name}")
         out.append(await asyncio.to_thread(_core_check, name, timeout))
 
     if save:
         for res in out:
             _save_result(res)
+        # 清掉 state.db 里所有不在本轮 expected_keys 中的残留
+        # 覆盖场景：删 OAuth 账户、删 API 渠道、关单项检测、关总开关
+        try:
+            state_db.network_check_delete_stale(expected_keys)
+        except Exception as exc:
+            print(f"[network_monitor] stale cleanup failed: {exc}")
     return out
 
 

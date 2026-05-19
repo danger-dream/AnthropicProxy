@@ -417,6 +417,43 @@ async def proxy_images_edit(request: Request):
     return await handle_edit(request)
 
 
+# OpenAI Images API 兼容入口：标准 schema、对接现有 OAuth 账号管线。
+@app.post(
+    "/v1/images/generations",
+    summary="OpenAI-compatible image generation",
+    description=(
+        "Standard OpenAI `/v1/images/generations` endpoint. Accepts `prompt`, "
+        "`model`, `n`, `size`, `response_format`, `quality`, `background`, "
+        "`output_format`, `moderation`, `style`, `output_compression`, "
+        "`partial_images`. Internally uses Parrot's OpenAI OAuth account pool. "
+        "`n > 1` is downgraded to 1 (one image per upstream call) and the "
+        "response includes a `parrot_warning` field."
+    ),
+    tags=["images"],
+)
+@app.post("/images/generations", include_in_schema=False)
+async def proxy_images_generations_openai(request: Request):
+    from src.openai.images_openai_compat import handle_generations
+    return await handle_generations(request)
+
+
+@app.post(
+    "/v1/images/edits",
+    summary="OpenAI-compatible image edit",
+    description=(
+        "Standard OpenAI `/v1/images/edits` endpoint. Supports JSON or "
+        "`multipart/form-data` body. Accepts a single `image` or multiple "
+        "`images[]` plus an optional `mask`. Same option fields as "
+        "generations are passed through."
+    ),
+    tags=["images"],
+)
+@app.post("/images/edits", include_in_schema=False)
+async def proxy_images_edits_openai(request: Request):
+    from src.openai.images_openai_compat import handle_edits
+    return await handle_edits(request)
+
+
 @app.post("/v1/messages")
 async def proxy_messages(request: Request):
     start_time = time.time()

@@ -63,6 +63,8 @@ class UpstreamImageError(Exception):
     cooldown: bool = False
     user_visible: bool = False
     force_refresh: bool = False
+    # 上游 429/5xx 返回的 retry-after 秒数；只在所有账号都失败时才回传给客户端。
+    retry_after: int | None = None
 
     def __str__(self) -> str:
         return self.message
@@ -150,8 +152,19 @@ def _candidate_accounts() -> list[dict]:
     return [x for x in list_image_accounts(include_disabled=False)]
 
 
+# OpenAI Images API 兼容入口透传到 image_generation tool 的字段集合。
+# 与 sub2api 对齐：见 sub2api/backend/internal/service/openai_images_responses.go::buildOpenAIImagesResponsesRequest
+_NATIVE_TOOL_STR_FIELDS = (
+    "size", "quality", "background", "output_format",
+    "moderation", "style",
+)
+_NATIVE_TOOL_INT_FIELDS = ("output_compression", "partial_images")
+
+
 def _build_payload(*, action: str, prompt: str, main_model: str, tool_model: str,
-                   size: str | None = None, images: list[str] | None = None) -> dict[str, Any]:
+                   size: str | None = None, images: list[str] | None = None,
+                   native_options: dict[str, Any] | None = None,
+                   mask_url: str | None = None) -> dict[str, Any]:
     tool: dict[str, Any] = {
         "type": "image_generation",
         "action": action,
@@ -160,6 +173,27 @@ def _build_payload(*, action: str, prompt: str, main_model: str, tool_model: str
     if size is not None and str(size).strip():
         # 对齐 CPA：用户传了才放进 tool；不传就完全不传递。
         tool["size"] = str(size).strip()
+
+    if native_options:
+        for field in _NATIVE_TOOL_STR_FIELDS:
+            value = native_options.get(field)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            tool[field] = text
+        for field in _NATIVE_TOOL_INT_FIELDS:
+            value = native_options.get(field)
+            if value is None:
+                continue
+            try:
+                tool[field] = int(value)
+            except (TypeError, ValueError):
+                continue
+
+    if mask_url and str(mask_url).strip():
+        tool["input_image_mask"] = {"image_url": str(mask_url).strip()}
 
     content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
     for img in images or []:
@@ -193,7 +227,7 @@ def _build_headers(access_token: str, account_id: str) -> dict[str, str]:
     }
 
 
-def _classify_error(status: int, body: str) -> UpstreamImageError:
+def _classify_error(status: int, body: str, *, retry_after: int | None = None) -> UpstreamImageError:
     msg = body.strip() or f"upstream HTTP {status}"
     lower = msg.lower()
 
@@ -229,13 +263,13 @@ def _classify_error(status: int, body: str) -> UpstreamImageError:
     if status == 429 or any(x in lower for x in quota_markers):
         return UpstreamImageError(
             msg[:1000], status_code=429, err_type=errors.ErrTypeOpenAI.RATE_LIMIT,
-            retryable=True, cooldown=True,
+            retryable=True, cooldown=True, retry_after=retry_after,
         )
     if status >= 500 or status in (408, 504):
         return UpstreamImageError(
             msg[:1000], status_code=status or 502,
             err_type=errors.classify_http_status_openai(status or 502),
-            retryable=True, cooldown=False,
+            retryable=True, cooldown=False, retry_after=retry_after,
         )
     return UpstreamImageError(
         msg[:1000], status_code=status or 400,
@@ -343,7 +377,18 @@ async def _call_upstream_once(account_row: dict, payload: dict, *, timeout_s: in
                 _update_codex_quota(ak, email, resp.headers)
                 if resp.status_code >= 400:
                     text = await resp.aread()
-                    raise _classify_error(resp.status_code, text.decode("utf-8", "replace"))
+                    ra_raw = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+                    ra_int: int | None = None
+                    if ra_raw:
+                        try:
+                            ra_int = max(0, int(float(str(ra_raw).strip())))
+                        except (ValueError, TypeError):
+                            ra_int = None
+                    raise _classify_error(
+                        resp.status_code,
+                        text.decode("utf-8", "replace"),
+                        retry_after=ra_int,
+                    )
                 async for event in _iter_sse_events(resp):
                     typ = str(event.get("type") or "")
                     if typ == "response.output_item.done":
@@ -534,28 +579,39 @@ async def _read_body(request: Request, *, action: str, cfg: dict) -> tuple[str, 
     return prompt, size, image_url
 
 
-async def _handle(request: Request, *, action: str) -> JSONResponse:
-    cfg = settings()
-    if not cfg.get("enabled", True):
-        return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "image generation is disabled")
+# === pipeline+handlers below ===
 
-    key_name, _, err = auth.validate(request.headers)
-    if err:
-        return _json_error(401, errors.ErrTypeOpenAI.AUTH, err)
-    if not auth.images_allowed(key_name):
-        return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "this API key is not allowed to use image endpoints")
+# === 公共管线 + 多入口包装 ===
 
-    try:
-        prompt, size, image_url = await _read_body(request, action=action, cfg=cfg)
-    except ValueError as exc:
-        return _json_error(400, errors.ErrTypeOpenAI.INVALID_REQUEST, str(exc))
 
-    if not prompt:
-        return _json_error(400, errors.ErrTypeOpenAI.INVALID_REQUEST, "prompt is required")
-    max_prompt = int(cfg.get("maxPromptChars") or _DEFAULTS["maxPromptChars"])
-    if len(prompt) > max_prompt:
-        return _json_error(400, errors.ErrTypeOpenAI.INVALID_REQUEST, f"prompt is too long; max {max_prompt} chars")
+@dataclass
+class _PipelineResult:
+    images: list[dict]
+    usage: dict | None
+    request_id: str
+    main_model: str
+    tool_model: str
+    account_email: str
+    duration_ms: int
+    cached: bool
 
+
+async def _execute_pipeline(
+    *,
+    action: str,
+    key_name: str | None,
+    prompt: str,
+    size: str | None,
+    input_image_urls: list[str] | None = None,
+    mask_url: str | None = None,
+    native_options: dict[str, Any] | None = None,
+    cfg: dict | None = None,
+) -> _PipelineResult:
+    """图片生成公共管线：调上游 + failover + cooldown + 日志落库。
+
+    成功返回 _PipelineResult；失败抛 UpstreamImageError，外层入口负责包装。
+    """
+    cfg = cfg if cfg is not None else settings()
     main_model = str(cfg.get("mainModel") or _DEFAULTS["mainModel"]).strip()
     tool_model = str(cfg.get("toolModel") or _DEFAULTS["toolModel"]).strip()
     request_id = str(uuid.uuid4())
@@ -573,7 +629,8 @@ async def _handle(request: Request, *, action: str) -> JSONResponse:
 
     payload = _build_payload(
         action=action, prompt=prompt, main_model=main_model, tool_model=tool_model,
-        size=size, images=[image_url] if image_url else None,
+        size=size, images=input_image_urls or None,
+        native_options=native_options, mask_url=mask_url,
     )
 
     started = time.time()
@@ -585,7 +642,10 @@ async def _handle(request: Request, *, action: str) -> JSONResponse:
             status="failed", duration_ms=int((time.time() - started) * 1000),
             error_type="no_account", error_message="no available OpenAI OAuth account for images",
         )
-        return _json_error(503, errors.ErrTypeOpenAI.SERVER, "no available OpenAI OAuth account for images")
+        raise UpstreamImageError(
+            "no available OpenAI OAuth account for images", 503,
+            errors.ErrTypeOpenAI.SERVER, retryable=False, user_visible=True,
+        )
 
     for row in accounts:
         ak = row["account_key"]
@@ -613,8 +673,6 @@ async def _handle(request: Request, *, action: str) -> JSONResponse:
                             _save_cached_images, images, action=action, cfg=cfg,
                         )
                     except Exception as cache_exc:
-                        # 上游已经成功返回图片；缓存失败不能让本次图片请求变成 500，
-                        # 否则客户端会误以为没生成并可能重复扣量重试。
                         print(f"[images] cache save failed for request {request_id}: {cache_exc}")
                         cache_paths, cached_count, cached_bytes = [], 0, 0
                     duration_ms = int((time.time() - started) * 1000)
@@ -635,19 +693,16 @@ async def _handle(request: Request, *, action: str) -> JSONResponse:
                         cached_images=cached_count, image_bytes=image_bytes,
                         cache_paths=cache_paths, usage=usage,
                     )
-                    return JSONResponse({
-                        "id": request_id,
-                        "object": f"parrot.image.{action}",
-                        "created": int(time.time()),
-                        "action": action,
-                        "model": main_model,
-                        "image_model": tool_model,
-                        "account": email,
-                        "data": images,
-                        "usage": usage,
-                        "cached": bool(cache_paths),
-                        "duration_ms": duration_ms,
-                    })
+                    return _PipelineResult(
+                        images=images,
+                        usage=usage,
+                        request_id=request_id,
+                        main_model=main_model,
+                        tool_model=tool_model,
+                        account_email=email,
+                        duration_ms=duration_ms,
+                        cached=bool(cache_paths),
+                    )
                 except UpstreamImageError as exc:
                     last_err = exc
                     await asyncio.to_thread(
@@ -677,7 +732,57 @@ async def _handle(request: Request, *, action: str) -> JSONResponse:
         status="failed", duration_ms=duration_ms,
         error_type=err_obj.err_type, error_message=err_obj.message,
     )
-    return _json_error(err_obj.status_code, err_obj.err_type, err_obj.message)
+    raise err_obj
+
+
+async def _handle(request: Request, *, action: str) -> JSONResponse:
+    """Parrot 私有 schema 入口：/v1/images/generate 与 /v1/images/edit。"""
+    cfg = settings()
+    if not cfg.get("enabled", True):
+        return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "image generation is disabled")
+
+    key_name, _, err = auth.validate(request.headers)
+    if err:
+        return _json_error(401, errors.ErrTypeOpenAI.AUTH, err)
+    if not auth.images_allowed(key_name):
+        return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "this API key is not allowed to use image endpoints")
+
+    try:
+        prompt, size, image_url = await _read_body(request, action=action, cfg=cfg)
+    except ValueError as exc:
+        return _json_error(400, errors.ErrTypeOpenAI.INVALID_REQUEST, str(exc))
+
+    if not prompt:
+        return _json_error(400, errors.ErrTypeOpenAI.INVALID_REQUEST, "prompt is required")
+    max_prompt = int(cfg.get("maxPromptChars") or _DEFAULTS["maxPromptChars"])
+    if len(prompt) > max_prompt:
+        return _json_error(400, errors.ErrTypeOpenAI.INVALID_REQUEST, f"prompt is too long; max {max_prompt} chars")
+
+    try:
+        result = await _execute_pipeline(
+            action=action,
+            key_name=key_name,
+            prompt=prompt,
+            size=size,
+            input_image_urls=[image_url] if image_url else None,
+            cfg=cfg,
+        )
+    except UpstreamImageError as exc:
+        return _json_error(exc.status_code, exc.err_type, exc.message)
+
+    return JSONResponse({
+        "id": result.request_id,
+        "object": f"parrot.image.{action}",
+        "created": int(time.time()),
+        "action": action,
+        "model": result.main_model,
+        "image_model": result.tool_model,
+        "account": result.account_email,
+        "data": result.images,
+        "usage": result.usage,
+        "cached": result.cached,
+        "duration_ms": result.duration_ms,
+    })
 
 
 async def handle_generate(request: Request) -> JSONResponse:
